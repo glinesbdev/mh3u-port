@@ -11,6 +11,7 @@ workspace = true
 anyhow.workspace = true
 mh3u-rt = { path = "../mh3u-rt" }
 mh3u-latte.workspace = true
+mh3u-formats.workspace = true
 wgpu = "30"
 winit = "0.30"
 pollster = "0.4"

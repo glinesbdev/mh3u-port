@@ -92,8 +92,8 @@ and the C library, `sync.rs` for threads and what they wait on) or, when none is
 
 - **Files**: `FS*` and `SAVE*` (all synchronous: the game imports no async variant) read `/vol/content` from the update's `content` folder
   first, then the base game's, matching names without regard to case; saves go to a folder of the owner's choosing (`--save-dir`).
-- **Graphics**: the `GX2` calls are stubs apart from the buffer and surface sizes (an approximation of the console's tiling rules, to be
-  replaced by the exact ones before textures are read). A function the game looks up by name at run time (`OSDynLoad_FindExport`) is
+- **Graphics**: the surface sizes (`GX2CalcSurfaceSizeAndAlignment`: tile mode, pitch, size, alignment, swizzle and mip offsets) follow
+  the console's address library rules, ported in `mh3u-formats/src/tiling.rs`. A function the game looks up by name at run time (`OSDynLoad_FindExport`) is
   found, and calling it does nothing and returns 0 (the error-display module is the only one so far).
 - **Switch tables**: the table's address is found by following the constants (`lis`, `addi`, `addic`, `ori`) in the 16 instructions
   before the `mtctr`; 1,102 tables in the game (the first rule, `addis`/`addi` into the register of the `mtctr`, found only 510).
@@ -117,9 +117,9 @@ systems, and it is fast enough for a console from 2012. The test machine's GPU i
 made the call, so it reads the guest's memory at the moment of the call and needs no copying or locking. A call that blocks (waiting
 for the next frame) blocks there, with the other guest threads waiting.
 
-**What it draws now** (the first real frames; textures are still white stand-ins): the game reaches its character screen and the
-backend draws it: the hunter model, the UI panels and the quest-board layout, upright, in the right places, without textures or text
-(the font and all textures are white). The pieces:
+**What it draws now**: the game reaches its character screen and the backend draws it, textured: the hunter model, the UI panels
+with their text and the cloth background, upright, in the right places (a few of the hunter's textures are still wrong: white
+speckles on the clothing). The pieces:
 
 - **State**: every `GX2Set*` call is recorded into the state of the current context (`GX2SetContextState`/`GX2SetupContextStateEx`
   switch between them); display lists (`GX2BeginDisplayListEx`...) are recorded and replayed with their arguments.
@@ -137,7 +137,15 @@ backend draws it: the hunter model, the UI panels and the quest-board layout, up
 - **The DMA engine** (`DMAECopyMem`) is how the game fills the GPU's constant buffers: without it every uniform block was zero.
 - `GX2CopySurface` copies between render targets (same size and format only); `GX2ClearColor`, `GX2ClearDepthStencilEx`.
 
-**Not done yet:** textures (the GX2 tiling rules, the compressed formats, mipmaps, cube maps), samplers from `GX2Sampler`, alpha
+- **Textures** (`texture.rs`): a `GX2Texture` is read from the guest, untiled texel by texel (`tiling::address`) and uploaded in the
+  format the GPU takes (the block-compressed ones as they are stored: the blocks are not byte-swapped; the packed ones are converted).
+  The layout is `tiling::surface_info`, the same calculation the game's size call used. The tiling code is a restatement of the part of
+  AMD's R6xx/R7xx address library (MIT, Copyright 2014 Advanced Micro Devices, Inc.) that maps coordinates to addresses and sizes
+  surfaces; the order of steps of the surface size call and the rule for resolving the default tile mode are facts read from the
+  decaf-emu sources, not copied. The memory configuration (2 pipes, 4 banks, 256-byte interleave, 2 KiB rows) is assumed from the
+  result: the text and the cloth only come out right with it. Only level 0 is read so far.
+
+**Not done yet:** mipmaps, cube maps and 3D textures, the rest of the sampler state, alpha
 test and stencil, depth bias, other geometry inputs (lines, triangles, instances), `CUBE` in shaders, loops and relative
 addressing in vertex shaders, rects and other primitive types, stream out, the second render target (the GamePad's picture is
 drawn but not shown), and speed: every draw makes its own buffers and render pass.

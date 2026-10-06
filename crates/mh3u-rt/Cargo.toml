@@ -13,5 +13,6 @@ undocumented_unsafe_blocks = "warn"
 
 [dependencies]
 anyhow.workspace = true
+mh3u-formats.workspace = true
 libloading = "0.8"
 memmap2 = "0.9"

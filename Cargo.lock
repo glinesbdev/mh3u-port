@@ -922,6 +922,7 @@ name = "mh3u-gfx"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "mh3u-formats",
  "mh3u-latte",
  "mh3u-rt",
  "pollster",
@@ -951,6 +952,7 @@ dependencies = [
  "anyhow",
  "libloading",
  "memmap2",
+ "mh3u-formats",
 ]
 
 [[package]]

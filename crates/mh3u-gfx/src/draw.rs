@@ -48,6 +48,12 @@ pub struct Compiled {
 /// The three translated stages of a geometry pipeline and how many vertices the geometry shader may emit.
 pub type GeometryShaders = (Arc<Compiled>, Arc<Compiled>, Arc<Compiled>, u32);
 
+pub struct CachedTexture {
+    pub texture: wgpu::Texture,
+    pub layers: u32,
+    pub range: (u32, u32),
+}
+
 pub struct PipelineEntry {
     pub pipeline: wgpu::RenderPipeline,
 }
@@ -62,6 +68,9 @@ pub struct DrawCaches {
     pub reported: std::collections::HashSet<String>,
     /// How many draws went to each colour buffer (by image address), for the log.
     pub drawn_into: HashMap<u32, u64>,
+    /// Textures made from the guest's, by the address of their image and what they were read as, with the memory they cover.
+    pub textures: HashMap<(u32, u32, u32, u32, u32), CachedTexture>,
+    pub samplers: HashMap<String, wgpu::Sampler>,
     pub geometry: HashMap<String, Option<GeometryShaders>>,
     pub compute: HashMap<String, wgpu::ComputePipeline>,
     /// Why draws were not drawn, and how many.
@@ -398,6 +407,88 @@ impl Gx2 {
         };
         self.caches.pixel.insert(key, compiled.clone());
         compiled.map(|c| (c, inputs))
+    }
+
+    /// Makes the texture at `t` (a `GX2Texture`) into a GPU texture, once until the game says it changed.
+    fn texture_view(&mut self, g: &Guest, t: u32, kind: TexKind) -> Option<wgpu::TextureView> {
+        let h = crate::texture::Header::read(g, t);
+        let key = (h.image, h.width, h.height, h.format, h.tile_mode ^ (h.dim << 8));
+        if !self.caches.textures.contains_key(&key) {
+            if let Some(dir) = std::env::var_os("MH3U_GFX_TEXDUMP") {
+                let dir = std::path::Path::new(&dir);
+                let _ = std::fs::create_dir_all(dir);
+                let mut raw = vec![0u8; h.image_size.min(1 << 26) as usize];
+                g.read(h.image, &mut raw);
+                let mut header = vec![0u8; 0x9c];
+                g.read(t, &mut header);
+                let name = format!("tex-{:08x}-{}x{}-f{:x}-m{}", h.image, h.width, h.height, h.format, h.tile_mode);
+                let _ = std::fs::write(dir.join(format!("{name}.image")), raw);
+                let _ = std::fs::write(dir.join(format!("{name}.header")), header);
+            }
+            match crate::texture::decode(g, &h) {
+                Ok(d) => {
+                    let texture = self.d.device.create_texture(&wgpu::TextureDescriptor {
+                        label: Some("game texture"),
+                        size: wgpu::Extent3d {
+                            width: d.width,
+                            height: d.height,
+                            depth_or_array_layers: d.layers,
+                        },
+                        mip_level_count: 1,
+                        sample_count: 1,
+                        dimension: wgpu::TextureDimension::D2,
+                        format: d.format,
+                        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                        view_formats: &[],
+                    });
+                    let block = d.format.block_dimensions();
+                    let rows = d.height.div_ceil(block.1);
+                    self.d.queue.write_texture(
+                        texture.as_image_copy(),
+                        &d.data,
+                        wgpu::TexelCopyBufferLayout {
+                            offset: 0,
+                            bytes_per_row: Some(d.bytes_per_row),
+                            rows_per_image: Some(rows),
+                        },
+                        wgpu::Extent3d {
+                            width: d.width,
+                            height: d.height,
+                            depth_or_array_layers: d.layers,
+                        },
+                    );
+                    self.caches.textures.insert(
+                        key,
+                        CachedTexture {
+                            texture,
+                            layers: d.layers,
+                            range: (h.image, h.image.saturating_add(h.image_size)),
+                        },
+                    );
+                }
+                Err(e) => {
+                    self.report(format!(
+                        "texture {t:#x} (format {:#x}, {}x{}, tile mode {}) not read: {e}",
+                        h.format, h.width, h.height, h.tile_mode
+                    ));
+                    return None;
+                }
+            }
+        }
+        let cached = &self.caches.textures[&key];
+        Some(cached.texture.create_view(&wgpu::TextureViewDescriptor {
+            dimension: Some(match kind {
+                TexKind::Cube if cached.layers == 6 => wgpu::TextureViewDimension::Cube,
+                _ => wgpu::TextureViewDimension::D2,
+            }),
+            array_layer_count: Some(if kind == TexKind::Cube { 6.min(cached.layers) } else { 1 }),
+            ..Default::default()
+        }))
+    }
+
+    pub(crate) fn invalidate_textures(&mut self, address: u32, size: u32) {
+        let end = address.saturating_add(size);
+        self.caches.textures.retain(|_, t| t.range.1 <= address || t.range.0 >= end);
     }
 
     fn fallback_texture(&mut self, kind: TexKind) -> wgpu::TextureView {
@@ -985,16 +1076,51 @@ impl Gx2 {
                         );
                     }
                 }
+                if t != 0
+                    && k != TexKind::Depth2d
+                    && k != TexKind::D3
+                    && let Some(view) = self.texture_view(g, t, k)
+                {
+                    return (r, view);
+                }
                 (r, self.fallback_texture(k))
             })
             .collect();
-        let linear = device.create_sampler(&wgpu::SamplerDescriptor {
-            mag_filter: wgpu::FilterMode::Linear,
-            min_filter: wgpu::FilterMode::Linear,
-            address_mode_u: wgpu::AddressMode::Repeat,
-            address_mode_v: wgpu::AddressMode::Repeat,
-            ..Default::default()
-        });
+        let sampler_for = |this: &mut Gx2, unit: u32| -> wgpu::Sampler {
+            let at = st.pixel_samplers.get(unit as usize).copied().unwrap_or(0);
+            if at == 0 {
+                return this.d.device.create_sampler(&wgpu::SamplerDescriptor {
+                    mag_filter: wgpu::FilterMode::Linear,
+                    min_filter: wgpu::FilterMode::Linear,
+                    ..Default::default()
+                });
+            }
+            let d = crate::texture::Sampler::read(g, at);
+            let key = format!("{d:?}");
+            if let Some(s) = this.caches.samplers.get(&key) {
+                return s.clone();
+            }
+            let filter = |linear: bool| {
+                if linear {
+                    wgpu::FilterMode::Linear
+                } else {
+                    wgpu::FilterMode::Nearest
+                }
+            };
+            let s = this.d.device.create_sampler(&wgpu::SamplerDescriptor {
+                address_mode_u: crate::texture::Sampler::address_mode(d.clamp[0]),
+                address_mode_v: crate::texture::Sampler::address_mode(d.clamp[1]),
+                address_mode_w: crate::texture::Sampler::address_mode(d.clamp[2]),
+                mag_filter: filter(d.mag_linear),
+                min_filter: filter(d.min_linear),
+                mipmap_filter: wgpu::MipmapFilterMode::Nearest,
+                ..Default::default()
+            });
+            this.caches.samplers.insert(key, s.clone());
+            s
+        };
+        let sampler_units: Vec<u32> = ps.interface.samplers.iter().copied().collect();
+        let sampler_list: Vec<(u32, wgpu::Sampler)> = sampler_units.iter().map(|s| (16 + s, sampler_for(self, *s))).collect();
         let compare_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             compare: Some(wgpu::CompareFunction::LessEqual),
             mag_filter: wgpu::FilterMode::Linear,
@@ -1008,10 +1134,10 @@ impl Gx2 {
                 resource: wgpu::BindingResource::TextureView(v),
             });
         }
-        for s in &ps.interface.samplers {
+        for (binding, sampler) in &sampler_list {
             tex_entries.push(wgpu::BindGroupEntry {
-                binding: 16 + s,
-                resource: wgpu::BindingResource::Sampler(&linear),
+                binding: *binding,
+                resource: wgpu::BindingResource::Sampler(sampler),
             });
         }
         for s in &ps.interface.compare_samplers {

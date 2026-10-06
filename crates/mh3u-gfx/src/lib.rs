@@ -4,6 +4,7 @@ mod draw;
 mod geometry;
 mod gx2;
 mod state;
+mod texture;
 
 pub use gx2::Gx2;
 
@@ -38,8 +39,15 @@ impl Display {
             ..Default::default()
         }))
         .context("no graphics adapter")?;
-        let (device, queue) =
-            pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default())).context("opening the graphics device")?;
+        // the game's shaders read many buffers, use compressed textures and filter 32-bit float ones: ask for what the adapter has
+        let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+            required_limits: adapter.limits(),
+            required_features: adapter.features() & (wgpu::Features::TEXTURE_COMPRESSION_BC | wgpu::Features::FLOAT32_FILTERABLE),
+            ..Default::default()
+        }))
+        .context("opening the graphics device")?;
+        // a validation error in one draw is reported, and the game goes on
+        device.on_uncaptured_error(Arc::new(|e| eprintln!("[gfx] {e}")));
         Ok(Display {
             window,
             instance,

@@ -41,6 +41,13 @@ const CALLS: &[&str] = &[
     "gx2:GX2CalcFetchShaderSizeEx",
     "gx2:GX2InitFetchShaderEx",
     "gx2:GX2ClearDepthStencilEx",
+    "gx2:GX2Invalidate",
+    "gx2:GX2InitSampler",
+    "gx2:GX2InitSamplerClamping",
+    "gx2:GX2InitSamplerXYFilter",
+    "gx2:GX2InitSamplerZMFilter",
+    "gx2:GX2InitSamplerLOD",
+    "gx2:GX2InitSamplerDepthCompare",
     "gx2:GX2CopySurface",
     "gx2:GX2DrawEx",
     "gx2:GX2DrawIndexedEx",
@@ -697,6 +704,46 @@ impl Gx2 {
                 self.fetch_shaders.insert(fs, streams);
             }
             "gx2:GX2CopySurface" => self.copy_surface(g, c.r[3], c.r[6]),
+            // (mode, address, size): the CPU wrote memory the GPU may have cached; a texture there is read again next time
+            "gx2:GX2Invalidate" => {
+                let (mode, address, size) = (a(0), a(1), a(2));
+                if mode & 2 != 0 || mode & 0x40 != 0 {
+                    self.invalidate_textures(address, size);
+                }
+            }
+            "gx2:GX2InitSampler" => {
+                let (s, clamp, filter) = (a(0), a(1) & 15, a(2) & 15);
+                g.put_u32(s, clamp | clamp << 4 | clamp << 8 | filter << 12 | filter << 16);
+                g.put_u32(s + 4, 0xf | (13 * 16) << 18);
+                g.put_u32(s + 8, 0);
+            }
+            "gx2:GX2InitSamplerClamping" => {
+                let (s, x, y, z) = (a(0), a(1) & 15, a(2) & 15, a(3) & 15);
+                let w = g.u32(s) & !0xfff;
+                g.put_u32(s, w | x | y << 4 | z << 8);
+            }
+            "gx2:GX2InitSamplerXYFilter" => {
+                let (s, mag, min) = (a(0), a(1) & 15, a(2) & 15);
+                let w = g.u32(s) & !(0xff << 12);
+                g.put_u32(s, w | mag << 12 | min << 16);
+            }
+            "gx2:GX2InitSamplerZMFilter" => {
+                let (s, z, mip) = (a(0), a(1) & 15, a(2) & 15);
+                let w = g.u32(s) & !(0xff << 20);
+                g.put_u32(s, w | z << 20 | mip << 24);
+            }
+            "gx2:GX2InitSamplerLOD" => {
+                let s = a(0);
+                let q = |v: f32| (v.clamp(0.0, 63.0) * 16.0) as u32 & 0x3ff;
+                let w = g.u32(s + 4) & 0xff;
+                g.put_u32(s + 4, w | q(farg(c, 0)) << 8 | q(farg(c, 1)) << 18);
+                g.put_u32(s + 8, farg(c, 2).to_bits());
+            }
+            "gx2:GX2InitSamplerDepthCompare" => {
+                let (s, func) = (a(0), a(1) & 15);
+                let w = g.u32(s + 4) & !0xf;
+                g.put_u32(s + 4, w | func);
+            }
             "gx2:GX2ClearDepthStencilEx" => self.clear_depth(g, c.r[3], farg(c, 0), c.r[4], c.r[5]),
             "gx2:GX2DrawEx" => self.draw(g, a(0), a(1), None, a(2), a(3)),
             "gx2:GX2DrawIndexedEx" => self.draw(g, a(0), a(1), Some((a(2), a(3))), a(4), a(5)),
