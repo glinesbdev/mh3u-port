@@ -192,21 +192,36 @@ pub fn key_axis(code: &str) -> Option<(usize, f32)> {
     })
 }
 
-/// Reads gamepads on a thread of their own, as long as the program runs. Buttons are placed like the GamePad's (the right-hand
-/// button of the four is A), whatever is printed on them.
+/// Reads gamepads on a thread of their own, as long as the program runs.
 pub fn start_gamepads() {
     let _ = std::thread::Builder::new().name("gamepads".into()).spawn(|| {
-        let Ok(mut gilrs) = gilrs::Gilrs::new() else { return };
+        let mut gilrs = match gilrs::Gilrs::new() {
+            Ok(g) => g,
+            Err(e) => {
+                eprintln!("no gamepad support: {e}");
+                return;
+            }
+        };
+        let by_position = std::env::var("MH3U_PAD_LAYOUT").is_ok_and(|v| v == "position");
+        for (_, pad) in gilrs.gamepads() {
+            eprintln!("gamepad: {}", pad.name());
+        }
         use gilrs::{Axis, Button, EventType};
         while let Some(event) = gilrs.next_event_blocking(None) {
             match event.event {
                 EventType::ButtonPressed(b, _) | EventType::ButtonReleased(b, _) => {
                     let down = matches!(event.event, EventType::ButtonPressed(..));
+                    // by default the buttons go by their labels (the Xbox A is the GamePad's A); MH3U_PAD_LAYOUT=position puts
+                    // them where the GamePad's are (the right-hand one is A)
                     let mask = match b {
-                        Button::East => button::A,
-                        Button::South => button::B,
-                        Button::North => button::X,
-                        Button::West => button::Y,
+                        Button::East if by_position => button::A,
+                        Button::South if by_position => button::B,
+                        Button::North if by_position => button::X,
+                        Button::West if by_position => button::Y,
+                        Button::South => button::A,
+                        Button::East => button::B,
+                        Button::West => button::X,
+                        Button::North => button::Y,
                         Button::DPadUp => button::UP,
                         Button::DPadDown => button::DOWN,
                         Button::DPadLeft => button::LEFT,
@@ -224,6 +239,7 @@ pub fn start_gamepads() {
                     };
                     INPUT.set_pad_button(mask, down);
                 }
+                EventType::Connected => eprintln!("gamepad connected: {}", gilrs.gamepad(event.id).name()),
                 EventType::AxisChanged(a, v, _) => {
                     let axis = match a {
                         Axis::LeftStickX => 0,

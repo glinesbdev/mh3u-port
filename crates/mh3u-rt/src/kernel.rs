@@ -84,12 +84,17 @@ pub struct Kernel {
     pub queues: HashMap<u32, Queue>,
     /// Functions found by name at run time (`OSDynLoad_FindExport`): a call to `DYNAMIC_BASE + 4 * n` is a call to the n-th of these.
     pub dynamic: Vec<String>,
+    pub started: std::time::Instant,
     /// The callbacks registered with `ProcUIRegisterCallback`: (type, function, parameter, priority), and whether the first foreground
     /// acquisition has been delivered.
     pub procui_callbacks: Vec<(u32, u32, u32, u32)>,
     pub procui_acquired: bool,
     /// The audio frame callbacks (`AXRegisterFrameCallback`), run every audio frame by a service thread made when the first is added.
     pub ax_callbacks: Vec<u32>,
+    /// The alarms that are set (by the address of the game's `OSAlarm`), and whether the thread that runs their handlers exists.
+    pub alarms: BTreeMap<u32, Alarm>,
+    pub alarm_thread: bool,
+    pub alarm_user_data: BTreeMap<u32, u32>,
     /// How the translated library is called, for the threads made later.
     pub call: unsafe extern "C" fn(*mut Ctx, u32) -> i32,
     pub memory: *mut u8,
@@ -155,9 +160,13 @@ impl Kernel {
             semaphores: HashMap::new(),
             queues: HashMap::new(),
             dynamic: Vec::new(),
+            started: std::time::Instant::now(),
             procui_callbacks: Vec::new(),
             procui_acquired: false,
             ax_callbacks: Vec::new(),
+            alarms: BTreeMap::new(),
+            alarm_thread: false,
+            alarm_user_data: BTreeMap::new(),
             call,
             memory,
             report,
@@ -216,6 +225,15 @@ pub fn pass_baton(mut guard: MutexGuard<'static, Option<Kernel>>, waiting: bool)
 }
 
 /// Sleeps the calling thread for `duration`, letting the others run meanwhile.
+/// A timer the game set: it calls `handler(alarm, context)` when `due` has come, and again every `period` if it has one.
+#[derive(Debug, Clone)]
+pub struct Alarm {
+    pub due: Instant,
+    pub period: Option<Duration>,
+    pub handler: u32,
+    pub tag: u32,
+}
+
 pub fn sleep_current(mut guard: MutexGuard<'static, Option<Kernel>>, duration: Duration) -> MutexGuard<'static, Option<Kernel>> {
     let until = Instant::now() + duration;
     let me = guard.as_ref().expect("kernel").current;

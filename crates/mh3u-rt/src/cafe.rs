@@ -126,7 +126,52 @@ fn simple(name: &str) -> Option<SimpleHandler> {
             os.voices += 1;
             c.r[3] = v;
         },
-        "snd_core.rpl:AXFreeVoice" | "snd_core.rpl:AXInit" | "snd_core.rpl:AXInitEx" => |_, _, c| c.r[3] = 0,
+        "snd_core.rpl:AXFreeVoice" => |os, _, c| {
+            os.voice_state.remove(&c.r[3]);
+            c.r[3] = 0;
+        },
+        "snd_core.rpl:AXInit" | "snd_core.rpl:AXInitEx" => |_, _, c| c.r[3] = 0,
+        // where a voice's sample data starts, loops and ends, and where it is now (in samples)
+        "snd_core.rpl:AXSetVoiceOffsets" => |os, g, c| {
+            let (voice, at) = (c.r[3], c.r[4]);
+            let v = os.voice_state.entry(voice).or_default();
+            v.advance();
+            v.format = g.u16(at);
+            v.looping = g.u16(at + 2) != 0;
+            v.loop_offset = g.u32(at + 4);
+            v.end = g.u32(at + 8);
+            v.current = f64::from(g.u32(at + 12));
+        },
+        "snd_core.rpl:AXGetVoiceOffsets" => |os, g, c| {
+            let (voice, at) = (c.r[3], c.r[4]);
+            let v = os.voice_state.entry(voice).or_default();
+            v.advance();
+            g.put_u16(at, v.format);
+            g.put_u16(at + 2, u16::from(v.looping));
+            g.put_u32(at + 4, v.loop_offset);
+            g.put_u32(at + 8, v.end);
+            g.put_u32(at + 12, v.current as u32);
+            if std::env::var_os("MH3U_TRACE_AX").is_some() {
+                eprintln!("[ax] voice {voice:#x} {v:?}");
+            }
+        },
+        "snd_core.rpl:AXSetVoiceState" => |os, _, c| {
+            let v = os.voice_state.entry(c.r[3]).or_default();
+            v.advance();
+            v.running = c.r[4] != 0;
+        },
+        // the pitch: how many samples of the voice go by per sample of the output
+        "snd_core.rpl:AXSetVoiceSrcRatio" => |os, _, c| {
+            let v = os.voice_state.entry(c.r[3]).or_default();
+            v.advance();
+            v.ratio = f64::from_bits(c.f[1]);
+        },
+        "snd_core.rpl:AXSetVoiceSrc" => |os, g, c| {
+            // the ratio is a fixed-point number with 16 fractional bits
+            let v = os.voice_state.entry(c.r[3]).or_default();
+            v.advance();
+            v.ratio = f64::from(g.u32(c.r[4])) / 65536.0;
+        },
         "snd_core.rpl:AXGetDeviceMode" => |_, g, c| {
             // stereo ("surround" is 2)
             g.put_u32(c.r[4], 1);
@@ -137,11 +182,36 @@ fn simple(name: &str) -> Option<SimpleHandler> {
             let (buffer, error) = (c.r[4], c.r[6]);
             g.fill(buffer, 0, 0xac);
             let input = &crate::input::INPUT;
+            // MH3U_TOUCH_SWEEP=<seconds>: from then on, touch each point of a grid in turn
+            if let Some(from) = std::env::var("MH3U_TOUCH_SWEEP").ok().and_then(|v| v.parse::<f64>().ok()) {
+                let t = os.started.elapsed().as_secs_f64();
+                if t >= from {
+                    let slot = ((t - from) / 0.5) as usize;
+                    let (w, h) = crate::input::TOUCH_SIZE;
+                    let cell = (slot / 2) % 25;
+                    input.set_touch(
+                        slot.is_multiple_of(2)
+                            .then_some(((cell % 5) as f32 * 0.2 * w + 0.1 * w, (cell / 5) as f32 * 0.2 * h + 0.1 * h)),
+                    );
+                }
+            }
             let hold = os.pad_hold() | input.hold();
+            // a press is reported once per frame, however many times the game reads in it: reads close together get the same answer
+            let now = std::time::Instant::now();
+            if now.duration_since(os.pad_read_at) > std::time::Duration::from_millis(4) {
+                os.pad_edges = (hold & !os.pad_before, os.pad_before & !hold);
+                os.pad_before = hold;
+            }
+            os.pad_read_at = now;
+            if std::env::var_os("MH3U_TRACE_PAD").is_some() {
+                eprintln!(
+                    "[pad] hold {hold:#x} trigger {:#x} release {:#x} count {:#x}",
+                    os.pad_edges.0, os.pad_edges.1, c.r[5]
+                );
+            }
             g.put_u32(buffer, hold);
-            g.put_u32(buffer + 4, hold & !os.pad_before);
-            g.put_u32(buffer + 8, os.pad_before & !hold);
-            os.pad_before = hold;
+            g.put_u32(buffer + 4, os.pad_edges.0);
+            g.put_u32(buffer + 8, os.pad_edges.1);
             let sticks = input.sticks();
             for (i, v) in sticks.iter().enumerate() {
                 g.put_u32(buffer + 0xc + 4 * i as u32, v.to_bits());
@@ -155,7 +225,8 @@ fn simple(name: &str) -> Option<SimpleHandler> {
             g.put_u16(buffer + 0x58 - 4, x as u16);
             g.put_u16(buffer + 0x58 - 2, y as u16);
             g.put_u16(buffer + 0x58, touched);
-            g.put_u16(buffer + 0x5a, if touched == 1 { 3 } else { 0 });
+            // (0 means the point is valid)
+            g.put_u16(buffer + 0x5a, 0);
             // the filtered points are the same
             g.copy(buffer + 0x54, buffer + 0x5c, 8);
             g.copy(buffer + 0x54, buffer + 0x64, 8);
@@ -349,14 +420,72 @@ pub struct Os {
     /// IPC buffer pools by handle: where the next block comes from and where the pool ends.
     ipc_pools: BTreeMap<u32, (u32, u32)>,
     voices: u32,
+    voice_state: BTreeMap<u32, Voice>,
     /// The buttons held at the last read of the GamePad (to tell what was just pressed).
     pub pad_before: u32,
+    pad_edges: (u32, u32),
+    pad_read_at: std::time::Instant,
     pad_script: Option<(u32, std::time::Duration)>,
-    started: std::time::Instant,
+    pub started: std::time::Instant,
+}
+
+/// What the game has told the audio system about a voice. Nothing is played yet, but the game watches how far a voice has got (to
+/// know when a sound has ended), so a running voice moves on with the time at the rate of its pitch.
+#[derive(Debug)]
+struct Voice {
+    format: u16,
+    looping: bool,
+    loop_offset: u32,
+    end: u32,
+    current: f64,
+    running: bool,
+    ratio: f64,
+    last: std::time::Instant,
+}
+
+impl Default for Voice {
+    fn default() -> Voice {
+        Voice {
+            format: 0,
+            looping: false,
+            loop_offset: 0,
+            end: 0,
+            current: 0.0,
+            running: false,
+            ratio: 1.0,
+            last: std::time::Instant::now(),
+        }
+    }
+}
+
+/// The output's sample rate.
+const SAMPLE_RATE: f64 = 48_000.0;
+
+impl Voice {
+    /// Moves a running voice forward to now.
+    fn advance(&mut self) {
+        let now = std::time::Instant::now();
+        let elapsed = now.duration_since(self.last).as_secs_f64();
+        self.last = now;
+        if !self.running {
+            return;
+        }
+        self.current += elapsed * SAMPLE_RATE * self.ratio;
+        let end = f64::from(self.end);
+        if self.current >= end {
+            if self.looping && end > f64::from(self.loop_offset) {
+                let length = end - f64::from(self.loop_offset);
+                self.current = f64::from(self.loop_offset) + (self.current - end) % length;
+            } else {
+                self.current = end;
+                self.running = false;
+            }
+        }
+    }
 }
 
 /// The time base's rate, in ticks per second (a quarter of the bus clock).
-const TICKS_PER_SECOND: u64 = 62_156_250;
+pub const TICKS_PER_SECOND: u64 = 62_156_250;
 
 impl Os {
     /// Makes the structures the game reads (they live in the OS area of the guest's memory).
@@ -369,7 +498,10 @@ impl Os {
             next_os: OS_AREA,
             ipc_pools: BTreeMap::new(),
             voices: 0,
+            voice_state: BTreeMap::new(),
             pad_before: 0,
+            pad_edges: (0, 0),
+            pad_read_at: std::time::Instant::now(),
             // MH3U_PRESS=<button mask in hex>,<period in ms>: hold the buttons for a tenth of every period (for finding what the game waits for)
             pad_script: std::env::var("MH3U_PRESS").ok().and_then(|v| {
                 let (mask, ms) = v.split_once(',')?;
@@ -397,10 +529,20 @@ impl Os {
 
     /// The buttons held now.
     fn pad_hold(&self) -> u32 {
+        // MH3U_PRESS_SWEEP=<seconds>: from then on, press each button in turn (for finding what a screen waits for)
+        if let Some(from) = std::env::var("MH3U_PRESS_SWEEP").ok().and_then(|v| v.parse::<f64>().ok()) {
+            let t = self.started.elapsed().as_secs_f64();
+            if t >= from {
+                const ALL: [u32; 13] = [0x4000, 0x2000, 0x1000, 0x8, 0x4, 0x200, 0x100, 0x800, 0x400, 0x20, 0x10, 0x80, 0x40];
+                let slot = ((t - from) / 0.6) as usize;
+                return if slot.is_multiple_of(2) { ALL[(slot / 2) % ALL.len()] } else { 0 };
+            }
+        }
         match self.pad_script {
             Some((mask, period)) if !period.is_zero() => {
                 let t = self.started.elapsed().as_millis() % period.as_millis();
-                if t < period.as_millis() / 10 { mask } else { 0 }
+                let duty: u128 = std::env::var("MH3U_PRESS_DUTY").ok().and_then(|d| d.parse().ok()).unwrap_or(10);
+                if t < period.as_millis() * duty / 100 { mask } else { 0 }
             }
             _ => 0,
         }

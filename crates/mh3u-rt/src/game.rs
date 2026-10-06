@@ -164,7 +164,12 @@ extern "C" fn import(c: *mut Ctx, number: u32) {
         };
         match step {
             Step::Done => {
-                if k.report.trace {
+                // MH3U_TRACE_FROM=<seconds>: trace only after that long
+                let from: f64 = std::env::var("MH3U_TRACE_FROM")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(f64::MAX);
+                if k.report.trace || k.started.elapsed().as_secs_f64() >= from {
                     eprintln!(
                         "[{}] {}({:#x}, {:#x}, {:#x}, {:#x}) = {:#x}  from {:#x}",
                         k.current, k.report.names[number as usize], args[0], args[1], args[2], args[3], c.r[3], c.lr
@@ -212,11 +217,16 @@ extern "C" fn unknown_call(c: *mut Ctx, target: u32) {
         let mut guard = lock();
         let k = guard.as_mut().expect("the kernel is set while the game runs");
         if let Some(name) = k.dynamic.get(n) {
-            if k.report.trace {
-                eprintln!("[{}] (dynamic) {name}", k.current);
+            if k.report.trace || std::env::var_os("MH3U_TRACE_DYNAMIC").is_some() {
+                // SAFETY: as below
+                let (r, lr) = unsafe { ((*c).r, (*c).lr) };
+                eprintln!(
+                    "[{}] (dynamic) {name} ({:#x}, {:#x}, {:#x}) from {lr:#x}",
+                    k.current, r[3], r[4], r[5]
+                );
             }
             // SAFETY: `c` is the context the translated code passed us
-            unsafe { (*c).r[3] = 0 };
+            unsafe { (*c).r[3] = u32::from(name.contains("Create")) };
             return;
         }
     }
@@ -325,6 +335,55 @@ pub fn spawn_audio(k: &mut Kernel) {
             for cb in callbacks {
                 // SAFETY: the library is loaded for the rest of the run
                 unsafe { call(&mut c, cb) };
+            }
+            guard = lock();
+        }
+    });
+}
+
+/// Starts the thread that runs the handlers of the game's alarms when they are due.
+pub fn spawn_alarms(k: &mut Kernel) {
+    let t = k.threads.len();
+    k.threads.push(Thread {
+        addr: 0xffff_ffe0,
+        life: Life::Ready,
+        suspend: 0,
+        exit_code: 0,
+        sleep_until: None,
+        entry: 0,
+        argc: 0,
+        argv: 0,
+        stack_top: 0xa0e0_0000,
+        started: true,
+        last: None,
+    });
+    let (call, mem) = (k.call, k.memory as usize);
+    std::thread::spawn(move || {
+        let mut guard = lock();
+        while guard.as_ref().expect("kernel").current != t {
+            guard = kernel::BATON.wait(guard).unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+        loop {
+            guard = kernel::sleep_current(guard, std::time::Duration::from_millis(2));
+            let now = std::time::Instant::now();
+            let k = guard.as_mut().expect("kernel");
+            let mut due = Vec::new();
+            for (addr, alarm) in k.alarms.iter_mut() {
+                if alarm.due <= now {
+                    due.push((*addr, alarm.handler));
+                    if let Some(period) = alarm.period {
+                        alarm.due += period;
+                    }
+                }
+            }
+            k.alarms.retain(|_, a| a.period.is_some() || a.due > now);
+            drop(guard);
+            for (addr, handler) in due {
+                let mut c = new_ctx(mem as *mut u8);
+                c.r[1] = 0xa0e0_0000 - 0x20;
+                c.r[3] = addr;
+                // SAFETY: the library is loaded for the rest of the run
+                unsafe { call(&mut c, handler) };
             }
             guard = lock();
         }

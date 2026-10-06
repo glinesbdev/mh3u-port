@@ -66,17 +66,63 @@ pub fn find(name: &str) -> Option<KernelHandler> {
         "coreinit:exit" | "coreinit:_Exit" | "coreinit:abort" => |_, c| Step::Stop(format!("the game called exit({})", c.r[3] as i32)),
         // modules loaded at run time are all "found"; what they export are functions that do nothing and return 0
         "coreinit:OSDynLoad_Acquire" => |k, c| {
+            if k.report.trace {
+                eprintln!("[dynload] module {}", k.guest.cstr(c.r[3]));
+            }
             k.guest.put_u32(c.r[4], 1);
             done(c, 0)
         },
         "coreinit:OSDynLoad_FindExport" => |k, c| {
             let name = k.guest.cstr(c.r[5]);
             let n = k.dynamic.iter().position(|d| *d == name).unwrap_or_else(|| {
+                if k.report.trace {
+                    eprintln!("[dynload] {name} -> stored at {:#x}", c.r[6]);
+                }
                 k.dynamic.push(name);
                 k.dynamic.len() - 1
             });
             k.guest.put_u32(c.r[6], crate::kernel::DYNAMIC_BASE + 4 * n as u32);
             done(c, 0)
+        },
+        // alarms: timers whose handlers run on a thread of their own (see `game::spawn_alarms`)
+        "coreinit:OSCreateAlarm" => |k, c| {
+            k.alarms.remove(&c.r[3]);
+            Step::Done
+        },
+        "coreinit:OSSetAlarm" => |k, c| {
+            let ticks = (u64::from(c.r[4]) << 32) | u64::from(c.r[5]);
+            let delay = std::time::Duration::from_secs_f64(ticks as f64 / crate::cafe::TICKS_PER_SECOND as f64);
+            k.alarms.insert(
+                c.r[3],
+                crate::kernel::Alarm {
+                    due: std::time::Instant::now() + delay,
+                    period: None,
+                    handler: c.r[6],
+                    tag: 0,
+                },
+            );
+            if !k.alarm_thread {
+                k.alarm_thread = true;
+                crate::game::spawn_alarms(k);
+            }
+            done(c, 1)
+        },
+        "coreinit:OSCancelAlarm" => |k, c| {
+            k.alarms.remove(&c.r[3]);
+            Step::Done
+        },
+        "coreinit:OSCancelAlarms" => |k, c| {
+            let tag = c.r[3];
+            k.alarms.retain(|_, a| a.tag != tag);
+            Step::Done
+        },
+        "coreinit:OSSetAlarmUserData" => |k, c| {
+            k.alarm_user_data.insert(c.r[3], c.r[4]);
+            Step::Done
+        },
+        "coreinit:OSGetAlarmUserData" => |k, c| {
+            let v = k.alarm_user_data.get(&c.r[3]).copied().unwrap_or(0);
+            done(c, v)
         },
         "coreinit:OSDynLoad_Release" => |_, _| Step::Done,
         // the application starts in the background and is told to acquire the foreground by its first call of ProcUIProcessMessages

@@ -150,8 +150,8 @@ with their text and the cloth background, upright, in the right places (the hunt
 - **Input** (`mh3u-rt/src/input.rs`): `VPADRead` returns what the player presses: the keyboard and mouse (window events) and gamepads
   (`gilrs`, on a thread of their own), combined in one shared state. Keys are named by position: WASD is the left stick, the arrow keys the
   right stick, Enter A, Backspace B, X, C the X and Y buttons, I/J/K/L the D-pad, Q/E L and R, 1/3 ZL and ZR, P plus, O minus, Left
-  and Right Shift the stick clicks. A gamepad's buttons are placed like the GamePad's (the right-hand face button is A). A pushed stick also
-  sets the stick's direction buttons (the menus read those). The mouse is the touch panel (the picture is the TV's, so it only matters once
+  and Right Shift the stick clicks. A pushed stick also
+  sets the stick's direction buttons (the menus read those). Gamepad face buttons go by label (the Xbox A is the GamePad's A); `MH3U_PAD_LAYOUT=position` puts them where the GamePad's are. The mouse is the touch panel (the picture is the TV's, so it only matters once
   the GamePad's screen is shown). `VPADGetTPCalibratedPoint` scales the raw touch values (0 to 4095) to 1280 x 720 (a guess). The Wii
   Remote and Pro Controller functions (`KPAD*`, `WPAD*`) are not answered: no controller of those kinds exists for the game.
   `MH3U_PRESS` still works and is added to the real input.
@@ -197,12 +197,21 @@ Each of these was found by looking at what the game was waiting for, with the de
   **IPC buffer pools** (the keyboard library's start-up failed without them); **accounts and network** answer "one user, no network".
 - **`GX2TempGetGPUVersion`** must return 2: the game's GFD header check compares it with the shader files' GPU version, and with a
   stub returning 0 every shader was rejected, silently, so every draw had no shader.
-- **Input**: the game waits at its first screen for a button. `VPADRead` gives one sample with the buttons held as
-  `MH3U_PRESS=<mask hex>,<period ms>` says (0x8000 is A); real input comes later.
+- **Input**: the game waits at its first screen for a button; see the input notes under "What it draws now". A press is reported once
+  per frame (`VPADRead` is called twice a frame, and only the first call may see the edge).
+- **Audio voices** keep what the game tells `AX` (offsets, loop, pitch, state) and a running voice moves on with the time at its pitch's
+  rate: the game polls a voice's position to know when to refill its stream or that a sound ended. Nothing is mixed or played yet.
+- **Alarms** (`OSSetAlarm`...) run their handlers on a thread of their own when they are due.
+- **Software keyboard** (`swkbd`, found at run time with `OSDynLoad_FindExport`): its functions still return 0 (`Create` returns 1).
+  The character screen's name field shows a notice and then does not move on, with input reaching the game correctly (checked with
+  `MH3U_TRACE_PAD`); the cause is not found. `Swkbd*Appear*` is never called, so it is not waiting for the keyboard.
 
 Debugging aids (all in `mh3u-tools run`): `MH3U_TRACE=1` (every system call with its result, and file opens), `MH3U_DUMP_AFTER=<s>`
 (what every thread is doing and which system function it called last), `MH3U_GFX_LOG=1` (the first draws' state, and draw counts), and,
 for a library built with `build-game --watch`: `MH3U_WATCH=<addr>,<len>` (every store, also by the runtime, to that range, with the
 return address), `MH3U_ENTER=<function>` / `MH3U_ENTER_LR=<return address>` (report entries of a function, or of whatever is called
 from a given call site), `MH3U_PROFILE=<s>` (a sampling profile of the translated code). `mh3u-tools disasm` prints readable
-PowerPC (`mh3u_ppc::format`).
+PowerPC (`mh3u_ppc::format`). More: `MH3U_TRACE_FROM=<s>` (trace only after that long), `MH3U_TRACE_DYNAMIC=1` (calls of functions found
+at run time, with arguments and return address), `MH3U_TRACE_PAD=1` (what `VPADRead` returns), `MH3U_TRACE_AX=1` (voice positions),
+`MH3U_PRESS_DUTY=<percent>` (how long of its period `MH3U_PRESS` holds), `MH3U_PRESS_SWEEP=<s>` and `MH3U_TOUCH_SWEEP=<s>` (press every
+button, or touch a grid of points, in turn from then on), `MH3U_PAD_LAYOUT=position` (gamepad face buttons by position instead of label).
