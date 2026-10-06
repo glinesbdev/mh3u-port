@@ -9,6 +9,12 @@ use mh3u_ppc::{Insn, Op};
 pub fn functions(base: u32, words: &[u32], pointers: &[u32], entry: u32) -> BTreeSet<u32> {
     let end = base.wrapping_add(4 * words.len() as u32);
     let inside = |a: u32| a.is_multiple_of(4) && (base..end).contains(&a);
+    // the entries of a switch's table are part of the function with the `bctr` (an address computed to find the table names them)
+    let in_a_table: BTreeSet<u32> = crate::switch_tables(base, words)
+        .into_iter()
+        .flat_map(|(at, n)| (0..n).map(move |k| at + 4 + 4 * k))
+        .collect();
+    let inside = |a: u32| inside(a) && !in_a_table.contains(&a);
     let mut set = BTreeSet::new();
     if inside(entry) {
         set.insert(entry);
@@ -39,7 +45,36 @@ pub fn functions(base: u32, words: &[u32], pointers: &[u32], entry: u32) -> BTre
             }
         }
     }
-    set
+    // A branch that leaves its function is a tail call to the start of another one (the compiler's register save and restore routines
+    // are entered in the middle of a chain this way). Cutting the code there can make other branches cross a boundary, so this repeats.
+    loop {
+        let mut added = Vec::new();
+        for (i, &w) in words.iter().enumerate() {
+            let Some(insn) = Insn::decode(w) else { continue };
+            if insn.lk() || !matches!(insn.op, Op::B | Op::Bc) {
+                continue;
+            }
+            let addr = base + 4 * i as u32;
+            let t = match (insn.op, insn.aa()) {
+                (Op::B, true) => insn.li() as u32,
+                (Op::B, false) => addr.wrapping_add(insn.li() as u32),
+                (_, true) => insn.bd() as u32,
+                (_, false) => addr.wrapping_add(insn.bd() as u32),
+            };
+            if !inside(t) || set.contains(&t) {
+                continue;
+            }
+            let Some(&from) = set.range(..=addr).next_back() else { continue };
+            let to = set.range(addr + 1..).next().copied().unwrap_or(end);
+            if !(from..to).contains(&t) {
+                added.push(t);
+            }
+        }
+        if added.is_empty() {
+            return set;
+        }
+        set.extend(added);
+    }
 }
 
 #[cfg(test)]

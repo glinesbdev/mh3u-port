@@ -294,6 +294,31 @@ pub fn import_sites(rpx: &[u8]) -> Result<Vec<(u32, Import)>> {
     Ok(out)
 }
 
+/// The addresses in `[from, to)` that the relocations make (the symbol's address plus the addend): where code and data say "this is the
+/// address of" something in that range, which is how a function whose address is taken by an instruction (not a table) is found.
+pub fn relocation_targets(rpx: &[u8], from: u32, to: u32) -> Result<Vec<u32>> {
+    let all = sections(rpx)?;
+    let Some(symtab) = all.iter().find(|s| s.kind == SHT_SYMTAB) else {
+        return Ok(Vec::new());
+    };
+    let symbols = contents(rpx, symtab)?;
+    let symbols = symbols.as_chunks::<SYMBOL>().0;
+    let mut out = Vec::new();
+    for rela in all.iter().filter(|s| s.name.starts_with(".rela.")) {
+        for entry in contents(rpx, rela)?.as_chunks::<12>().0 {
+            let (info, addend) = (be32(entry, 4).unwrap_or(0), be32(entry, 8).unwrap_or(0));
+            let Some(sym) = symbols.get((info >> 8) as usize) else { continue };
+            let target = be32(sym, 4).unwrap_or(0).wrapping_add(addend);
+            if (from..to).contains(&target) {
+                out.push(target);
+            }
+        }
+    }
+    out.sort_unstable();
+    out.dedup();
+    Ok(out)
+}
+
 /// An executable made up for the tests: an import section for the library `gx2`, one for data of `coreinit`, and a symbol table
 /// naming two functions and one piece of data (and the sections' own symbols, which are not imports). Nothing in it is compressed.
 #[cfg(test)]

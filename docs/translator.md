@@ -62,25 +62,16 @@ the smaller of the bound and the run of branches). The C is a `switch` on the in
 checked against the interpreter in `c_diff.rs`. The other 4,312 `bctr` are tail calls through a function pointer or a vtable (a
 `lwz`/`mtctr` chain), not tables.
 
-## The whole executable (`mh3u-tools translate`)
+## The whole executable (`mh3u-tools translate`, `build-game`, `run`)
 
-70,195 functions become 351 C files of 200 functions (245 MB, written in under 2 seconds, outside any git tree) and every file passes
-`clang -fsyntax-only` (15 s on 24 cores). Nothing links or runs yet: there is no runtime.
+The 82,209 functions become 412 C files of 200 functions (247 MB, written in 2 seconds, outside any git tree) with `game.h`
+(declarations), `imports.h` (the names of the system functions), and `dispatch.c`: the table that finds a function by address (for the
+30,605 indirect calls and the indirect tail jumps), the table of import trampolines (an import called through a pointer reaches the
+host as an import), and the hooks that route `rt_*` to the host. Every file passes `clang -fsyntax-only`.
 
-## Finding the functions (`mh3u-recomp`, `discover.rs`; `mh3u-tools functions`)
-
-A function starts at the entry point, at every direct call (`bl`), and at every word of the data sections that points at an
-instruction right after a return, a jump or padding. The last rule matters: pointers into the middle of a function are jump-table
-entries, not functions (1,357 of the 32,186 code pointers in the data were of that kind). Result on the game's code: 39,366 functions
-from the entry and calls, 70,195 with the pointers (virtual functions); median 76 bytes, 99th percentile about 3 KB, largest 44 KB.
-A function that is only reached by a tail jump (`b` out of another function) is not found yet and would be merged into its neighbour.
-
-The paired singles (about 17,000 instructions) have no oracle (QEMU has none): their semantics are written from the architecture
-book, the C is checked against the interpreter on random states (including the second halves of the registers and the quantization
-registers), and a few cases are computed by hand in `mh3u-ppc`'s unit tests.
-
-## Not tested against QEMU, with the reason
-
-`mftb` (the time base moves), the floating point status register (not modelled), the traps `tw`/`twi`/`sc` (they stop the program: unit
-tests), `lmw` (it overwrites the registers the harness needs), the privileged ones, `eciwx`/`ecowx`, the 64-bit ones, `fres`/`frsqrte`
-(only closeness).
+`build-game` compiles the files on every core into a shared library (`libgame.so` / `game.dll`): 41 s at `-O0` on 24 cores.
+`run` is the first runtime (`mh3u-rt`, the only crate with `unsafe`): it reserves the guest's 4 GiB address space, puts the
+executable's sections in it, loads the library, gives it a stack and calls the entry point. Every system function is for now a
+stub that returns 0 and is logged in order of first call. First result: the game's startup runs through 36 distinct system
+functions (heap, mutexes, file system, save, system config) and then calls a null pointer, since the heap allocator returned 0.
+The list of functions that need real code, in the order the game wants them, is the to-do list for the Cafe OS layer.

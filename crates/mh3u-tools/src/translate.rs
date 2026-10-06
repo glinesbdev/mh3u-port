@@ -72,6 +72,42 @@ pub fn run(input: &Input, out: &Path, per_file: usize) -> Result<Report> {
         std::fs::write(out.join(format!("part_{n:04}.c")), src)?;
         files += 1;
     }
+    let mut d = String::from(
+        "#include \"game.h\"\n#include \"imports.h\"\n\
+         static Host host;\n\
+         typedef void (*Fn)(Ctx *);\n\
+         static const struct { uint32_t a; Fn f; } functions[] = {\n",
+    );
+    for &s in &starts {
+        let _ = writeln!(d, "{{{s:#x}u,{}}},", function_name(s));
+    }
+    d.push_str("};\nstatic const struct { uint32_t a; uint32_t n; } trampolines[] = {\n");
+    for (&a, &n) in targets {
+        let _ = writeln!(d, "{{{a:#x}u,{n}}},");
+    }
+    d.push_str(
+        "};\n\
+         GAME_API void game_set_host(const Host *h) { host = *h; }\n\
+         GAME_API uint32_t game_ctx_size(void) { return sizeof(Ctx); }\n\
+         GAME_API uint32_t game_import_count(void) { return sizeof import_names / sizeof *import_names; }\n\
+         GAME_API const char *game_import_name(uint32_t n) { return n < game_import_count() ? import_names[n] : 0; }\n\
+         GAME_API int game_call(Ctx *c, uint32_t a) {\n\
+         \x20   size_t lo = 0, hi = sizeof functions / sizeof *functions;\n\
+         \x20   while (lo < hi) { size_t m = (lo + hi) / 2; if (functions[m].a < a) lo = m + 1; else hi = m; }\n\
+         \x20   if (lo != sizeof functions / sizeof *functions && functions[lo].a == a) { functions[lo].f(c); return 1; }\n\
+         \x20   lo = 0; hi = sizeof trampolines / sizeof *trampolines;\n\
+         \x20   while (lo < hi) { size_t m = (lo + hi) / 2; if (trampolines[m].a < a) lo = m + 1; else hi = m; }\n\
+         \x20   if (lo != sizeof trampolines / sizeof *trampolines && trampolines[lo].a == a) { host.import(c, trampolines[lo].n); return 1; }\n\
+         \x20   return 0;\n\
+         }\n\
+         void rt_call(Ctx *c, uint32_t t) { if (!game_call(c, t)) host.unknown_call(c, t); }\n\
+         void rt_jump(Ctx *c, uint32_t t) { if (!game_call(c, t)) host.unknown_call(c, t); }\n\
+         void rt_import(Ctx *c, uint32_t n) { host.import(c, n); }\n\
+         void rt_trap(Ctx *c, uint32_t w) { host.trap(c, w); }\n\
+         void rt_unsupported(Ctx *c, uint32_t w) { host.unsupported(c, w); }\n\
+         void rt_syscall(Ctx *c) { host.syscall(c); }\n",
+    );
+    std::fs::write(out.join("dispatch.c"), &d)?;
     Ok(Report {
         functions: starts.len(),
         files,

@@ -1,6 +1,7 @@
 //! Explorers for the game's files, for the port's groundwork. They read the owner's own dump (`--game-dir`, or the `MH3U_GAME_DIR`
 //! environment variable) and print; they change nothing.
 
+mod build_game;
 mod codegen_bench;
 #[cfg(target_os = "linux")]
 mod shader_scan;
@@ -27,6 +28,21 @@ enum Tool {
     Sections { game_dir: PathBuf },
     /// Find where the functions of the executable start (calls, code pointers in the data, the entry point) and say how many.
     Functions { game_dir: PathBuf },
+    /// Compile the C that `translate` wrote into a library, OUT/libgame.so (or .dll), using every core.
+    BuildGame {
+        c_dir: PathBuf,
+        /// The optimisation level of the C compiler (0 builds fastest).
+        #[arg(long, default_value_t = 1)]
+        opt: u8,
+    },
+    /// Run the game's entry point from the library built by `build-game`, and list the system functions it calls.
+    Run {
+        game_dir: PathBuf,
+        c_dir: PathBuf,
+        /// How many system calls to allow before stopping.
+        #[arg(long, default_value_t = 100_000)]
+        max_imports: u64,
+    },
     /// Translate the whole executable into C files in OUT (which must not be inside a git working tree).
     Translate {
         game_dir: PathBuf,
@@ -172,6 +188,8 @@ fn main() -> Result<()> {
                 }
             }
             let (names, targets) = import_targets(&data, &text)?;
+            let end = TEXT_ADDRESS + 4 * words.len() as u32;
+            pointers.extend(rpx::relocation_targets(&data, TEXT_ADDRESS, end)?);
             let r = translate::run(
                 &translate::Input {
                     words: &words,
@@ -187,6 +205,12 @@ fn main() -> Result<()> {
             println!("{} functions, {} files, {} bytes", r.functions, r.files, r.bytes);
             Ok(())
         }
+        Tool::BuildGame { c_dir, opt } => build_game::run(&c_dir, opt),
+        Tool::Run {
+            game_dir,
+            c_dir,
+            max_imports,
+        } => run_game(&dump(&game_dir)?, &c_dir, max_imports),
         Tool::Functions { game_dir } => functions(&dump(&game_dir)?),
         Tool::Coverage { game_dir, unknown } => coverage(&dump(&game_dir)?, unknown),
         Tool::Imports { game_dir, names } => imports(&dump(&game_dir)?, names),
@@ -569,6 +593,10 @@ fn functions(dump: &Dump) -> Result<()> {
             pointers.extend(body.as_chunks::<4>().0.iter().map(|w| u32::from_be_bytes(*w)));
         }
     }
+    let end = TEXT_ADDRESS + 4 * words.len() as u32;
+    let by_relocation = rpx::relocation_targets(&data, TEXT_ADDRESS, end)?;
+    println!("{} addresses in the code that the relocations name", by_relocation.len());
+    pointers.extend(by_relocation);
     let calls = mh3u_recomp::discover::functions(TEXT_ADDRESS, &words, &[], entry);
     let all = mh3u_recomp::discover::functions(TEXT_ADDRESS, &words, &pointers, entry);
     println!("entry point {entry:#x}");
@@ -592,11 +620,14 @@ fn functions(dump: &Dump) -> Result<()> {
     Ok(())
 }
 
-/// The import trampolines the code calls: the address of each (where the calls to an import go) and the numbers of the imports, which are
-/// named "library:function". The relocations say which import a call site means; a trampoline serves one import only.
+/// The import trampolines: the address of each (where a call to an import goes) and the names of the imports ("library:function"), in
+/// the order of the symbol table. The calls in the code name their import through the relocations; the trampolines of all the others
+/// follow from those, since they sit at the same distance from the symbols' own addresses.
 fn import_targets(rpx_data: &[u8], text: &[u8]) -> Result<(Vec<String>, std::collections::BTreeMap<u32, u32>)> {
-    let mut names: Vec<String> = Vec::new();
-    let mut targets = std::collections::BTreeMap::new();
+    let symbols = rpx::import_addresses(rpx_data)?;
+    let names: Vec<String> = symbols.iter().map(|(i, _)| format!("{}:{}", i.library, i.name)).collect();
+    // each library's trampolines are at one distance from the library's symbols
+    let mut shift: std::collections::BTreeMap<String, u32> = std::collections::BTreeMap::new();
     for (site, import) in rpx::import_sites(rpx_data)? {
         let at = site.wrapping_sub(TEXT_ADDRESS) as usize;
         let Some(w) = text.get(at..at + 4) else { continue };
@@ -605,15 +636,53 @@ fn import_targets(rpx_data: &[u8], text: &[u8]) -> Result<(Vec<String>, std::col
             continue;
         }
         let target = site.wrapping_add((((w & 0x03ff_fffc) as i32) << 6 >> 6) as u32);
-        let name = format!("{}:{}", import.library, import.name);
-        let number = names.iter().position(|n| *n == name).unwrap_or_else(|| {
-            names.push(name);
-            names.len() - 1
-        });
-        if let Some(&old) = targets.get(&target) {
-            anyhow::ensure!(old == number as u32, "two imports share the trampoline {target:#x}");
-        }
-        targets.insert(target, number as u32);
+        let value = symbols
+            .iter()
+            .find(|(i, _)| i.library == import.library && i.name == import.name)
+            .map(|(_, v)| *v)
+            .with_context(|| format!("no symbol for the import {}:{}", import.library, import.name))?;
+        let this = target.wrapping_sub(value);
+        anyhow::ensure!(
+            *shift.entry(import.library.clone()).or_insert(this) == this,
+            "the trampolines of {} are not at a constant distance from their symbols",
+            import.library
+        );
     }
+    let targets = symbols
+        .iter()
+        .enumerate()
+        .filter_map(|(n, (i, v))| shift.get(&i.library).map(|s| (v.wrapping_add(*s), n as u32)))
+        .collect();
     Ok((names, targets))
+}
+
+fn run_game(dump: &Dump, c_dir: &Path, max_imports: u64) -> Result<()> {
+    let data = read(&dump.executable()?)?;
+    let entry = u32::from_be_bytes(data.get(0x18..0x1c).context("short file")?.try_into()?);
+    let mut pieces = Vec::new();
+    for s in rpx::sections(&data)? {
+        // the sections that are loaded (SHF_ALLOC) into the program's own range; the import sections are placed by the loader
+        if s.flags & 2 == 0 || s.addr >= 0x8000_0000 || s.addr == 0 {
+            continue;
+        }
+        let bytes = if s.kind == 8 { Vec::new() } else { rpx::contents(&data, &s)? };
+        pieces.push(mh3u_rt::Piece {
+            address: s.addr,
+            bytes,
+            zero: if s.kind == 8 { s.size as u32 } else { 0 },
+        });
+    }
+    let library = c_dir.join(build_game::LIBRARY);
+    let options = mh3u_rt::Options {
+        entry,
+        max_imports,
+        stack_top: 0xa010_0000,
+        stack_size: 0x10_0000,
+    };
+    let report = mh3u_rt::run(&library, &pieces, &options)?;
+    println!("{}", report.end);
+    for (name, n) in &report.imports {
+        println!("  {n:>8}  {name}");
+    }
+    Ok(())
 }

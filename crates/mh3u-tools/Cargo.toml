@@ -16,3 +16,4 @@ mh3u-formats.workspace = true
 mh3u-latte.workspace = true
 mh3u-ppc.workspace = true
 mh3u-recomp.workspace = true
+mh3u-rt = { path = "../mh3u-rt" }

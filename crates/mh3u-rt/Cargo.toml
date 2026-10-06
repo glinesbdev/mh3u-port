@@ -1,0 +1,17 @@
+[package]
+name = "mh3u-rt"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# the one crate that may use `unsafe` (see docs/code-guidelines.md): the guest's memory and the calls into the translated library
+[lints.rust]
+unsafe_code = "allow"
+
+[lints.clippy]
+undocumented_unsafe_blocks = "warn"
+
+[dependencies]
+anyhow.workspace = true
+libloading = "0.8"
+memmap2 = "0.9"

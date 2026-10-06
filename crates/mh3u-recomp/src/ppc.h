@@ -21,7 +21,22 @@ typedef struct Ctx {
     uint8_t *mem; /* guest address 0; a guest address a is at mem + a */
 } Ctx;
 
-/* hooks the program that runs the translated code provides */
+/* what the program that runs the translated code gives it (the translated game is a library; the program sets these with game_set_host) */
+typedef struct Host {
+    void (*import)(Ctx *c, uint32_t number);     /* a call to a system function; the number is its place in `imports.h` */
+    void (*unknown_call)(Ctx *c, uint32_t target); /* a call or jump to an address that is not the start of a translated function */
+    void (*trap)(Ctx *c, uint32_t word);
+    void (*unsupported)(Ctx *c, uint32_t word);
+    void (*syscall)(Ctx *c);
+} Host;
+
+#ifdef _WIN32
+#define GAME_API __declspec(dllexport)
+#else
+#define GAME_API __attribute__((visibility("default")))
+#endif
+
+/* the hooks the generated code calls; the library routes them to the host (dispatch.c) and the test programs define them themselves */
 void rt_syscall(Ctx *c);
 void rt_trap(Ctx *c, uint32_t word);
 void rt_unsupported(Ctx *c, uint32_t word);
