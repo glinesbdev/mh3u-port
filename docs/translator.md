@@ -47,8 +47,10 @@ of something else is the translator's job to find (see "What is not translated y
 
 - The table for indirect calls (30,605 `rt_call(c, t)` sites) and for the 4,312 indirect tail jumps that are not switches: both go through
   the runtime, which must map an address to a translated function.
-- The import calls: 550 distinct call targets just past the end of `.text` (from 0x31963d8) are the import trampolines; the runtime must
-  map each to the Cafe OS function it stands for.
+- The imports: a call to one of the 568 import trampolines (placed after the end of `.text`, from 0x31963d8) is `rt_import(c, number)`,
+  and `imports.h` names each number ("library:function"). Which import a trampoline stands for comes from the relocations of `.text`
+  (7,231 name an import; each trampoline serves one import, checked); the runtime implements `rt_import`. Imports reached through a
+  pointer instead of a call are not known yet.
 - Not found: functions only reached by a tail jump, and the 6 words in the code that are not instructions (data between functions).
 
 ## Switch tables (`switch_tables` in `mh3u-recomp`)

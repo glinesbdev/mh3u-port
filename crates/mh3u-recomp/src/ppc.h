@@ -26,6 +26,7 @@ void rt_syscall(Ctx *c);
 void rt_trap(Ctx *c, uint32_t word);
 void rt_unsupported(Ctx *c, uint32_t word);
 void rt_call(Ctx *c, uint32_t target);     /* a call through a register or to an address the translator does not know */
+void rt_import(Ctx *c, uint32_t number);   /* a call to a system function; the number is its place in `imports.h` */
 void rt_jump(Ctx *c, uint32_t target);     /* a jump through a register */
 
 /* ---- the condition register */

@@ -24,6 +24,8 @@ pub struct Function<'a> {
     pub functions: &'a BTreeSet<u32>,
     /// The switch tables: the address of the `bctr` and how many branches the table after it holds.
     pub tables: &'a BTreeMap<u32, u32>,
+    /// The import trampolines: the address a call goes to and the number of the import it stands for.
+    pub imports: &'a BTreeMap<u32, u32>,
 }
 
 fn hex(v: u32) -> String {
@@ -678,6 +680,8 @@ fn emit_branch(insn: Insn, addr: u32, fx: &Function) -> Vec<String> {
     let leave = |t: u32| -> Vec<String> {
         if fx.functions.contains(&t) {
             vec![format!("{}(c); return;", function_name(t))]
+        } else if let Some(n) = fx.imports.get(&t) {
+            vec![format!("rt_import(c, {n}); return;")]
         } else {
             vec![format!("rt_jump(c, {});", hex(t)), "return;".to_string()]
         }
@@ -685,6 +689,8 @@ fn emit_branch(insn: Insn, addr: u32, fx: &Function) -> Vec<String> {
     let call = |t: u32| -> String {
         if fx.functions.contains(&t) {
             format!("{}(c);", function_name(t))
+        } else if let Some(n) = fx.imports.get(&t) {
+            format!("rt_import(c, {n});")
         } else {
             format!("rt_call(c, {});", hex(t))
         }
@@ -858,6 +864,11 @@ pub fn switch_tables(start: u32, words: &[u32]) -> BTreeMap<u32, u32> {
 
 /// One C function for the PowerPC function whose words start at `start`.
 pub fn emit_function(start: u32, words: &[u32], functions: &BTreeSet<u32>) -> String {
+    emit_function_with(start, words, functions, &BTreeMap::new())
+}
+
+/// The same, with the import trampolines known: a call to one is `rt_import(c, number)`.
+pub fn emit_function_with(start: u32, words: &[u32], functions: &BTreeSet<u32>, imports: &BTreeMap<u32, u32>) -> String {
     let end = start + 4 * words.len() as u32;
     let tables = switch_tables(start, words);
     let mut labels = block_starts(start, words);
@@ -866,6 +877,7 @@ pub fn emit_function(start: u32, words: &[u32], functions: &BTreeSet<u32>) -> St
     }
     let fx = Function {
         tables: &tables,
+        imports,
         start,
         end,
         labels: &labels,

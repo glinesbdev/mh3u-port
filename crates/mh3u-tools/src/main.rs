@@ -171,7 +171,19 @@ fn main() -> Result<()> {
                     pointers.extend(body.as_chunks::<4>().0.iter().map(|w| u32::from_be_bytes(*w)));
                 }
             }
-            let r = translate::run(&words, TEXT_ADDRESS, &pointers, entry, &out, per_file)?;
+            let (names, targets) = import_targets(&data, &text)?;
+            let r = translate::run(
+                &translate::Input {
+                    words: &words,
+                    base: TEXT_ADDRESS,
+                    pointers: &pointers,
+                    entry,
+                    imports: &names,
+                    targets: &targets,
+                },
+                &out,
+                per_file,
+            )?;
             println!("{} functions, {} files, {} bytes", r.functions, r.files, r.bytes);
             Ok(())
         }
@@ -578,4 +590,30 @@ fn functions(dump: &Dump) -> Result<()> {
         sizes[sizes.len() - 1]
     );
     Ok(())
+}
+
+/// The import trampolines the code calls: the address of each (where the calls to an import go) and the numbers of the imports, which are
+/// named "library:function". The relocations say which import a call site means; a trampoline serves one import only.
+fn import_targets(rpx_data: &[u8], text: &[u8]) -> Result<(Vec<String>, std::collections::BTreeMap<u32, u32>)> {
+    let mut names: Vec<String> = Vec::new();
+    let mut targets = std::collections::BTreeMap::new();
+    for (site, import) in rpx::import_sites(rpx_data)? {
+        let at = site.wrapping_sub(TEXT_ADDRESS) as usize;
+        let Some(w) = text.get(at..at + 4) else { continue };
+        let w = u32::from_be_bytes(w.try_into()?);
+        if w >> 26 != 18 {
+            continue;
+        }
+        let target = site.wrapping_add((((w & 0x03ff_fffc) as i32) << 6 >> 6) as u32);
+        let name = format!("{}:{}", import.library, import.name);
+        let number = names.iter().position(|n| *n == name).unwrap_or_else(|| {
+            names.push(name);
+            names.len() - 1
+        });
+        if let Some(&old) = targets.get(&target) {
+            anyhow::ensure!(old == number as u32, "two imports share the trampoline {target:#x}");
+        }
+        targets.insert(target, number as u32);
+    }
+    Ok((names, targets))
 }

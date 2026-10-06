@@ -3,7 +3,8 @@
 //! working tree.
 
 use anyhow::{Result, bail};
-use mh3u_recomp::{RUNTIME_H, discover, emit_function, function_name};
+use mh3u_recomp::{RUNTIME_H, discover, emit_function_with, function_name};
+use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::path::Path;
 
@@ -13,13 +14,33 @@ pub struct Report {
     pub bytes: usize,
 }
 
-pub fn run(words: &[u32], base: u32, pointers: &[u32], entry: u32, out: &Path, per_file: usize) -> Result<Report> {
+/// What the executable holds that the translation needs.
+pub struct Input<'a> {
+    pub words: &'a [u32],
+    pub base: u32,
+    /// The words of the data sections (code pointers are among them).
+    pub pointers: &'a [u32],
+    pub entry: u32,
+    /// The names of the imports, and where the calls to each go.
+    pub imports: &'a [String],
+    pub targets: &'a BTreeMap<u32, u32>,
+}
+
+pub fn run(input: &Input, out: &Path, per_file: usize) -> Result<Report> {
     if crate::codegen_bench::in_a_working_tree(out) {
         bail!(
             "{} is inside a git working tree: what this writes is made from the game and must not go in a repository",
             out.display()
         );
     }
+    let Input {
+        words,
+        base,
+        pointers,
+        entry,
+        imports,
+        targets,
+    } = *input;
     let functions = discover::functions(base, words, pointers, entry);
     let starts: Vec<u32> = functions.iter().copied().collect();
     std::fs::create_dir_all(out)?;
@@ -29,6 +50,14 @@ pub fn run(words: &[u32], base: u32, pointers: &[u32], entry: u32, out: &Path, p
         let _ = writeln!(header, "void {}(Ctx *c);", function_name(s));
     }
     std::fs::write(out.join("game.h"), &header)?;
+    let mut names = String::from(
+        "/* the system functions the game calls, by the number rt_import is given */\nstatic const char *const import_names[] = {\n",
+    );
+    for n in imports {
+        let _ = writeln!(names, "    \"{n}\",");
+    }
+    names.push_str("};\n");
+    std::fs::write(out.join("imports.h"), names)?;
     let end = base + 4 * words.len() as u32;
     let mut bytes = header.len();
     let mut files = 0;
@@ -37,7 +66,7 @@ pub fn run(words: &[u32], base: u32, pointers: &[u32], entry: u32, out: &Path, p
         for &s in chunk {
             let next = functions.range(s + 4..).next().copied().unwrap_or(end);
             let body = &words[((s - base) / 4) as usize..((next - base) / 4) as usize];
-            src.push_str(&emit_function(s, body, &functions));
+            src.push_str(&emit_function_with(s, body, &functions, targets));
         }
         bytes += src.len();
         std::fs::write(out.join(format!("part_{n:04}.c")), src)?;
