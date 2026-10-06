@@ -20,4 +20,6 @@ mh3u-formats = { path = "crates/mh3u-formats" }
 mh3u-dump = { path = "crates/mh3u-dump" }
 mh3u-cemu = { path = "crates/mh3u-cemu" }
 mh3u-ppc = { path = "crates/mh3u-ppc" }
+mh3u-recomp = { path = "crates/mh3u-recomp" }
+mh3u-testkit = { path = "crates/mh3u-testkit" }
 mh3u-latte = { path = "crates/mh3u-latte" }

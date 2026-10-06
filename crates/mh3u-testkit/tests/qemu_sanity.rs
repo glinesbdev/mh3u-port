@@ -1,7 +1,6 @@
 //! The harness itself: a program whose answer is known must come out of QEMU as expected.
 
-mod harness;
-use harness::*;
+use mh3u_testkit::harness::*;
 
 #[test]
 fn qemu_runs_the_stub_and_returns_the_state() {

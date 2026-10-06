@@ -31,6 +31,24 @@ What QEMU does not check: the **paired singles** (QEMU has none), and the instru
 the game does not use them). Their meaning has to come from the architecture book, and a second check (from the game itself: Cemu's
 memory, see `docs/spikes.md`) is planned.
 
+## The C against the interpreter (`crates/mh3u-testkit`, `crates/mh3u-recomp`)
+
+`mh3u-recomp` writes C for each function: every instruction is a few statements using the helpers of `ppc.h` (the registers in a `Ctx`,
+loads and stores through a base pointer, the carry and overflow rules, the condition register). `tests/c_diff.rs` translates every
+instruction word of the same random cases, compiles them all into one program with the system C compiler (clang, cc or gcc), runs the
+program on the same states and compares with the interpreter bit for bit: 1,320 words, every branch form that stays inside a
+function, and the reservation pair. Together with the first part this is a chain: translated C = interpreter = QEMU.
+
+Where the C is deliberately not the interpreter: a `bl` or `bctrl` is a *call* (a C call, or a hook for an address the translator does
+not know) and `blr` is a *return*, where the interpreter changes the program counter; code that uses them as jumps into the middle
+of something else is the translator's job to find (see "What is not translated yet").
+
+## What is not translated yet
+
+- The paired singles (about 17,000 instructions): no oracle (QEMU has none); the semantics are written from the architecture book.
+- Jump tables (4,822 indirect jumps through `bctr`): they are `rt_jump` hooks until the tables are resolved.
+- Function discovery for the whole game and the table for indirect calls (30,605 sites).
+
 ## Not tested against QEMU, with the reason
 
 `mftb` (the time base moves), the floating point status register (not modelled), the traps `tw`/`twi`/`sc` (they stop the program: unit

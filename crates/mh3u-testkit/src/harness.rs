@@ -53,7 +53,7 @@ impl Default for St {
 }
 
 impl St {
-    fn to_bytes(&self) -> Vec<u8> {
+    pub fn to_bytes(&self) -> Vec<u8> {
         let mut b = vec![0u8; STATE];
         for (i, v) in self.gpr.iter().enumerate() {
             b[GPR_AT + 4 * i..GPR_AT + 4 * i + 4].copy_from_slice(&v.to_be_bytes());
@@ -68,7 +68,7 @@ impl St {
         b
     }
 
-    fn from_bytes(b: &[u8]) -> St {
+    pub fn from_bytes(b: &[u8]) -> St {
         let u32_at = |o: usize| u32::from_be_bytes(b[o..o + 4].try_into().unwrap());
         let mut s = St::default();
         for i in 0..32 {
@@ -339,4 +339,12 @@ pub fn run_raw(code: &[u32], cases: &[St], tag: &str) -> Result<(Option<i32>, Ve
 
 pub fn words_exit(code: u32) -> Vec<u32> {
     vec![addi(0, 0, 1), addi(3, 0, code as i32), SC]
+}
+
+pub fn state_bytes(s: &St) -> Vec<u8> {
+    s.to_bytes()
+}
+
+pub fn state_from_bytes(b: &[u8]) -> St {
+    St::from_bytes(b)
 }

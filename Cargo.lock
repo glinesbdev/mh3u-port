@@ -185,6 +185,21 @@ name = "mh3u-ppc"
 version = "0.1.0"
 
 [[package]]
+name = "mh3u-recomp"
+version = "0.1.0"
+dependencies = [
+ "mh3u-ppc",
+]
+
+[[package]]
+name = "mh3u-testkit"
+version = "0.1.0"
+dependencies = [
+ "mh3u-ppc",
+ "mh3u-recomp",
+]
+
+[[package]]
 name = "mh3u-tools"
 version = "0.1.0"
 dependencies = [

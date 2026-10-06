@@ -784,15 +784,16 @@ impl Cpu {
             }
             Fadds | Fsubs | Fmuls | Fdivs | Fmadds | Fmsubs | Fnmadds | Fnmsubs => {
                 let (x, y, z) = (single(a), single(b), single(c));
-                let r = match insn.op {
-                    Fadds => x + y,
-                    Fsubs => x - y,
-                    Fmuls => x * z,
-                    Fdivs => x / y,
-                    Fmadds | Fnmadds => x.mul_add(z, y),
-                    _ => x.mul_add(z, -y),
+                // the operands each operation uses, in the order a NaN among them is passed on
+                let (r, used): (f32, Vec<f32>) = match insn.op {
+                    Fadds => (x + y, vec![x, y]),
+                    Fsubs => (x - y, vec![x, y]),
+                    Fmuls => (x * z, vec![x, z]),
+                    Fdivs => (x / y, vec![x, y]),
+                    Fmadds | Fnmadds => (x.mul_add(z, y), vec![x, z, y]),
+                    _ => (x.mul_add(z, -y), vec![x, z, y]),
                 };
-                let r = canonical32(r, &[x, y, z]);
+                let r = canonical32(r, &used);
                 let r = if matches!(insn.op, Fnmadds | Fnmsubs) && !r.is_nan() {
                     -r
                 } else {
