@@ -912,6 +912,7 @@ pub fn emit_function_with(start: u32, words: &[u32], functions: &BTreeSet<u32>, 
     };
     let mut out = String::new();
     let _ = writeln!(out, "void {}(Ctx *c) {{", function_name(start));
+    let _ = writeln!(out, "    ENTER(c, {});", hex(start));
     for (i, &w) in words.iter().enumerate() {
         let addr = start + 4 * i as u32;
         if labels.contains(&addr) {

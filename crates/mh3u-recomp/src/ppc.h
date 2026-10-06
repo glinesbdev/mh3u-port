@@ -28,6 +28,8 @@ typedef struct Host {
     void (*trap)(Ctx *c, uint32_t word);
     void (*unsupported)(Ctx *c, uint32_t word);
     void (*syscall)(Ctx *c);
+    void (*enter)(Ctx *c, uint32_t function);
+    void (*watch)(Ctx *c, uint32_t address, uint64_t value, uint32_t size); /* only called by a build made with MH3U_WATCH */
 } Host;
 
 #ifdef _WIN32
@@ -128,10 +130,24 @@ AI uint32_t ld16(Ctx *c, uint32_t a) { uint16_t v; memcpy(&v, H(c, a), 2); retur
 AI uint32_t ld16s(Ctx *c, uint32_t a) { return ext16(ld16(c, a)); }
 AI uint32_t ld32(Ctx *c, uint32_t a) { uint32_t v; memcpy(&v, H(c, a), 4); return bswap32(v); }
 AI uint64_t ld64(Ctx *c, uint32_t a) { uint64_t v; memcpy(&v, H(c, a), 8); return __builtin_bswap64(v); }
-AI void st8(Ctx *c, uint32_t a, uint32_t v) { *H(c, a) = (uint8_t)v; }
-AI void st16(Ctx *c, uint32_t a, uint32_t v) { uint16_t s = __builtin_bswap16((uint16_t)v); memcpy(H(c, a), &s, 2); }
-AI void st32(Ctx *c, uint32_t a, uint32_t v) { uint32_t s = bswap32(v); memcpy(H(c, a), &s, 4); }
-AI void st64(Ctx *c, uint32_t a, uint64_t v) { uint64_t s = __builtin_bswap64(v); memcpy(H(c, a), &s, 8); }
+#ifdef MH3U_WATCH
+/* a debugging build reports every store that overlaps the watched range (see game_set_watch) */
+extern uint32_t g_watch_lo, g_watch_hi;
+void rt_watch(Ctx *c, uint32_t a, uint64_t v, uint32_t size);
+#define WATCH(c, a, v, n) do { if ((a) < g_watch_hi && (a) + (n) > g_watch_lo) rt_watch(c, a, v, n); } while (0)
+extern uint32_t g_enter;
+void rt_enter(Ctx *c, uint32_t function);
+extern volatile uint32_t g_last_fn;
+extern uint32_t g_enter_lr;
+#define ENTER(c, f) do { g_last_fn = (f); if ((f) == g_enter || (c)->lr == g_enter_lr) rt_enter(c, f); } while (0)
+#else
+#define WATCH(c, a, v, n) do { } while (0)
+#define ENTER(c, f) do { } while (0)
+#endif
+AI void st8(Ctx *c, uint32_t a, uint32_t v) { WATCH(c, a, v, 1); *H(c, a) = (uint8_t)v; }
+AI void st16(Ctx *c, uint32_t a, uint32_t v) { WATCH(c, a, v, 2); uint16_t s = __builtin_bswap16((uint16_t)v); memcpy(H(c, a), &s, 2); }
+AI void st32(Ctx *c, uint32_t a, uint32_t v) { WATCH(c, a, v, 4); uint32_t s = bswap32(v); memcpy(H(c, a), &s, 4); }
+AI void st64(Ctx *c, uint32_t a, uint64_t v) { WATCH(c, a, v, 8); uint64_t s = __builtin_bswap64(v); memcpy(H(c, a), &s, 8); }
 AI uint32_t ldmb(Ctx *c, uint32_t a, uint32_t k) { return ld8(c, a + k); }
 AI void zero32(Ctx *c, uint32_t a) { memset(H(c, a & ~31u), 0, 32); }
 

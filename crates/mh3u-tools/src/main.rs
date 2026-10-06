@@ -52,6 +52,9 @@ enum Tool {
         /// The optimisation level of the C compiler (0 builds fastest).
         #[arg(long, default_value_t = 1)]
         opt: u8,
+        /// Build with the store watch (for `run --watch`); slower.
+        #[arg(long)]
+        watch: bool,
     },
     /// Run the game's entry point from the library built by `build-game`, and list the system functions it calls.
     Run {
@@ -230,7 +233,7 @@ fn main() -> Result<()> {
             println!("{} functions, {} files, {} bytes", r.functions, r.files, r.bytes);
             Ok(())
         }
-        Tool::BuildGame { c_dir, opt } => build_game::run(&c_dir, opt),
+        Tool::BuildGame { c_dir, opt, watch } => build_game::run(&c_dir, opt, watch),
         Tool::Run {
             game_dir,
             c_dir,
@@ -250,20 +253,7 @@ fn main() -> Result<()> {
                 let o = at.wrapping_sub(TEXT_ADDRESS) as usize;
                 let Some(w) = text.get(o..o + 4) else { break };
                 let w = u32::from_be_bytes(w.try_into()?);
-                let line = match mh3u_ppc::Insn::decode(w) {
-                    Some(i) => format!(
-                        "{:<10} rd/rs={} ra={} rb={} simm={} uimm={:#x} bo={} bi={}",
-                        i.op.name(),
-                        i.rd(),
-                        i.ra(),
-                        i.rb(),
-                        i.simm(),
-                        i.uimm(),
-                        i.bo(),
-                        i.bi()
-                    ),
-                    None => "?".to_string(),
-                };
+                let line = mh3u_ppc::format(at, w);
                 println!("{at:#x}  {w:08x}  {line}");
             }
             Ok(())

@@ -2,12 +2,42 @@
 //! console's frame pacing. Draws, shaders and textures are the next part.
 
 use crate::Display;
+use crate::state::{State, arg, farg};
 use mh3u_rt::{Ctx, Guest, Gx2Backend};
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 /// The names this backend handles.
 const CALLS: &[&str] = &[
+    "gx2:GX2SetupContextStateEx",
+    "gx2:GX2SetContextState",
+    "gx2:GX2BeginDisplayListEx",
+    "gx2:GX2EndDisplayList",
+    "gx2:GX2DirectCallDisplayList",
+    "gx2:GX2SetVertexShader",
+    "gx2:GX2SetPixelShader",
+    "gx2:GX2SetGeometryShader",
+    "gx2:GX2SetFetchShader",
+    "gx2:GX2SetAttribBuffer",
+    "gx2:GX2SetVertexUniformBlock",
+    "gx2:GX2SetPixelUniformBlock",
+    "gx2:GX2SetGeometryUniformBlock",
+    "gx2:GX2SetPixelTexture",
+    "gx2:GX2SetPixelSampler",
+    "gx2:GX2SetColorBuffer",
+    "gx2:GX2SetDepthBuffer",
+    "gx2:GX2SetViewport",
+    "gx2:GX2SetScissor",
+    "gx2:GX2SetBlendControl",
+    "gx2:GX2SetColorControl",
+    "gx2:GX2SetTargetChannelMasks",
+    "gx2:GX2SetDepthOnlyControl",
+    "gx2:GX2SetDepthStencilControl",
+    "gx2:GX2SetCullOnlyControl",
+    "gx2:GX2SetPolygonControl",
+    "gx2:GX2SetAlphaTest",
+    "gx2:GX2DrawEx",
+    "gx2:GX2DrawIndexedEx",
     "gx2:GX2ClearColor",
     "gx2:GX2CopyColorBufferToScanBuffer",
     "gx2:GX2SwapScanBuffers",
@@ -39,6 +69,16 @@ pub struct Gx2 {
     tv: Option<wgpu::Texture>,
     swaps: u32,
     interval: u32,
+    /// The state of each context the game has made, by the guest address of its `GX2ContextState`, and the one in use.
+    contexts: HashMap<u32, State>,
+    current: u32,
+    /// Display lists: recorded calls by the address of their buffer, and the list being recorded.
+    lists: HashMap<u32, Vec<Recorded>>,
+    recording: Option<(u32, Vec<Recorded>)>,
+    draws: u64,
+    null_draws: u64,
+    real_draws: u64,
+    log: bool,
     next_vsync: Instant,
 }
 
@@ -152,6 +192,14 @@ impl Gx2 {
             tv: None,
             swaps: 0,
             interval: 1,
+            contexts: HashMap::new(),
+            current: 0,
+            lists: HashMap::new(),
+            recording: None,
+            draws: 0,
+            null_draws: 0,
+            real_draws: 0,
+            log: std::env::var_os("MH3U_GFX_LOG").is_some(),
             next_vsync: Instant::now(),
         }
     }
@@ -339,18 +387,180 @@ impl Gx2 {
     }
 }
 
-impl Gx2Backend for Gx2 {
-    fn implements(&self, name: &str) -> bool {
-        CALLS.contains(&name)
+/// A call kept in a display list: its name, the argument registers and the stack arguments.
+#[derive(Clone)]
+struct Recorded {
+    name: String,
+    r: [u32; 32],
+    f: [u64; 32],
+    stack: Vec<u32>,
+}
+
+/// The calls that are never part of a display list (they are about the display, not the GPU's command stream).
+fn is_immediate(name: &str) -> bool {
+    matches!(
+        name,
+        "gx2:GX2BeginDisplayListEx"
+            | "gx2:GX2EndDisplayList"
+            | "gx2:GX2DirectCallDisplayList"
+            | "gx2:GX2SwapScanBuffers"
+            | "gx2:GX2WaitForVsync"
+            | "gx2:GX2GetSwapStatus"
+            | "gx2:GX2SetSwapInterval"
+            | "gx2:GX2GetSwapInterval"
+    )
+}
+
+impl Gx2 {
+    fn state(&mut self) -> &mut State {
+        self.contexts.entry(self.current).or_default()
     }
 
-    fn call(&mut self, name: &str, c: &mut Ctx, g: &Guest) {
+    /// Runs one call (or plays back a recorded one: `replay` is its stack).
+    fn exec(&mut self, name: &str, c: &mut Ctx, g: &Guest, replay: Option<&[u32]>) {
+        if false {
+            eprintln!("call {name}{}", if replay.is_some() { " (replayed)" } else { "" });
+        }
+        let a = |n: usize| arg(c, g, replay, n);
         match name {
+            "gx2:GX2SetupContextStateEx" => {
+                self.contexts.insert(c.r[3], State::default());
+                self.current = c.r[3];
+            }
+            "gx2:GX2SetContextState" => self.current = c.r[3],
+            "gx2:GX2SetVertexShader" => {
+                let v = a(0);
+                if false {
+                    eprintln!("  vertex shader {v:#x}");
+                }
+                self.state().vertex_shader = v;
+            }
+            "gx2:GX2SetPixelShader" => {
+                let v = a(0);
+                if false {
+                    eprintln!("  pixel shader {v:#x}");
+                }
+                self.state().pixel_shader = v;
+            }
+            "gx2:GX2SetGeometryShader" => {
+                let v = a(0);
+                self.state().geometry_shader = v;
+            }
+            "gx2:GX2SetFetchShader" => {
+                let v = a(0);
+                self.state().fetch_shader = v;
+            }
+            "gx2:GX2SetAttribBuffer" => {
+                let (i, size, stride, address) = (a(0), a(1), a(2), a(3));
+                if let Some(b) = self.state().attrib_buffers.get_mut(i as usize) {
+                    *b = crate::state::AttribBuffer { address, size, stride };
+                }
+            }
+            "gx2:GX2SetVertexUniformBlock" | "gx2:GX2SetPixelUniformBlock" => {
+                let (i, size, address) = (a(0), a(1), a(2));
+                let st = self.state();
+                let blocks = if name.contains("Vertex") {
+                    &mut st.vertex_blocks
+                } else {
+                    &mut st.pixel_blocks
+                };
+                if let Some(b) = blocks.get_mut(i as usize) {
+                    *b = crate::state::UniformBlock { address, size };
+                }
+            }
+            "gx2:GX2SetPixelTexture" => {
+                let (t, unit) = (a(0), a(1));
+                if let Some(slot) = self.state().pixel_textures.get_mut(unit as usize) {
+                    *slot = t;
+                }
+            }
+            "gx2:GX2SetPixelSampler" => {
+                let (s, unit) = (a(0), a(1));
+                if let Some(slot) = self.state().pixel_samplers.get_mut(unit as usize) {
+                    *slot = s;
+                }
+            }
+            "gx2:GX2SetColorBuffer" => {
+                let (cb, target) = (a(0), a(1));
+                if let Some(slot) = self.state().colour_buffers.get_mut(target as usize) {
+                    *slot = cb;
+                }
+            }
+            "gx2:GX2SetDepthBuffer" => {
+                let v = a(0);
+                self.state().depth_buffer = v;
+            }
+            "gx2:GX2SetViewport" => {
+                let v = [farg(c, 0), farg(c, 1), farg(c, 2), farg(c, 3), farg(c, 4), farg(c, 5)];
+                self.state().viewport = v;
+            }
+            "gx2:GX2SetScissor" => {
+                let v = [a(0), a(1), a(2), a(3)];
+                self.state().scissor = v;
+            }
+            "gx2:GX2SetBlendControl" => {
+                let t = a(0) as usize;
+                let b = crate::state::Blend {
+                    colour_src: a(1),
+                    colour_dst: a(2),
+                    colour_op: a(3),
+                    separate_alpha: a(4) != 0,
+                    alpha_src: a(5),
+                    alpha_dst: a(6),
+                    alpha_op: a(7),
+                };
+                if let Some(slot) = self.state().blend.get_mut(t) {
+                    *slot = b;
+                }
+            }
+            "gx2:GX2SetColorControl" => {
+                let v = [a(0), a(1), a(2), a(3)];
+                self.state().colour_control = v;
+            }
+            "gx2:GX2SetTargetChannelMasks" => {
+                let mut m = 0;
+                for k in 0..8 {
+                    m |= (a(k) & 0xf) << (4 * k);
+                }
+                self.state().target_masks = m;
+            }
+            "gx2:GX2SetDepthOnlyControl" => {
+                let (t, w, f) = (a(0) != 0, a(1) != 0, a(2));
+                let st = self.state();
+                (st.depth_test, st.depth_write, st.depth_func, st.stencil_test) = (t, w, f, false);
+            }
+            "gx2:GX2SetDepthStencilControl" => {
+                let (t, w, f, s) = (a(0) != 0, a(1) != 0, a(2), a(3) != 0);
+                let st = self.state();
+                (st.depth_test, st.depth_write, st.depth_func, st.stencil_test) = (t, w, f, s);
+            }
+            "gx2:GX2SetCullOnlyControl" => {
+                let (face, front, back) = (a(0), a(1) != 0, a(2) != 0);
+                let st = self.state();
+                (st.front_face, st.cull_front, st.cull_back) = (face, front, back);
+            }
+            "gx2:GX2SetPolygonControl" => {
+                let (face, front, back) = (a(0), a(1) != 0, a(2) != 0);
+                let st = self.state();
+                (st.front_face, st.cull_front, st.cull_back) = (face, front, back);
+            }
+            "gx2:GX2SetAlphaTest" => {
+                let (e, f, r) = (a(0) != 0, a(1), farg(c, 0));
+                self.state().alpha_test = (e, f, r);
+            }
+            "gx2:GX2DrawEx" => self.draw(g, a(0), a(1), None, a(2), a(3)),
+            "gx2:GX2DrawIndexedEx" => self.draw(g, a(0), a(1), Some((a(2), a(3))), a(4), a(5)),
             "gx2:GX2ClearColor" => self.clear(g, c),
             "gx2:GX2CopyColorBufferToScanBuffer" => self.copy_to_scan_buffer(g, c),
             "gx2:GX2SwapScanBuffers" => {
                 self.present();
                 self.swaps += 1;
+                if self.log && self.swaps.is_multiple_of(120) {
+                    eprintln!(
+                        "[gfx] {} swaps, {} draws ({} with no shader, {} with)",
+                        self.swaps, self.draws, self.null_draws, self.real_draws
+                    );
+                }
             }
             "gx2:GX2WaitForVsync" => self.wait_for_vsync(),
             // (swap count, flip count, last flip time, last vsync time): every swap has flipped by now
@@ -365,6 +575,109 @@ impl Gx2Backend for Gx2 {
             "gx2:GX2SetSwapInterval" => self.interval = c.r[3],
             "gx2:GX2GetSwapInterval" => c.r[3] = self.interval,
             _ => {}
+        }
+    }
+
+    fn draw(&mut self, g: &Guest, primitive: u32, count: u32, indexed: Option<(u32, u32)>, offset: u32, instances: u32) {
+        self.draws += 1;
+        if !self.log {
+            return;
+        }
+        let st = self.contexts.entry(self.current).or_default().clone();
+        if st.vertex_shader == 0 && st.pixel_shader == 0 {
+            self.null_draws += 1;
+            return;
+        }
+        self.real_draws += 1;
+        if self.real_draws > 30 {
+            return;
+        }
+        let (vs, ps) = (st.vertex_shader, st.pixel_shader);
+        let shader = |p: u32, size_at: u32, prog_at: u32| (g.u32(p + size_at), g.u32(p + prog_at));
+        eprintln!(
+            "draw {}: prim {primitive} count {count} indexed {indexed:?} offset {offset} instances {instances}",
+            self.draws
+        );
+        if vs != 0 {
+            eprintln!("  vs {vs:#x} (size, program) {:x?}", shader(vs, 0xd0, 0xd4));
+        }
+        if ps != 0 {
+            eprintln!("  ps {ps:#x} (size, program) {:x?}", shader(ps, 0xa4, 0xa8));
+        }
+        eprintln!("  fetch shader {:#x}", st.fetch_shader);
+        for (i, b) in st.attrib_buffers.iter().enumerate().filter(|(_, b)| b.address != 0) {
+            eprintln!("  attrib buffer {i}: {:#x} size {:#x} stride {}", b.address, b.size, b.stride);
+        }
+        for (i, b) in st.vertex_blocks.iter().enumerate().filter(|(_, b)| b.address != 0) {
+            eprintln!("  vertex block {i}: {:#x} size {:#x}", b.address, b.size);
+        }
+        for (i, b) in st.pixel_blocks.iter().enumerate().filter(|(_, b)| b.address != 0) {
+            eprintln!("  pixel block {i}: {:#x} size {:#x}", b.address, b.size);
+        }
+        for (i, &t) in st.pixel_textures.iter().enumerate().filter(|(_, t)| **t != 0) {
+            eprintln!(
+                "  texture {i}: {t:#x} dim {} {}x{}x{} mips {} format {:#x} tile {} image {:#x}",
+                g.u32(t),
+                g.u32(t + 4),
+                g.u32(t + 8),
+                g.u32(t + 0xc),
+                g.u32(t + 0x10),
+                g.u32(t + 0x14),
+                g.u32(t + 0x30),
+                g.u32(t + 0x24)
+            );
+        }
+        for (i, &cb) in st.colour_buffers.iter().enumerate().filter(|(_, c)| **c != 0) {
+            eprintln!(
+                "  colour buffer {i}: {cb:#x} {}x{} format {:#x}",
+                g.u32(cb + 4),
+                g.u32(cb + 8),
+                g.u32(cb + 0x14)
+            );
+        }
+        eprintln!(
+            "  depth {} {} func {} cull {} {} viewport {:?} scissor {:?}",
+            st.depth_test, st.depth_write, st.depth_func, st.cull_front, st.cull_back, st.viewport, st.scissor
+        );
+    }
+}
+
+impl Gx2Backend for Gx2 {
+    fn implements(&self, name: &str) -> bool {
+        CALLS.contains(&name)
+    }
+
+    fn call(&mut self, name: &str, c: &mut Ctx, g: &Guest) {
+        match name {
+            "gx2:GX2BeginDisplayListEx" => self.recording = Some((c.r[3], Vec::new())),
+            "gx2:GX2EndDisplayList" => {
+                if let Some((address, calls)) = self.recording.take() {
+                    c.r[3] = 0x20 + 0x10 * calls.len() as u32;
+                    self.lists.insert(address, calls);
+                }
+            }
+            "gx2:GX2DirectCallDisplayList" => {
+                let calls = self.lists.get(&c.r[3]).cloned().unwrap_or_default();
+                for call in calls {
+                    let mut replay = c.clone();
+                    replay.r = call.r;
+                    replay.f = call.f;
+                    self.exec(&call.name, &mut replay, g, Some(&call.stack));
+                }
+            }
+            _ => {
+                if let Some((_, calls)) = self.recording.as_mut().filter(|_| !is_immediate(name)) {
+                    let stack = (0..8).map(|k| g.u32(c.r[1].wrapping_add(8 + 4 * k))).collect();
+                    calls.push(Recorded {
+                        name: name.to_string(),
+                        r: c.r,
+                        f: c.f,
+                        stack,
+                    });
+                } else {
+                    self.exec(name, c, g, None);
+                }
+            }
         }
     }
 }

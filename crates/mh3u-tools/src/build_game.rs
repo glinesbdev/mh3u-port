@@ -18,7 +18,7 @@ fn compiler() -> Result<&'static str> {
         .context("no C compiler found (install clang)")
 }
 
-pub fn run(dir: &Path, opt: u8) -> Result<()> {
+pub fn run(dir: &Path, opt: u8, watch: bool) -> Result<()> {
     let cc = compiler()?;
     let mut sources: Vec<PathBuf> = std::fs::read_dir(dir)?
         .filter_map(|e| e.ok().map(|e| e.path()))
@@ -46,8 +46,9 @@ pub fn run(dir: &Path, opt: u8) -> Result<()> {
                             "-fno-strict-aliasing",
                             "-c",
                             &format!("-O{opt}"),
-                            "-I",
                         ])
+                        .args(if watch { vec!["-DMH3U_WATCH"] } else { vec![] })
+                        .arg("-I")
                         .arg(dir)
                         .arg(&src)
                         .arg("-o")

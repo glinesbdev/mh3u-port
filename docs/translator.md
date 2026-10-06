@@ -145,3 +145,22 @@ other 7 use `CUBE` (not written: its output convention has to be worked out with
 shader computes what the hardware does is not checked by anything but looking at the picture: the semantics are from the documents,
 so an operation the translator does not know is an error, never a guess.
 Vertex shaders (fetch shaders, loops, relative addressing) are next.
+
+## Getting the game to its first scene (what the runtime had to learn)
+
+Each of these was found by looking at what the game was waiting for, with the debugging aids below:
+
+- **`ProcUIProcessMessages`** delivers the foreground-acquire callback on its first call (`Step::Calls` runs guest callbacks with the
+  kernel unlocked); **audio**: `AXRegisterFrameCallback` starts a service thread that runs the callbacks every 3 ms, and voices exist;
+  **IPC buffer pools** (the keyboard library's start-up failed without them); **accounts and network** answer "one user, no network".
+- **`GX2TempGetGPUVersion`** must return 2: the game's GFD header check compares it with the shader files' GPU version, and with a
+  stub returning 0 every shader was rejected, silently, so every draw had no shader.
+- **Input**: the game waits at its first screen for a button. `VPADRead` gives one sample with the buttons held as
+  `MH3U_PRESS=<mask hex>,<period ms>` says (0x8000 is A); real input comes later.
+
+Debugging aids (all in `mh3u-tools run`): `MH3U_TRACE=1` (every system call with its result, and file opens), `MH3U_DUMP_AFTER=<s>`
+(what every thread is doing and which system function it called last), `MH3U_GFX_LOG=1` (the first draws' state, and draw counts), and,
+for a library built with `build-game --watch`: `MH3U_WATCH=<addr>,<len>` (every store, also by the runtime, to that range, with the
+return address), `MH3U_ENTER=<function>` / `MH3U_ENTER_LR=<return address>` (report entries of a function, or of whatever is called
+from a given call site), `MH3U_PROFILE=<s>` (a sampling profile of the translated code). `mh3u-tools disasm` prints readable
+PowerPC (`mh3u_ppc::format`).

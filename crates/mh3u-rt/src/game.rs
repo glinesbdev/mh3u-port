@@ -16,6 +16,8 @@ struct Host {
     trap: extern "C" fn(*mut Ctx, u32),
     unsupported: extern "C" fn(*mut Ctx, u32),
     syscall: extern "C" fn(*mut Ctx),
+    enter: extern "C" fn(*mut Ctx, u32),
+    watch: extern "C" fn(*mut Ctx, u32, u64, u32),
 }
 
 /// A variable the loader fills in for the executable (data imported from a system library).
@@ -129,7 +131,10 @@ extern "C" fn import(c: *mut Ctx, number: u32) {
             r.recent.pop_front();
         }
         r.recent.push_back((number, [c.r[3], c.r[4], c.r[5], c.r[6]], c.lr));
-        if r.calls > r.max_imports {
+        let (calls, max) = (r.calls, r.max_imports);
+        let me = k.current;
+        k.threads[me].last = Some((number, c.lr, c.r[1]));
+        if calls > max {
             drop(guard);
             stop(c, "too many system calls".into());
         }
@@ -173,6 +178,25 @@ extern "C" fn import(c: *mut Ctx, number: u32) {
                 drop(kernel::pass_baton(guard, false));
                 return;
             }
+            Step::Calls(calls) => {
+                let (call, mem) = (k.call, k.memory);
+                drop(guard);
+                let mut result = 0;
+                for (target, param) in calls {
+                    let mut inner = c.clone();
+                    inner.mem = mem;
+                    inner.r[1] = c.r[1].wrapping_sub(0x400);
+                    inner.r[3] = param;
+                    inner.lr = 0;
+                    // SAFETY: the library is loaded for the rest of the run
+                    unsafe { call(&mut inner, target) };
+                    result = inner.r[3];
+                }
+                let _ = result;
+                guard = lock();
+                kernel::progress(guard.as_mut().expect("kernel"));
+                return;
+            }
             Step::Exit => kernel::retire(guard),
             Step::Stop(why) => {
                 drop(guard);
@@ -209,6 +233,23 @@ extern "C" fn unsupported(c: *mut Ctx, word: u32) {
 
 extern "C" fn syscall(c: *mut Ctx) {
     stop(c, "a system call instruction".into());
+}
+
+extern "C" fn enter(c: *mut Ctx, function: u32) {
+    // SAFETY: `c` is the context the translated code passed us
+    let (lr, r) = unsafe { ((*c).lr, (*c).r) };
+    let thread = lock().as_ref().map_or(99, |k| k.current);
+    eprintln!(
+        "[enter] thread {thread}: {function:#x} from {lr:#x} (r3 {:#x}, r4 {:#x}, r5 {:#x}, r6 {:#x})",
+        r[3], r[4], r[5], r[6]
+    );
+}
+
+extern "C" fn watch(c: *mut Ctx, address: u32, value: u64, size: u32) {
+    // SAFETY: `c` is the context the translated code passed us
+    let (lr, r1) = unsafe { ((*c).lr, (*c).r[1]) };
+    let thread = lock().as_ref().map_or(99, |k| k.current);
+    eprintln!("[watch] thread {thread}: {size} bytes at {address:#x} <- {value:#x}   (lr {lr:#x}, sp {r1:#x})");
 }
 
 fn new_ctx(mem: *mut u8) -> Ctx {
@@ -252,6 +293,44 @@ pub fn spawn(k: &Kernel, t: usize) {
     });
 }
 
+/// Starts the thread that runs the audio frame callbacks every audio frame (3 ms of sound). It is a guest thread like the others: it
+/// holds the baton while it runs the game's code.
+pub fn spawn_audio(k: &mut Kernel) {
+    let t = k.threads.len();
+    k.threads.push(Thread {
+        addr: 0xffff_fff0,
+        life: Life::Ready,
+        suspend: 0,
+        exit_code: 0,
+        sleep_until: None,
+        entry: 0,
+        argc: 0,
+        argv: 0,
+        stack_top: 0xa0f0_0000,
+        started: true,
+        last: None,
+    });
+    let (call, mem) = (k.call, k.memory as usize);
+    std::thread::spawn(move || {
+        let mut guard = lock();
+        while guard.as_ref().expect("kernel").current != t {
+            guard = kernel::BATON.wait(guard).unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+        loop {
+            guard = kernel::sleep_current(guard, std::time::Duration::from_millis(3));
+            let callbacks = guard.as_ref().expect("kernel").ax_callbacks.clone();
+            drop(guard);
+            let mut c = new_ctx(mem as *mut u8);
+            c.r[1] = 0xa0f0_0000 - 0x20;
+            for cb in callbacks {
+                // SAFETY: the library is loaded for the rest of the run
+                unsafe { call(&mut c, cb) };
+            }
+            guard = lock();
+        }
+    });
+}
+
 /// Runs the game's entry point from the translated library at `library`, with `pieces` put in the guest's memory first.
 pub fn run(library: &Path, pieces: &[Piece], options: Options) -> Result<Report> {
     let mut options_roots = crate::fs::Roots::default();
@@ -285,8 +364,6 @@ pub fn run(library: &Path, pieces: &[Piece], options: Options) -> Result<Report>
             *lib.get::<unsafe extern "C" fn() -> u32>(b"game_ctx_size\0")?,
         )
     };
-    // the threads made later call into the library after this function's frame is gone, so it stays loaded
-    std::mem::forget(lib);
     // SAFETY: plain calls of functions that read constants
     let (size, imports) = unsafe { (ctx_size(), count()) };
     ensure!(
@@ -321,6 +398,7 @@ pub fn run(library: &Path, pieces: &[Piece], options: Options) -> Result<Report>
         argv: 0,
         stack_top: options.stack_top,
         started: true,
+        last: None,
     };
     let by_addr = HashMap::from([(os.thread, 0)]);
     let roots = std::mem::take(&mut options_roots);
@@ -350,20 +428,123 @@ pub fn run(library: &Path, pieces: &[Piece], options: Options) -> Result<Report>
         k.fs.roots = roots;
         k.backend = backend;
     }
+    if let Some(secs) = std::env::var("MH3U_DUMP_AFTER").ok().and_then(|v| v.parse::<u64>().ok()) {
+        // a look at what every thread is doing, for finding what the game is waiting for
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_secs(secs));
+            let guard = lock();
+            if let Some(k) = guard.as_ref() {
+                for (i, t) in k.threads.iter().enumerate() {
+                    let last = t.last.map(|(n, lr, sp)| {
+                        // the saved link registers up the stack (the frame at `sp` holds its caller's frame, and the return address at +4)
+                        let mut frames = vec![lr];
+                        let mut frame = sp;
+                        for _ in 0..14 {
+                            let (back, ret) = (k.guest.u32(frame), k.guest.u32(frame.wrapping_add(4)));
+                            if back <= frame || back < 0x1000_0000 || ret == 0 {
+                                break;
+                            }
+                            frames.push(ret);
+                            frame = back;
+                        }
+                        format!(
+                            "{} from {}",
+                            k.report.names[n as usize],
+                            frames.iter().map(|f| format!("{f:#x}")).collect::<Vec<_>>().join(" < ")
+                        )
+                    });
+                    println!(
+                        "thread {i}: life {} suspend {} started {} addr {:#x} entry {:#x} current {} last {last:?}",
+                        match t.life {
+                            Life::Ready => "ready",
+                            Life::Suspended => "suspended",
+                            Life::Done => "done",
+                        },
+                        t.suspend,
+                        t.started,
+                        t.addr,
+                        t.entry,
+                        k.current == i
+                    );
+                }
+            }
+            if let Some(k) = guard.as_ref() {
+                print_report(k, "the dump was asked for");
+            }
+            drop(guard);
+            std::process::exit(0);
+        });
+    }
     let host = Host {
         import,
         unknown_call,
         trap,
         unsupported,
         syscall,
+        enter,
+        watch,
     };
     // `host` is copied by the library
     // SAFETY: the library reads the struct during the call and keeps a copy
     unsafe { set_host(&host) };
+    let hex = |name: &str| {
+        std::env::var(name)
+            .ok()
+            .and_then(|v| u32::from_str_radix(v.trim_start_matches("0x"), 16).ok())
+    };
+    if hex("MH3U_ENTER").is_some() || hex("MH3U_ENTER_LR").is_some() {
+        // report entries of this function, and entries of any function called with this link register (the return address of a call)
+        // SAFETY: the symbol exists only in a library built with the watch, with this signature
+        match unsafe { lib.get::<unsafe extern "C" fn(u32, u32)>(b"game_set_enter\0") } {
+            // SAFETY: the symbol has this signature
+            Ok(set) => unsafe { set(hex("MH3U_ENTER").unwrap_or(1), hex("MH3U_ENTER_LR").unwrap_or(1)) },
+            Err(_) => eprintln!("MH3U_ENTER is set but the library was not built with --watch"),
+        }
+    }
+    if let Some(secs) = std::env::var("MH3U_PROFILE").ok().and_then(|v| v.parse::<u64>().ok()) {
+        // a sampling profile of the translated code: the function most recently entered, every millisecond (needs a --watch build)
+        // SAFETY: the symbol exists only in a library built with the watch, with this signature
+        if let Ok(f) = unsafe { lib.get::<unsafe extern "C" fn() -> u32>(b"game_last_function\0") } {
+            let f = *f;
+            std::thread::spawn(move || {
+                let mut counts: BTreeMap<u32, u32> = BTreeMap::new();
+                let end = std::time::Instant::now() + std::time::Duration::from_secs(secs);
+                while std::time::Instant::now() < end {
+                    // SAFETY: a plain read of a global
+                    *counts.entry(unsafe { f() }).or_default() += 1;
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                let mut v: Vec<_> = counts.into_iter().collect();
+                v.sort_by_key(|(_, n)| std::cmp::Reverse(*n));
+                for (addr, n) in v.iter().take(25) {
+                    println!("profile {n:>6}  {addr:#x}");
+                }
+                std::process::exit(0);
+            });
+        }
+    }
+    if let Ok(spec) = std::env::var("MH3U_WATCH") {
+        // "address,length" in hex: report every store to that range (needs a library built with --watch)
+        let mut parts = spec.split(',').map(|p| u32::from_str_radix(p.trim_start_matches("0x"), 16));
+        if let (Some(Ok(lo)), Some(Ok(len))) = (parts.next(), parts.next()) {
+            crate::guest::WATCH.0.store(lo, std::sync::atomic::Ordering::Relaxed);
+            crate::guest::WATCH
+                .1
+                .store(lo.saturating_add(len), std::sync::atomic::Ordering::Relaxed);
+            // SAFETY: the symbol exists only in a library built with the watch, with this signature
+            match unsafe { lib.get::<unsafe extern "C" fn(u32, u32)>(b"game_set_watch\0") } {
+                // SAFETY: the symbol has this signature
+                Ok(f) => unsafe { f(lo, lo.saturating_add(len)) },
+                Err(_) => eprintln!("MH3U_WATCH is set but the library was not built with --watch"),
+            }
+        }
+    }
     ensure!(
         options.stack_size > 0x1000 && options.stack_top >= options.stack_size,
         "the stack does not fit"
     );
+    // the threads made later call into the library after this function's frame is gone, so it stays loaded
+    std::mem::forget(lib);
     let mut c = new_ctx(mem);
     c.r[1] = options.stack_top - 0x20;
     // SAFETY: the context is valid and its `mem` covers the whole 32-bit address space

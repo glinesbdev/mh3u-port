@@ -88,6 +88,16 @@ pub fn run(input: &Input, out: &Path, per_file: usize) -> Result<Report> {
     d.push_str(
         "};\n\
          GAME_API void game_set_host(const Host *h) { host = *h; }\n\
+         #ifdef MH3U_WATCH\n\
+         uint32_t g_watch_lo = 1, g_watch_hi = 0, g_enter = 1;\n\
+         GAME_API void game_set_enter(uint32_t f, uint32_t lr) { g_enter = f; g_enter_lr = lr; }\n\
+         uint32_t g_enter_lr = 1;\n\
+         volatile uint32_t g_last_fn = 0;\n\
+         GAME_API uint32_t game_last_function(void) { return g_last_fn; }\n\
+         void rt_enter(Ctx *c, uint32_t f) { host.enter(c, f); }\n\
+         GAME_API void game_set_watch(uint32_t lo, uint32_t hi) { g_watch_lo = lo; g_watch_hi = hi; }\n\
+         void rt_watch(Ctx *c, uint32_t a, uint64_t v, uint32_t n) { host.watch(c, a, v, n); }\n\
+         #endif\n\
          GAME_API uint32_t game_ctx_size(void) { return sizeof(Ctx); }\n\
          GAME_API uint32_t game_import_count(void) { return sizeof import_names / sizeof *import_names; }\n\
          GAME_API const char *game_import_name(uint32_t n) { return n < game_import_count() ? import_names[n] : 0; }\n\

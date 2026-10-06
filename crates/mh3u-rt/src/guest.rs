@@ -1,5 +1,17 @@
 //! The guest's memory as the host sees it: big-endian reads and writes at guest addresses.
 
+/// A watched range (set from MH3U_WATCH): host-side writes into it are reported, as the translated code's stores are in a `--watch` build.
+pub static WATCH: (std::sync::atomic::AtomicU32, std::sync::atomic::AtomicU32) =
+    (std::sync::atomic::AtomicU32::new(1), std::sync::atomic::AtomicU32::new(0));
+
+fn watched(address: u32, len: u32, what: &str) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let (lo, hi) = (WATCH.0.load(Relaxed), WATCH.1.load(Relaxed));
+    if address < hi && address.saturating_add(len) > lo {
+        eprintln!("[watch-host] {what}: {len} bytes at {address:#x}");
+    }
+}
+
 /// A view of the guest's address space (a reserved range of 4 GiB with guest address 0 at `base`).
 #[derive(Clone, Copy)]
 pub struct Guest {
@@ -24,12 +36,14 @@ impl Guest {
     }
 
     pub fn write(&self, address: u32, bytes: &[u8]) {
+        watched(address, bytes.len() as u32, "write");
         debug_assert!(u64::from(address) + bytes.len() as u64 <= 1 << 32);
         // SAFETY: as for `read`
         unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), self.at(address), bytes.len()) }
     }
 
     pub fn fill(&self, address: u32, value: u8, len: u32) {
+        watched(address, len, "fill");
         debug_assert!(u64::from(address) + u64::from(len) <= 1 << 32);
         // SAFETY: as for `read`
         unsafe { std::ptr::write_bytes(self.at(address), value, len as usize) }
@@ -37,6 +51,7 @@ impl Guest {
 
     /// Moves bytes inside the guest (the ranges may overlap).
     pub fn copy(&self, from: u32, to: u32, len: u32) {
+        watched(to, len, "copy");
         debug_assert!(u64::from(from) + u64::from(len) <= 1 << 32 && u64::from(to) + u64::from(len) <= 1 << 32);
         // SAFETY: as for `read`; `copy` allows overlap
         unsafe { std::ptr::copy(self.at(from), self.at(to), len as usize) }
@@ -55,6 +70,7 @@ impl Guest {
     }
 
     pub fn put_u32(&self, address: u32, v: u32) {
+        watched(address, 4, "put_u32");
         self.write(address, &v.to_be_bytes());
     }
 

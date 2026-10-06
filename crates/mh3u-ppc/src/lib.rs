@@ -101,6 +101,77 @@ pub fn spr_name(number: u32) -> Option<&'static str> {
     })
 }
 
+/// A readable line for an instruction word at `addr`: the mnemonic and operands in the usual assembler order. Meant for looking at code
+/// (it covers the forms the game uses; unusual ones fall back to the raw fields).
+pub fn format(addr: u32, word: u32) -> String {
+    use insn::{Insn, Op};
+    let Some(i) = Insn::decode(word) else {
+        return format!(".long {word:#010x}");
+    };
+    let n = i.op.name();
+    let (rd, ra, rb) = (i.rd(), i.ra(), i.rb());
+    let dot = if i.rc() && !matches!(i.op, Op::B | Op::Bc | Op::Bclr | Op::Bcctr) {
+        "."
+    } else {
+        ""
+    };
+    let target = |off: i32, absolute: bool| if absolute { off as u32 } else { addr.wrapping_add(off as u32) };
+    match i.op {
+        Op::B => format!(
+            "{}{} {:#x}",
+            if i.lk() { "bl" } else { "b" },
+            if i.aa() { "a" } else { "" },
+            target(i.li(), i.aa())
+        ),
+        Op::Bc => {
+            let l = if i.lk() { "l" } else { "" };
+            format!("bc{l} {},{},{:#x}", i.bo(), i.bi(), target(i.bd(), i.aa()))
+        }
+        Op::Bclr if i.bo() == 20 => {
+            if i.lk() {
+                "blrl".into()
+            } else {
+                "blr".into()
+            }
+        }
+        Op::Bcctr if i.bo() == 20 => {
+            if i.lk() {
+                "bctrl".into()
+            } else {
+                "bctr".into()
+            }
+        }
+        Op::Bclr | Op::Bcctr => format!("{n}{} {},{}", if i.lk() { "l" } else { "" }, i.bo(), i.bi()),
+        Op::Addi if ra == 0 => format!("li r{rd}, {}", i.simm()),
+        Op::Addis if ra == 0 => format!("lis r{rd}, {:#x}", i.simm() as u16),
+        Op::Addi | Op::Addis | Op::Addic | Op::AddicDot | Op::Subfic | Op::Mulli => format!("{n} r{rd}, r{ra}, {}", i.simm()),
+        Op::Ori | Op::Oris | Op::Xori | Op::Xoris | Op::AndiDot | Op::AndisDot => format!("{n} r{ra}, r{rd}, {:#x}", i.uimm()),
+        Op::Cmpi => format!("cmpwi cr{}, r{ra}, {}", i.crfd(), i.simm()),
+        Op::Cmpli => format!("cmplwi cr{}, r{ra}, {:#x}", i.crfd(), i.uimm()),
+        Op::Cmp => format!("cmpw cr{}, r{ra}, r{rb}", i.crfd()),
+        Op::Cmpl => format!("cmplw cr{}, r{ra}, r{rb}", i.crfd()),
+        Op::Rlwinm | Op::Rlwimi => format!("{n}{dot} r{ra}, r{rd}, {}, {}, {}", i.sh(), i.mb(), i.me()),
+        Op::Rlwnm => format!("{n}{dot} r{ra}, r{rd}, r{rb}, {}, {}", i.mb(), i.me()),
+        Op::Mfspr => format!("mfspr r{rd}, {}", spr_name(spr(word)).map_or(spr(word).to_string(), str::to_string)),
+        Op::Mtspr => format!("mtspr {}, r{rd}", spr_name(spr(word)).map_or(spr(word).to_string(), str::to_string)),
+        _ => match i.op.class() {
+            Class::Load | Class::Store | Class::FloatMem if (word >> 26) != 31 && (word >> 26) != 4 && (word >> 26) < 56 => {
+                let reg = if i.op.class() == Class::FloatMem { 'f' } else { 'r' };
+                format!("{n} {reg}{rd}, {}(r{ra})", i.simm())
+            }
+            Class::Load | Class::Store | Class::FloatMem => {
+                let reg = if i.op.class() == Class::FloatMem { 'f' } else { 'r' };
+                format!("{n} {reg}{rd}, r{ra}, r{rb}")
+            }
+            // the logical and shift forms put their result in rA and take rS from the first field
+            Class::Logical => format!("{n}{dot} r{ra}, r{rd}, r{rb}"),
+            Class::Integer if matches!(i.op, Op::Extsb | Op::Extsh | Op::Cntlzw) => format!("{n}{dot} r{ra}, r{rd}"),
+            Class::Integer => format!("{n}{dot} r{rd}, r{ra}, r{rb}"),
+            _ => format!("{n}{dot} {rd}, {ra}, {rb}"),
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

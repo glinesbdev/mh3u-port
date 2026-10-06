@@ -9,6 +9,8 @@ use crate::guest::Guest;
 pub fn find(name: &str) -> Option<SimpleHandler> {
     Some(match name {
         "gx2:GX2CalcSurfaceSizeAndAlignment" => |_, g, c| calc_surface(g, c.r[3]),
+        // the GPU generation the shader files are checked against (Latte is 2)
+        "gx2:GX2TempGetGPUVersion" => |_, _, c| c.r[3] = 2,
         "gx2:GX2CalcTVSize" => |_, g, c| {
             // (render mode, format, buffering mode, *size, *scale needed)
             let (w, h) = match c.r[3] {

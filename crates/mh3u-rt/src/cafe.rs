@@ -49,6 +49,103 @@ fn simple(name: &str) -> Option<SimpleHandler> {
         "coreinit:strlen" => |_, g, c| {
             c.r[3] = g.cstr(c.r[3]).len() as u32;
         },
+        // the game's own diagnostic messages (printf-style: the integer arguments follow the format in registers)
+        "coreinit:OSReport" | "coreinit:OSPanic" | "coreinit:OSFatal" => |_, g, c| {
+            let (fmt, mut at) = if c.r[3] > 0x1000 && g.cstr(c.r[3]).contains('%') || true {
+                (g.cstr(c.r[3]), 4usize)
+            } else {
+                (String::new(), 4)
+            };
+            let mut out = String::new();
+            let mut chars = fmt.chars().peekable();
+            while let Some(ch) = chars.next() {
+                if ch != '%' {
+                    out.push(ch);
+                    continue;
+                }
+                while chars.peek().is_some_and(|c| "-+ #0123456789.l".contains(*c)) {
+                    chars.next();
+                }
+                let arg = if at < 11 { c.r[at] } else { 0 };
+                match chars.next() {
+                    Some('d' | 'i') => out.push_str(&(arg as i32).to_string()),
+                    Some('u') => out.push_str(&arg.to_string()),
+                    Some('x') => out.push_str(&format!("{arg:x}")),
+                    Some('X') => out.push_str(&format!("{arg:X}")),
+                    Some('s') => out.push_str(&g.cstr(arg)),
+                    Some('c') => out.push(arg as u8 as char),
+                    Some('p') => out.push_str(&format!("{arg:#x}")),
+                    Some('%') => {
+                        out.push('%');
+                        continue;
+                    }
+                    Some(other) => out.push(other),
+                    None => break,
+                }
+                at += 1;
+            }
+            eprintln!("[game] {}", out.trim_end());
+        },
+        // buffers for the IPC with the system's services (used by the keyboard library): a bump allocator over the memory it is given
+        "coreinit:IPCBufPoolCreate" => |os, g, c| {
+            let pool = os.carve(g, 0x20);
+            let start = (c.r[3] + 0x3f) & !0x3f;
+            let end = c.r[3].saturating_add(c.r[4]);
+            os.ipc_pools.insert(pool, (start, end));
+            c.r[3] = pool;
+        },
+        "coreinit:IPCBufPoolAllocate" => |os, _, c| {
+            let size = (c.r[4] + 0x3f) & !0x3f;
+            c.r[3] = match os.ipc_pools.get_mut(&c.r[3]) {
+                Some((next, end)) if next.saturating_add(size) <= *end => {
+                    let at = *next;
+                    *next += size;
+                    at
+                }
+                _ => 0,
+            };
+        },
+        "coreinit:IPCBufPoolFree" => |_, _, c| c.r[3] = 0,
+        // the account: one signed-in user in slot 1
+        "nn_act:Initialize__Q2_2nn3actFv" | "nn_act:Finalize__Q2_2nn3actFv" => |_, _, c| c.r[3] = 0,
+        "nn_act:GetSlotNo__Q2_2nn3actFv" | "nn_act:GetNumOfAccounts__Q2_2nn3actFv" => |_, _, c| c.r[3] = 1,
+        "nn_act:IsSlotOccupied__Q2_2nn3actFUc" => |_, _, c| c.r[3] = 1,
+        "nn_act:GetPersistentId__Q2_2nn3actFv" => |_, _, c| c.r[3] = 0x8000_0001,
+        "nn_act:HasNfsAccount__Q2_2nn3actFv" => |_, _, c| c.r[3] = 0,
+        // there is no network
+        "nn_ac:Initialize__Q2_2nn2acFv" | "nn_ac:Finalize__Q2_2nn2acFv" | "nn_ac:Close__Q2_2nn2acFv" => |_, _, c| c.r[3] = 0,
+        "nn_ac:IsApplicationConnected__Q2_2nn2acFPb" => |_, g, c| {
+            g.fill(c.r[3], 0, 1);
+            c.r[3] = 0;
+        },
+        "nn_ac:Connect__Q2_2nn2acFv" => |_, _, c| c.r[3] = 0xffff_ffff,
+        // a voice of the audio system: only its index is looked at by the game
+        "snd_core.rpl:AXAcquireVoice" => |os, g, c| {
+            let v = os.carve(g, 0x100);
+            g.put_u32(v, os.voices);
+            os.voices += 1;
+            c.r[3] = v;
+        },
+        "snd_core.rpl:AXFreeVoice" | "snd_core.rpl:AXInit" | "snd_core.rpl:AXInitEx" => |_, _, c| c.r[3] = 0,
+        "snd_core.rpl:AXGetDeviceMode" => |_, g, c| {
+            // stereo ("surround" is 2)
+            g.put_u32(c.r[4], 1);
+            c.r[3] = 0;
+        },
+        // the GamePad: one sample of "no touch, sticks centred" with the buttons held as `Os::pad_hold` says
+        "vpad.rpl:VPADRead" => |os, g, c| {
+            let (buffer, error) = (c.r[4], c.r[6]);
+            g.fill(buffer, 0, 0xac);
+            let hold = os.pad_hold();
+            g.put_u32(buffer, hold);
+            g.put_u32(buffer + 4, hold & !os.pad_before);
+            g.put_u32(buffer + 8, os.pad_before & !hold);
+            os.pad_before = hold;
+            if error != 0 {
+                g.put_u32(error, 0);
+            }
+            c.r[3] = 1;
+        },
         "coreinit:OSGetCoreId" | "coreinit:OSGetMainCoreId" => |_, _, c| c.r[3] = 1,
         "coreinit:__ghsLock" | "coreinit:__ghsUnlock" => |_, _, _| {},
         "coreinit:OSIsDebuggerInitialized" => |_, _, c| c.r[3] = 0,
@@ -212,6 +309,12 @@ pub struct Os {
     pub thread: u32,
     system_info: u32,
     next_os: u32,
+    /// IPC buffer pools by handle: where the next block comes from and where the pool ends.
+    ipc_pools: BTreeMap<u32, (u32, u32)>,
+    voices: u32,
+    /// The buttons held at the last read of the GamePad (to tell what was just pressed).
+    pub pad_before: u32,
+    pad_script: Option<(u32, std::time::Duration)>,
     started: std::time::Instant,
 }
 
@@ -227,6 +330,17 @@ impl Os {
             thread: 0,
             system_info: 0,
             next_os: OS_AREA,
+            ipc_pools: BTreeMap::new(),
+            voices: 0,
+            pad_before: 0,
+            // MH3U_PRESS=<button mask in hex>,<period in ms>: hold the buttons for a tenth of every period (for finding what the game waits for)
+            pad_script: std::env::var("MH3U_PRESS").ok().and_then(|v| {
+                let (mask, ms) = v.split_once(',')?;
+                Some((
+                    u32::from_str_radix(mask.trim_start_matches("0x"), 16).ok()?,
+                    std::time::Duration::from_millis(ms.parse().ok()?),
+                ))
+            }),
             started: std::time::Instant::now(),
         };
         os.thread = os.carve(g, 0x6a0);
@@ -237,11 +351,22 @@ impl Os {
         os
     }
 
-    fn carve(&mut self, g: &Guest, size: u32) -> u32 {
+    pub fn carve(&mut self, g: &Guest, size: u32) -> u32 {
         let at = self.next_os;
         self.next_os += size.div_ceil(0x40) * 0x40;
         g.fill(at, 0, size);
         at
+    }
+
+    /// The buttons held now.
+    fn pad_hold(&self) -> u32 {
+        match self.pad_script {
+            Some((mask, period)) if !period.is_zero() => {
+                let t = self.started.elapsed().as_millis() % period.as_millis();
+                if t < period.as_millis() / 10 { mask } else { 0 }
+            }
+            _ => 0,
+        }
     }
 
     fn ticks(&self) -> u64 {

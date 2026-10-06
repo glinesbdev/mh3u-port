@@ -186,6 +186,9 @@ pub fn find(name: &str) -> Option<KernelHandler> {
         "coreinit:FSOpenFile" => |k, c| {
             let (path, mode) = (k.guest.cstr(c.r[5]), k.guest.cstr(c.r[6]));
             let host = k.fs.path(&path);
+            if k.report.trace {
+                eprintln!("[fs] open {path} ({mode}): {}", if host.is_some() { "found" } else { "NOT FOUND" });
+            }
             open_file(k, c, host, &mode, c.r[7])
         },
         // (client, block, account, path, mode, *handle, error mask)
@@ -260,6 +263,9 @@ pub fn find(name: &str) -> Option<KernelHandler> {
         "coreinit:FSGetStat" => |k, c| {
             let path = k.guest.cstr(c.r[5]);
             let status = k.fs.path(&path).map_or(NOT_FOUND, |(p, _)| write_stat(k, c.r[6], &p));
+            if k.report.trace {
+                eprintln!("[fs] stat {path}: {status}");
+            }
             result(c, status)
         },
         // (client, block, account, path, *stat, error mask)

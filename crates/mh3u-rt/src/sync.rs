@@ -79,6 +79,28 @@ pub fn find(name: &str) -> Option<KernelHandler> {
             done(c, 0)
         },
         "coreinit:OSDynLoad_Release" => |_, _| Step::Done,
+        // the application starts in the background and is told to acquire the foreground by its first call of ProcUIProcessMessages
+        "proc_ui:ProcUIRegisterCallback" => |k, c| {
+            k.procui_callbacks.push((c.r[3], c.r[4], c.r[5], c.r[6]));
+            done(c, 0)
+        },
+        "proc_ui:ProcUIProcessMessages" => |k, c| {
+            c.r[3] = 0;
+            if k.procui_acquired {
+                return Step::Done;
+            }
+            k.procui_acquired = true;
+            let mut acquire: Vec<_> = k.procui_callbacks.iter().filter(|cb| cb.0 == 0).copied().collect();
+            acquire.sort_by_key(|cb| cb.3);
+            Step::Calls(acquire.iter().map(|cb| (cb.1, cb.2)).collect())
+        },
+        "snd_core.rpl:AXRegisterFrameCallback" => |k, c| {
+            if k.ax_callbacks.is_empty() {
+                crate::game::spawn_audio(k);
+            }
+            k.ax_callbacks.push(c.r[3]);
+            done(c, 0)
+        },
         "coreinit:OSYieldThread" => |_, _| Step::Yield,
         "coreinit:OSSleepTicks" => |k, c| {
             let me = k.current;
@@ -263,6 +285,7 @@ fn create_thread(k: &mut Kernel, c: &mut Ctx) -> Step {
         argv: c.r[6],
         stack_top: c.r[7],
         started: false,
+        last: None,
     };
     match k.by_addr.get(&addr) {
         Some(&t) => k.threads[t] = thread,
