@@ -119,7 +119,7 @@ Each step ends with something that can be checked, and the project stops being w
 
 **Then:**
 
-4. **The recompiler runs a small function**, checked against Cemu or against a reference interpreter on made-up input (the
+4. **The recompiler runs a small function** (started: `mh3u-ppc` has a reference interpreter that agrees with QEMU's PowerPC 750 on every instruction but the paired singles; see `docs/translator.md`), checked against Cemu or against a reference interpreter on made-up input (the
    interpreter is also what tests the translator, so it is built first).
 5. **The runtime starts the game's entry point** and reaches the first system call it cannot answer, and the list of those is the to-do list.
 6. **A window and a cleared screen**, then **the title screen**, then **a village**. Each is a milestone with a recording.
