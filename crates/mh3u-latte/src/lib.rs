@@ -5,6 +5,10 @@
 //! This reads the structure and counts what is in it ([`census`]); it does not run or translate anything. The format is as the
 //! R6xx/R7xx instruction set documents give it, and every program of the game's pack parses to the end with it (see `docs/spikes.md`).
 
+pub mod decode;
+pub mod ops;
+pub mod translate;
+
 use std::collections::BTreeMap;
 
 /// The control-flow instruction kinds a pixel shader of the game uses, by their number (bits 23 to 29 of the second word).
@@ -24,6 +28,11 @@ pub fn cf_name(inst: u32) -> &'static str {
         0x0f => "pop-jump",
         0x10 => "pop-push",
         0x13 => "call-fs",
+        0x06 => "loop-start-dx10",
+        0x08 => "loop-continue",
+        0x09 => "loop-break",
+        0x11 => "pop-push-else",
+        0x12 => "call",
         0x14 => "return",
         0x28 => "export-done",
         0x27 => "export",

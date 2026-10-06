@@ -126,3 +126,22 @@ swaps frames in the window (about 40 a second with call tracing on); the picture
 **Next:** record the state calls (shaders, fetch shader, attribute buffers, textures, samplers, uniform blocks, blend, depth, cull,
 viewport, scissor, colour and depth buffers) and turn `GX2DrawEx`/`GX2DrawIndexedEx` into draws; translate the shaders' microcode
 (the census in `docs/spikes.md`) to WGSL; read textures through the exact tiling rules; display lists (`GX2BeginDisplayListEx`).
+
+## The shaders (`mh3u-latte`: `decode.rs`, `ops.rs`, `translate.rs`)
+
+`decode` reads a program (control flow, ALU groups, fetches) with the R7xx bit layouts and the R6xx instruction numbers; `ops.rs` is the
+table of numbers, names and slots (made from the open drivers' list for this family, which documents them; the bit layouts were read
+from the same drivers' headers and checked against the game's 967 programs: `mh3u-tools latte-check` decodes all of them and counts
+exactly what the first census did). Findings that differ from the textbook: the ALU word's two-operand instruction number is in bits 7
+to 17 with the output modifier in bits 5 and 6 (R7xx), and an ALU clause has no end-of-program bit (bit 21 is part of its count).
+The game's pixel shaders use 33 two-operand and 5 three-operand instructions, kcache banks 1 to 5, no relative addressing, no
+predication per instruction, and uniform blocks indexed at run time through `VFETCH` on resource 128 + the block number.
+
+`translate_pixel` turns a decoded program into WGSL: registers are `vec4<f32>` holding raw bits, each group reads the registers as they
+were before it and writes together afterwards, `pv`/`ps` are the previous group's results, the exec-mask stack is a stack of booleans
+(a lane that is not active writes nothing), and texture fetches run for every lane so derivatives stay defined (`diagnostic(off,
+derivative_uniformity)`). **572 of the 579 different pixel programs become WGSL that naga validates** (`mh3u-tools latte-wgsl`); the
+other 7 use `CUBE` (not written: its output convention has to be worked out with a cube-map shader to look at). Whether a translated
+shader computes what the hardware does is not checked by anything but looking at the picture: the semantics are from the documents,
+so an operation the translator does not know is an error, never a guess.
+Vertex shaders (fetch shaders, loops, relative addressing) are next.

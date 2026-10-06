@@ -3,6 +3,7 @@
 
 mod build_game;
 mod codegen_bench;
+mod latte_check;
 #[cfg(target_os = "linux")]
 mod shader_scan;
 mod translate;
@@ -28,6 +29,15 @@ enum Tool {
     Sections { game_dir: PathBuf },
     /// Find where the functions of the executable start (calls, code pointers in the data, the entry point) and say how many.
     Functions { game_dir: PathBuf },
+    /// Decode every shader program of the game's pack and count what they use.
+    LatteCheck { game_dir: PathBuf },
+    /// Translate every pixel program of the pack to WGSL and validate it.
+    LatteWgsl {
+        game_dir: PathBuf,
+        /// Print the translation of this shader of the pack.
+        #[arg(long)]
+        show: Option<usize>,
+    },
     /// Print instructions of the code with their fields (for finding out what the code is doing; not a full disassembler).
     Disasm {
         game_dir: PathBuf,
@@ -257,6 +267,22 @@ fn main() -> Result<()> {
                 println!("{at:#x}  {w:08x}  {line}");
             }
             Ok(())
+        }
+        Tool::LatteWgsl { game_dir, show } => {
+            let dump = dump(&game_dir)?;
+            let path = dump.content("nativeCafe/shaderArc.arc").context("no shaderArc.arc in the dump")?;
+            let bytes = read(&path)?;
+            let arc = Arc::parse(&bytes)?;
+            let entry = arc.entries.iter().find(|e| e.name == "shaderPack").context("no shaderPack")?;
+            latte_check::wgsl(&arc.read(entry)?, show)
+        }
+        Tool::LatteCheck { game_dir } => {
+            let dump = dump(&game_dir)?;
+            let path = dump.content("nativeCafe/shaderArc.arc").context("no shaderArc.arc in the dump")?;
+            let bytes = read(&path)?;
+            let arc = Arc::parse(&bytes)?;
+            let entry = arc.entries.iter().find(|e| e.name == "shaderPack").context("no shaderPack")?;
+            latte_check::run(&arc.read(entry)?)
         }
         Tool::Functions { game_dir } => functions(&dump(&game_dir)?),
         Tool::Coverage { game_dir, unknown } => coverage(&dump(&game_dir)?, unknown),

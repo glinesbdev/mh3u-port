@@ -974,6 +974,7 @@ dependencies = [
  "mh3u-ppc",
  "mh3u-recomp",
  "mh3u-rt",
+ "naga",
 ]
 
 [[package]]

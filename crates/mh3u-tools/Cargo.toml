@@ -18,3 +18,4 @@ mh3u-ppc.workspace = true
 mh3u-recomp.workspace = true
 mh3u-rt = { path = "../mh3u-rt" }
 mh3u-gfx = { path = "../mh3u-gfx" }
+naga = { version = "30", features = ["wgsl-in"] }
