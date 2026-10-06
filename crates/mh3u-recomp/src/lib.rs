@@ -485,6 +485,144 @@ pub fn emit_insn(insn: Insn, addr: u32, fx: &Function) -> Vec<String> {
             push(format!("setcrf(c, {}, (c->fpscr >> {shift}) & 0xf);", insn.crfd()));
             push(format!("c->fpscr &= {};", hex(!(0xf << shift))));
         }
+        // ---- paired singles
+        PsAdd | PsSub | PsMul | PsDiv | PsMadd | PsMsub | PsNmadd | PsNmsub => {
+            let c_reg = insn.rc_f();
+            let mut body = String::from("{ ");
+            for i in 0..2 {
+                let (a, b, cc) = (
+                    format!("hf(c, {ra}, {i})"),
+                    format!("hf(c, {rb}, {i})"),
+                    format!("hf(c, {c_reg}, {i})"),
+                );
+                let e = match insn.op {
+                    PsAdd => format!("canon3f({a} + {b}, {a}, {b}, {b})"),
+                    PsSub => format!("canon3f({a} - {b}, {a}, {b}, {b})"),
+                    PsMul => format!("canon3f({a} * {cc}, {a}, {cc}, {cc})"),
+                    PsDiv => format!("canon3f({a} / {b}, {a}, {b}, {b})"),
+                    PsMadd => format!("canon3f(fmaf({a}, {cc}, {b}), {a}, {cc}, {b})"),
+                    PsMsub => format!("canon3f(fmaf({a}, {cc}, -{b}), {a}, {cc}, {b})"),
+                    PsNmadd => format!("negiff(canon3f(fmaf({a}, {cc}, {b}), {a}, {cc}, {b}))"),
+                    _ => format!("negiff(canon3f(fmaf({a}, {cc}, -{b}), {a}, {cc}, {b}))"),
+                };
+                let _ = write!(body, "float r{i} = {e}; ");
+            }
+            let _ = write!(body, "sh(c, {rd}, 0, r0); sh(c, {rd}, 1, r1); }}");
+            push(body);
+        }
+        PsMuls0 | PsMuls1 | PsMadds0 | PsMadds1 => {
+            let which = u32::from(matches!(insn.op, PsMuls1 | PsMadds1));
+            let mut body = format!("{{ float cc = hf(c, {}, {which}); ", insn.rc_f());
+            for i in 0..2 {
+                let (a, b) = (format!("hf(c, {ra}, {i})"), format!("hf(c, {rb}, {i})"));
+                let e = if matches!(insn.op, PsMuls0 | PsMuls1) {
+                    format!("canon3f({a} * cc, {a}, cc, cc)")
+                } else {
+                    format!("canon3f(fmaf({a}, cc, {b}), {a}, cc, {b})")
+                };
+                let _ = write!(body, "float r{i} = {e}; ");
+            }
+            let _ = write!(body, "sh(c, {rd}, 0, r0); sh(c, {rd}, 1, r1); }}");
+            push(body);
+        }
+        PsSum0 | PsSum1 => {
+            let c_reg = insn.rc_f();
+            let sum = format!("canon3f(hf(c, {ra}, 0) + hf(c, {rb}, 1), hf(c, {ra}, 0), hf(c, {rb}, 1), hf(c, {rb}, 1))");
+            if insn.op == PsSum0 {
+                push(format!(
+                    "{{ float s = {sum}; float k = hf(c, {c_reg}, 1); sh(c, {rd}, 0, s); sh(c, {rd}, 1, k); }}"
+                ));
+            } else {
+                push(format!(
+                    "{{ float s = {sum}; float k = hf(c, {c_reg}, 0); sh(c, {rd}, 0, k); sh(c, {rd}, 1, s); }}"
+                ));
+            }
+        }
+        PsSel => {
+            let c_reg = insn.rc_f();
+            let mut body = String::from("{ ");
+            for i in 0..2 {
+                let _ = write!(
+                    body,
+                    "float r{i} = hf(c, {ra}, {i}) >= 0.0f ? hf(c, {c_reg}, {i}) : hf(c, {rb}, {i}); "
+                );
+            }
+            let _ = write!(body, "sh(c, {rd}, 0, r0); sh(c, {rd}, 1, r1); }}");
+            push(body);
+        }
+        PsRes | PsRsqrte => {
+            let mut body = String::from("{ ");
+            for i in 0..2 {
+                let b = format!("hf(c, {rb}, {i})");
+                let e = if insn.op == PsRes {
+                    format!("1.0f / {b}")
+                } else {
+                    format!("1.0f / sqrtf({b})")
+                };
+                let _ = write!(body, "float r{i} = canon3f({e}, {b}, {b}, {b}); ");
+            }
+            let _ = write!(body, "sh(c, {rd}, 0, r0); sh(c, {rd}, 1, r1); }}");
+            push(body);
+        }
+        PsNeg | PsMr | PsNabs | PsAbs => {
+            let f = |x: String| match insn.op {
+                PsNeg => format!("{x} ^ (1ull << 63)"),
+                PsNabs => format!("{x} | (1ull << 63)"),
+                PsAbs => format!("{x} & ~(1ull << 63)"),
+                _ => x,
+            };
+            push(format!(
+                "{{ uint64_t b0 = c->f[{rb}].u, b1 = c->ps1[{rb}].u; c->f[{rd}].u = {}; c->ps1[{rd}].u = {}; }}",
+                f("b0".to_string()),
+                f("b1".to_string())
+            ));
+        }
+        PsMerge00 | PsMerge01 | PsMerge10 | PsMerge11 => {
+            let (x, y) = match insn.op {
+                PsMerge00 => ("a0", "b0"),
+                PsMerge01 => ("a0", "b1"),
+                PsMerge10 => ("a1", "b0"),
+                _ => ("a1", "b1"),
+            };
+            push(format!(
+                "{{ uint64_t a0 = c->f[{ra}].u, a1 = c->ps1[{ra}].u, b0 = c->f[{rb}].u, b1 = c->ps1[{rb}].u; c->f[{rd}].u = {x}; c->ps1[{rd}].u = {y}; }}"
+            ));
+        }
+        PsCmpu0 | PsCmpo0 | PsCmpu1 | PsCmpo1 => {
+            let i = u32::from(matches!(insn.op, PsCmpu1 | PsCmpo1));
+            push(format!(
+                "fcmp(c, {}, (double)hf(c, {ra}, {i}), (double)hf(c, {rb}, {i}));",
+                insn.crfd()
+            ));
+        }
+        PsqL | PsqLu | PsqLx | PsqLux => {
+            let indexed = matches!(insn.op, PsqLx | PsqLux);
+            let ea = if indexed { ea_x(ra, rb) } else { ea_d(ra, insn.psq_d()) };
+            let (w, i) = if indexed {
+                (insn.psqx_w(), insn.psqx_i())
+            } else {
+                (insn.psq_w(), insn.psq_i())
+            };
+            let mut body = format!("uint32_t ea = {ea}; psq_load(c, {rd}, ea, {}, {i});", u32::from(w));
+            if matches!(insn.op, PsqLu | PsqLux) {
+                let _ = write!(body, " {} = ea;", r(ra));
+            }
+            push(format!("{{ {body} }}"));
+        }
+        PsqSt | PsqStu | PsqStx | PsqStux => {
+            let indexed = matches!(insn.op, PsqStx | PsqStux);
+            let ea = if indexed { ea_x(ra, rb) } else { ea_d(ra, insn.psq_d()) };
+            let (w, i) = if indexed {
+                (insn.psqx_w(), insn.psqx_i())
+            } else {
+                (insn.psq_w(), insn.psq_i())
+            };
+            let mut body = format!("uint32_t ea = {ea}; psq_store(c, {rd}, ea, {}, {i});", u32::from(w));
+            if matches!(insn.op, PsqStu | PsqStux) {
+                let _ = write!(body, " {} = ea;", r(ra));
+            }
+            push(format!("{{ {body} }}"));
+        }
         // ---- cache and synchronisation
         Dcbz => push(format!("zero32(c, {});", ea_x(ra, rb))),
         Dcbf | Dcbi | Dcbst | Dcbt | Dcbtst | Icbi | Sync | Isync | Eieio => push(format!("/* {} */", insn.op.name())),

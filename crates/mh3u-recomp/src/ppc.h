@@ -163,4 +163,60 @@ AI uint32_t cvt_i32(double x, int tr) {
 AI void fcmp(Ctx *c, uint32_t f, double a, double b) {
     setcrf(c, f, isnan(a) || isnan(b) ? 1 : (a < b ? 8 : (a > b ? 4 : 2)));
 }
+
+/* ---- paired singles */
+AI float hf(Ctx *c, int r, int i) { return (float)(i ? c->ps1[r].d : c->f[r].d); }
+AI void sh(Ctx *c, int r, int i, float v) { if (i) c->ps1[r].d = (double)v; else c->f[r].d = (double)v; }
+AI int32_t sat32(float x) {
+    if (isnan(x)) return INT32_MIN;
+    if (x >= 2147483648.0f) return INT32_MAX;
+    if (x <= -2147483648.0f) return INT32_MIN;
+    return (int32_t)x;
+}
+AI int32_t clampi(int32_t v, int32_t lo, int32_t hi) { return v < lo ? lo : (v > hi ? hi : v); }
+AI int qscale(uint32_t field) { return (int)((int32_t)(field << 26) >> 26); }
+AI uint32_t qsize(uint32_t kind) { return (kind == 4 || kind == 6) ? 1 : ((kind == 5 || kind == 7) ? 2 : 4); }
+AI uint64_t qread(Ctx *c, uint32_t at, uint32_t kind, int scale) {
+    FR r;
+    switch (kind) {
+    case 4: r.d = (double)((float)ld8(c, at) * ldexpf(1.0f, -scale)); return r.u;
+    case 5: r.d = (double)((float)ld16(c, at) * ldexpf(1.0f, -scale)); return r.u;
+    case 6: r.d = (double)((float)(int8_t)ld8(c, at) * ldexpf(1.0f, -scale)); return r.u;
+    case 7: r.d = (double)((float)(int16_t)ld16(c, at) * ldexpf(1.0f, -scale)); return r.u;
+    default: {
+        uint32_t bits = ld32(c, at);
+        float f; memcpy(&f, &bits, 4);
+        if (isnan(f)) return ((uint64_t)(bits >> 31) << 63) | 0x7ff0000000000000ull | ((uint64_t)(bits & 0x007fffffu) << 29);
+        r.d = (double)f; return r.u;
+    }
+    }
+}
+AI void psq_load(Ctx *c, int rd, uint32_t ea, int w, int g) {
+    uint32_t kind = (c->gqr[g] >> 16) & 7;
+    int scale = qscale(c->gqr[g] >> 24);
+    uint64_t first = qread(c, ea, kind, scale);
+    FR one; one.d = 1.0;
+    uint64_t second = w ? one.u : qread(c, ea + qsize(kind), kind, scale);
+    c->f[rd].u = first;
+    c->ps1[rd].u = second;
+}
+AI void qwrite(Ctx *c, uint32_t at, uint64_t bits, uint32_t kind, int scale) {
+    FR v; v.u = bits;
+    float x = (float)v.d;
+    int32_t q = sat32(x * ldexpf(1.0f, scale));
+    switch (kind) {
+    case 4: st8(c, at, (uint32_t)clampi(q, 0, 255)); break;
+    case 5: st16(c, at, (uint32_t)clampi(q, 0, 65535)); break;
+    case 6: st8(c, at, (uint32_t)(uint8_t)(int8_t)clampi(q, -128, 127)); break;
+    case 7: st16(c, at, (uint32_t)(uint16_t)(int16_t)clampi(q, -32768, 32767)); break;
+    default: st32(c, at, narrow(bits)); break;
+    }
+}
+AI void psq_store(Ctx *c, int rs, uint32_t ea, int w, int g) {
+    uint32_t kind = c->gqr[g] & 7;
+    int scale = qscale(c->gqr[g] >> 8);
+    uint64_t first = c->f[rs].u, second = c->ps1[rs].u;
+    qwrite(c, ea, first, kind, scale);
+    if (!w) qwrite(c, ea + qsize(kind), second, kind, scale);
+}
 #endif

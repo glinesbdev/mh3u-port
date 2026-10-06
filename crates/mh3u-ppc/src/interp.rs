@@ -150,11 +150,11 @@ fn canonical32(result: f32, inputs: &[f32]) -> f32 {
 }
 
 impl Cpu {
-    fn cr_bit(&self, bit: u32) -> bool {
+    pub(crate) fn cr_bit(&self, bit: u32) -> bool {
         (self.cr >> (31 - bit)) & 1 != 0
     }
 
-    fn set_cr_bit(&mut self, bit: u32, value: bool) {
+    pub(crate) fn set_cr_bit(&mut self, bit: u32, value: bool) {
         let mask = 1u32 << (31 - bit);
         if value {
             self.cr |= mask;
@@ -164,12 +164,16 @@ impl Cpu {
     }
 
     /// Set field `n` of the condition register to the four bits `v`.
-    fn set_cr_field(&mut self, n: usize, v: u32) {
+    pub(crate) fn set_cr_field(&mut self, n: usize, v: u32) {
         let shift = 28 - 4 * n as u32;
         self.cr = (self.cr & !(0xf << shift)) | ((v & 0xf) << shift);
     }
 
-    fn cr_field(&self, n: usize) -> u32 {
+    pub fn cr_field_for_test(&self, n: usize) -> u32 {
+        self.cr_field(n)
+    }
+
+    pub(crate) fn cr_field(&self, n: usize) -> u32 {
         (self.cr >> (28 - 4 * n as u32)) & 0xf
     }
 
@@ -207,7 +211,7 @@ impl Cpu {
     }
 
     /// The value of register `ra` for an address or `addi`: zero when the field is 0.
-    fn ra_or_zero(&self, ra: usize) -> u32 {
+    pub(crate) fn ra_or_zero(&self, ra: usize) -> u32 {
         if ra == 0 { 0 } else { self.gpr[ra] }
     }
 
@@ -755,6 +759,7 @@ impl Cpu {
                     return Err(Stop::Trap(w));
                 }
             }
+            op if op.class() == crate::Class::Paired => self.paired(mem, insn)?,
             op if op.class() == crate::Class::Float || op.class() == crate::Class::Special => self.float(insn)?,
             _ => return Err(Stop::Unsupported(w)),
         }

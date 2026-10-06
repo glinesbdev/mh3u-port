@@ -55,7 +55,8 @@ int main(int argc, char **argv) {
         const uint8_t *s = in + i * STATE;
         Ctx c;
         memset(&c, 0, sizeof c);
-        for (int k = 0; k < 32; k++) { c.r[k] = be32(s + 4 * k); c.f[k].u = be64(s + 0x80 + 8 * k); }
+        for (int k = 0; k < 32; k++) { c.r[k] = be32(s + 4 * k); c.f[k].u = be64(s + 0x80 + 8 * k); c.ps1[k].u = be64(s + 0x300 + 8 * k); }
+        for (int k = 0; k < 8; k++) c.gqr[k] = be32(s + 0x1a0 + 4 * k);
         c.cr = be32(s + 0x180); c.xer = be32(s + 0x184); c.lr = be32(s + 0x188); c.ctr = be32(s + 0x18c);
         c.r[30] = 0; c.r[31] = IN_BASE + (uint32_t)(i * STATE);
         uint32_t sa = IN_BASE + (uint32_t)(i * STATE) + SCRATCH_AT;
@@ -63,7 +64,8 @@ int main(int argc, char **argv) {
         c.mem = 0;
         table[idx](&c);
         uint8_t *o = out + i * STATE;
-        for (int k = 0; k < 32; k++) { put32(o + 4 * k, c.r[k]); put64(o + 0x80 + 8 * k, c.f[k].u); }
+        for (int k = 0; k < 32; k++) { put32(o + 4 * k, c.r[k]); put64(o + 0x80 + 8 * k, c.f[k].u); put64(o + 0x300 + 8 * k, c.ps1[k].u); }
+        for (int k = 0; k < 8; k++) put32(o + 0x1a0 + 4 * k, c.gqr[k]);
         put32(o + 0x180, c.cr); put32(o + 0x184, c.xer); put32(o + 0x188, c.lr); put32(o + 0x18c, c.ctr);
         memcpy(o + SCRATCH_AT, (void *)(uintptr_t)sa, SCRATCH_LEN);
     }
@@ -142,7 +144,6 @@ fn skipped_here(op: Op) -> Option<&'static str> {
         DcbzL => "paired-single mode",
         B | Bc | Bclr | Bcctr => "branches have their own test",
         Lwarx | Stwcx => "the reservation pair has its own test",
-        _ if op.class() == mh3u_ppc::Class::Paired => "paired singles are not translated yet",
         _ => return None,
     })
 }
@@ -192,7 +193,8 @@ fn the_translated_c_of_every_instruction_does_what_the_interpreter_does() {
         for (k, st) in it.states.iter().enumerate() {
             match interpret(&[it.word], st, k) {
                 Ok((ours, _)) => {
-                    let d = differences(it.op, &c_states[k], &ours);
+                    let mut d = differences(it.op, &c_states[k], &ours);
+                    d.extend(ps_differences(&c_states[k], &ours));
                     if !d.is_empty() {
                         failures.push(format!(
                             "{} {:#010x} case {k}: {} (c first, interpreter second)",

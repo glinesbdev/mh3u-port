@@ -171,7 +171,7 @@ pub fn is_memory(op: Op) -> bool {
     matches!(
         op.class(),
         mh3u_ppc::Class::Load | mh3u_ppc::Class::Store | mh3u_ppc::Class::FloatMem
-    )
+    ) || matches!(op, PsqL | PsqLu | PsqSt | PsqStu | PsqLx | PsqLux | PsqStx | PsqStux)
 }
 
 pub fn is_indexed(op: Op) -> bool {
@@ -205,6 +205,10 @@ pub fn is_indexed(op: Op) -> bool {
             | Stfdx
             | Stfdux
             | Stfiwx
+            | PsqLx
+            | PsqLux
+            | PsqStx
+            | PsqStux
             | Lswx
             | Stswx
             | Dcbz
@@ -241,6 +245,10 @@ pub fn is_update(op: Op) -> bool {
             | Stfsux
             | Stfdu
             | Stfdux
+            | PsqLu
+            | PsqStu
+            | PsqLux
+            | PsqStux
     )
 }
 
@@ -291,7 +299,7 @@ pub fn build(op: Op, tpl: u32, rng: &mut Rng, i: usize) -> Case {
                 rb = reg(rng);
             }
         }
-        if is_update(op) && matches!(op.class(), mh3u_ppc::Class::Load) {
+        if is_update(op) && (matches!(op.class(), mh3u_ppc::Class::Load) || matches!(op, PsqLu | PsqLux)) {
             while rd == ra {
                 rd = reg(rng);
             }
@@ -321,6 +329,14 @@ pub fn build(op: Op, tpl: u32, rng: &mut Rng, i: usize) -> Case {
         } else {
             rng.double()
         };
+    }
+    for f in 0..32 {
+        st.ps1[f] = rng.single();
+    }
+    for g in st.gqr.iter_mut() {
+        let kind = |rng: &mut Rng| [0u32, 4, 5, 6, 7][rng.below(5) as usize];
+        let scale = |rng: &mut Rng| (rng.below(17) as i32 - 8) as u32 & 0x3f;
+        *g = kind(rng) | scale(rng) << 8 | kind(rng) << 16 | scale(rng) << 24;
     }
     st.cr = rng.next_u64() as u32;
     st.xer = (rng.next_u64() as u32) & 0xe000_0000;
@@ -382,6 +398,39 @@ pub fn build(op: Op, tpl: u32, rng: &mut Rng, i: usize) -> Case {
                     w &= !(0x1f << 16);
                 }
             }
+            if opcode == 4 {
+                // the paired singles: frC for the A-form ones, W and I for the indexed quantized loads and stores, a compare's field
+                let a_form = matches!(
+                    op,
+                    PsAdd
+                        | PsSub
+                        | PsMul
+                        | PsDiv
+                        | PsMadd
+                        | PsMsub
+                        | PsNmadd
+                        | PsNmsub
+                        | PsSum0
+                        | PsSum1
+                        | PsMuls0
+                        | PsMuls1
+                        | PsMadds0
+                        | PsMadds1
+                        | PsSel
+                        | PsRes
+                        | PsRsqrte
+                );
+                if a_form {
+                    w |= rng.below(30) << 6;
+                }
+                if matches!(op, PsqLx | PsqLux | PsqStx | PsqStux) {
+                    w |= rng.below(2) << 10 | rng.below(8) << 7;
+                }
+                if matches!(op, PsCmpu0 | PsCmpo0 | PsCmpu1 | PsCmpo1) {
+                    w &= !(0x1f << 21);
+                    w |= rng.below(8) << 23;
+                }
+            }
             if has_oe(op) && rng.bit() {
                 w |= 1 << 10;
             }
@@ -432,6 +481,11 @@ pub fn build(op: Op, tpl: u32, rng: &mut Rng, i: usize) -> Case {
                 w |= ((1 + rng.below(32)) % 32) << 11;
             }
         }
+        56 | 57 | 60 | 61 => {
+            // psq_l, psq_lu, psq_st, psq_stu: W, I and a 12-bit displacement
+            let d = (rng.below(65) as i32 - 32) as u32 & 0xfff;
+            w |= rd << 21 | ra << 16 | rng.below(2) << 15 | rng.below(8) << 12 | d;
+        }
         20 | 21 | 23 => {
             w |= rd << 21 | ra << 16 | rng.below(32) << 11 | rng.below(32) << 6 | rng.below(32) << 1;
             if rng.bit() {
@@ -467,7 +521,11 @@ pub fn build(op: Op, tpl: u32, rng: &mut Rng, i: usize) -> Case {
         } else if matches!(op, Lswi | Stswi) {
             st.gpr[ra_i] = base;
         } else {
-            let disp = i32::from(w as i16);
+            let disp = if matches!(op, PsqL | PsqLu | PsqSt | PsqStu) {
+                ((w & 0xfff) as i32) << 20 >> 20
+            } else {
+                i32::from(w as i16)
+            };
             st.gpr[ra_i] = (base as i32).wrapping_sub(disp) as u32;
             if matches!(op, Stmw) {
                 st.gpr[ra_i] = base.wrapping_sub(disp as u32);
@@ -500,6 +558,8 @@ pub fn interpret(words: &[u32], st: &St, i: usize) -> Result<(St, usize), Stop> 
     let mut cpu = Cpu {
         gpr: st.gpr,
         fpr: st.fpr,
+        ps1: st.ps1,
+        gqr: st.gqr,
         cr: st.cr,
         xer: st.xer,
         lr: st.lr,
@@ -523,6 +583,8 @@ pub fn interpret(words: &[u32], st: &St, i: usize) -> Result<(St, usize), Stop> 
     let mut out = St {
         gpr: cpu.gpr,
         fpr: cpu.fpr,
+        ps1: cpu.ps1,
+        gqr: cpu.gqr,
         cr: cpu.cr,
         xer: cpu.xer,
         lr: cpu.lr,
@@ -603,7 +665,12 @@ pub fn fix_state_for_word(op: Op, word: u32, st: &mut St, i: usize, rng: &mut Rn
         } else if matches!(op, Lswi | Stswi) {
             st.gpr[ra] = base;
         } else {
-            st.gpr[ra] = (base as i32).wrapping_sub(i32::from(word as i16)) as u32;
+            let disp = if matches!(op, PsqL | PsqLu | PsqSt | PsqStu) {
+                ((word & 0xfff) as i32) << 20 >> 20
+            } else {
+                i32::from(word as i16)
+            };
+            st.gpr[ra] = (base as i32).wrapping_sub(disp) as u32;
         }
         if matches!(op, Lswx | Stswx) {
             st.xer = (st.xer & !0x7f) | rng.below(33);
@@ -654,4 +721,18 @@ pub fn run_sequence(name: &str, words: &[u32], states: &[St], note: &dyn Fn(&St)
         }
     }
     failures
+}
+
+/// What differs in the second halves of the registers and the quantization registers (QEMU has neither, so `differences` leaves them).
+pub fn ps_differences(a: &St, b: &St) -> Vec<String> {
+    let mut d = Vec::new();
+    for f in 0..32 {
+        if a.ps1[f] != b.ps1[f] {
+            d.push(format!("ps1 of f{f}: {:#018x}, {:#018x}", a.ps1[f], b.ps1[f]));
+        }
+    }
+    if a.gqr != b.gqr {
+        d.push(format!("gqr: {:x?}, {:x?}", a.gqr, b.gqr));
+    }
+    d
 }

@@ -23,7 +23,9 @@ pub const CR_AT: usize = 0x180;
 pub const XER_AT: usize = 0x184;
 pub const LR_AT: usize = 0x188;
 pub const CTR_AT: usize = 0x18c;
+pub const GQR_AT: usize = 0x1a0;
 pub const SCRATCH_AT: usize = 0x200;
+pub const PS1_AT: usize = 0x300;
 pub const SCRATCH_LEN: usize = 256;
 
 /// A register state and the scratch memory the instructions may touch.
@@ -31,6 +33,9 @@ pub const SCRATCH_LEN: usize = 256;
 pub struct St {
     pub gpr: [u32; 32],
     pub fpr: [u64; 32],
+    /// The second half of each register (paired singles) and the quantization registers: not part of what QEMU runs.
+    pub ps1: [u64; 32],
+    pub gqr: [u32; 8],
     pub cr: u32,
     pub xer: u32,
     pub lr: u32,
@@ -43,6 +48,8 @@ impl Default for St {
         St {
             gpr: [0; 32],
             fpr: [0; 32],
+            ps1: [0; 32],
+            gqr: [0; 8],
             cr: 0,
             xer: 0,
             lr: 0,
@@ -61,6 +68,12 @@ impl St {
         for (i, v) in self.fpr.iter().enumerate() {
             b[FPR_AT + 8 * i..FPR_AT + 8 * i + 8].copy_from_slice(&v.to_be_bytes());
         }
+        for (i, v) in self.ps1.iter().enumerate() {
+            b[PS1_AT + 8 * i..PS1_AT + 8 * i + 8].copy_from_slice(&v.to_be_bytes());
+        }
+        for (i, v) in self.gqr.iter().enumerate() {
+            b[GQR_AT + 4 * i..GQR_AT + 4 * i + 4].copy_from_slice(&v.to_be_bytes());
+        }
         for (at, v) in [(CR_AT, self.cr), (XER_AT, self.xer), (LR_AT, self.lr), (CTR_AT, self.ctr)] {
             b[at..at + 4].copy_from_slice(&v.to_be_bytes());
         }
@@ -74,6 +87,10 @@ impl St {
         for i in 0..32 {
             s.gpr[i] = u32_at(GPR_AT + 4 * i);
             s.fpr[i] = u64::from_be_bytes(b[FPR_AT + 8 * i..FPR_AT + 8 * i + 8].try_into().unwrap());
+            s.ps1[i] = u64::from_be_bytes(b[PS1_AT + 8 * i..PS1_AT + 8 * i + 8].try_into().unwrap());
+        }
+        for i in 0..8 {
+            s.gqr[i] = u32_at(GQR_AT + 4 * i);
         }
         s.cr = u32_at(CR_AT);
         s.xer = u32_at(XER_AT);

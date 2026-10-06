@@ -44,6 +44,7 @@ pub enum Class {
 
 pub mod insn;
 pub mod interp;
+pub mod paired;
 pub use insn::{Insn, Op};
 
 /// One decoded instruction: its name and kind.
