@@ -3,7 +3,7 @@
 //! shaders (the translator makes them from the same microcode) that write storage buffers, the geometry shader also writes the list of
 //! triangles that its strips make, and the copy shader is an ordinary vertex shader that reads the second ring.
 
-use crate::draw::{AttribStream, Compiled};
+use crate::draw::{AttribStream, BufRef, Compiled, Role};
 use crate::gx2::Gx2;
 use crate::state::State;
 use mh3u_latte::decode::{decode, ring_extent};
@@ -14,8 +14,8 @@ use std::sync::Arc;
 /// What the render stage of a geometry pipeline draws from.
 pub struct GeoOut {
     pub copy: Arc<Compiled>,
-    pub ring_out: wgpu::Buffer,
-    pub indices: wgpu::Buffer,
+    pub ring_out: BufRef,
+    pub indices: BufRef,
     pub index_count: u32,
     /// Where the geometry shader's description of the vertex outputs' meanings (semantic numbers) is.
     pub semantics_at: u32,
@@ -169,62 +169,24 @@ impl Gx2 {
         let device = self.d.device.clone();
         let total = first + count;
         // the vertex streams, as for any vertex shader
-        let (stream_data, meta) = self.decode_streams(g, st, fetch, total.min(1 << 22), 1);
-        let storage = |label: &str, size: u64, extra: wgpu::BufferUsages| {
-            device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some(label),
-                size: size.max(16),
-                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST | extra,
-                mapped_at_creation: false,
-            })
-        };
-        let va = storage("streams", stream_data.len() as u64, wgpu::BufferUsages::empty());
-        self.d.queue.write_buffer(&va, 0, &stream_data);
-        let meta_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("stream offsets"),
-            size: 256,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        self.d.queue.write_buffer(
-            &meta_buffer,
-            0,
-            &meta.iter().flatten().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>(),
-        );
-        let ring_in = storage("es ring", u64::from(total) * u64::from(es_vec4) * 16, wgpu::BufferUsages::empty());
-        let ring_out = storage(
-            "gs ring",
-            u64::from(count) * u64::from(max_vertices) * u64::from(gs_vec4) * 16,
-            wgpu::BufferUsages::COPY_SRC,
-        );
+        let (stream_data, meta) = self.decode_streams(g, st, fetch, 0, total.min(1 << 22), 1);
+        let va = self.arena_write(&stream_data, stream_data.len() as u64);
+        let meta_buffer = self.arena_write(&meta.iter().flatten().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>(), 256);
+        let ring_in = self.arena_alloc(Role::RingIn, u64::from(total) * u64::from(es_vec4) * 16);
+        // what the geometry shader does not write must read as zero (an empty triangle)
+        let ring_out = self.arena_alloc(Role::Out, u64::from(count) * u64::from(max_vertices) * u64::from(gs_vec4) * 16);
         let index_count = count * max_vertices * 3;
-        let indices = storage(
-            "gs triangles",
-            u64::from(index_count) * 4,
-            wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_SRC,
-        );
-        let params = |x: u32, y: u32| {
-            let b = device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("stage parameters"),
-                size: 16,
-                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            });
-            self.d
-                .queue
-                .write_buffer(&b, 0, &[x.to_le_bytes(), y.to_le_bytes(), [0; 4], [0; 4]].concat());
-            b
-        };
-        let es_params = params(total, 0);
-        let gs_params = params(count, first);
+        let indices = self.arena_alloc(Role::Out, u64::from(index_count) * 4);
+        let es_params = self.arena_write(&[total.to_le_bytes(), 0u32.to_le_bytes(), [0; 4], [0; 4]].concat(), 16);
+        let gs_params = self.arena_write(&[count.to_le_bytes(), first.to_le_bytes(), [0; 4], [0; 4]].concat(), 16);
         // uniform blocks of each stage
-        let mut keep: Vec<wgpu::Buffer> = Vec::new();
+        let mut keep: Vec<BufRef> = Vec::new();
         for (&bank, &len) in &es.interface.banks {
-            keep.push(self.uniform_buffer_pub(g, &st.vertex_blocks[(bank as usize).min(15)], len));
+            keep.push(self.uniform_buffer(g, &st.vertex_blocks[(bank as usize).min(15)], len));
         }
         let es_banks = keep.len();
         for (&bank, &len) in &gst.interface.banks {
-            keep.push(self.uniform_buffer_pub(g, &st.geometry_blocks[(bank as usize).min(15)], len));
+            keep.push(self.uniform_buffer(g, &st.geometry_blocks[(bank as usize).min(15)], len));
         }
         let es_pipeline = self.compute(format!("es{key}"), &es.module);
         let gs_pipeline = self.compute(format!("gs{key}"), &gst.module);
@@ -235,7 +197,7 @@ impl Gx2 {
             .enumerate()
             .map(|(i, &bank)| wgpu::BindGroupEntry {
                 binding: bank,
-                resource: keep[i].as_entire_binding(),
+                resource: keep[i].binding(),
             })
             .collect();
         let gs_consts: Vec<wgpu::BindGroupEntry> = gst
@@ -245,7 +207,7 @@ impl Gx2 {
             .enumerate()
             .map(|(i, &bank)| wgpu::BindGroupEntry {
                 binding: bank,
-                resource: keep[es_banks + i].as_entire_binding(),
+                resource: keep[es_banks + i].binding(),
             })
             .collect();
         let bind = |p: &wgpu::ComputePipeline, group: u32, entries: &[wgpu::BindGroupEntry]| {
@@ -262,19 +224,19 @@ impl Gx2 {
             &[
                 wgpu::BindGroupEntry {
                     binding: 0,
-                    resource: va.as_entire_binding(),
+                    resource: va.binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
-                    resource: meta_buffer.as_entire_binding(),
+                    resource: meta_buffer.binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 2,
-                    resource: ring_in.as_entire_binding(),
+                    resource: ring_in.binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 5,
-                    resource: es_params.as_entire_binding(),
+                    resource: es_params.binding(),
                 },
             ],
         );
@@ -285,23 +247,28 @@ impl Gx2 {
             &[
                 wgpu::BindGroupEntry {
                     binding: 2,
-                    resource: ring_in.as_entire_binding(),
+                    resource: ring_in.binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 3,
-                    resource: ring_out.as_entire_binding(),
+                    resource: ring_out.binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 4,
-                    resource: indices.as_entire_binding(),
+                    resource: indices.binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 5,
-                    resource: gs_params.as_entire_binding(),
+                    resource: gs_params.binding(),
                 },
             ],
         );
-        let mut enc = device.create_command_encoder(&Default::default());
+        let enc = self
+            .batch
+            .pre
+            .get_or_insert_with(|| device.create_command_encoder(&Default::default()));
+        enc.clear_buffer(&ring_out.buffer, ring_out.offset, Some(ring_out.size));
+        enc.clear_buffer(&indices.buffer, indices.offset, Some(indices.size));
         {
             let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("es"),
@@ -322,7 +289,6 @@ impl Gx2 {
             pass.set_bind_group(1, &gs_g1, &[]);
             pass.dispatch_workgroups(count.div_ceil(64), 1, 1);
         }
-        self.d.queue.submit([enc.finish()]);
         Some(GeoOut {
             copy,
             ring_out,

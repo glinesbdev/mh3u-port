@@ -16,6 +16,7 @@ const CALLS: &[&str] = &[
     "gx2:GX2DirectCallDisplayList",
     "gx2:GX2SetVertexShader",
     "gx2:GX2SetPixelShader",
+    "gx2:GX2SetPrimitiveRestartIndex",
     "gx2:GX2SetGeometryShader",
     "gx2:GX2SetFetchShader",
     "gx2:GX2SetAttribBuffer",
@@ -71,6 +72,7 @@ pub(crate) struct Target {
 }
 
 pub struct Gx2 {
+    pub(crate) batch: crate::draw::Batch,
     pub(crate) d: Display,
     pub(crate) config: wgpu::SurfaceConfiguration,
     blit: wgpu::RenderPipeline,
@@ -80,7 +82,7 @@ pub struct Gx2 {
     pub(crate) targets: HashMap<u32, Target>,
     /// What the TV shows: a copy of the colour buffer given to `GX2CopyColorBufferToScanBuffer`.
     tv: Option<wgpu::Texture>,
-    swaps: u32,
+    pub(crate) swaps: u32,
     interval: u32,
     /// The state of each context the game has made, by the guest address of its `GX2ContextState`, and the one in use.
     pub(crate) contexts: HashMap<u32, State>,
@@ -201,6 +203,7 @@ impl Gx2 {
             ..Default::default()
         });
         Gx2 {
+            batch: Default::default(),
             d,
             config,
             blit,
@@ -266,6 +269,7 @@ impl Gx2 {
 
     /// `GX2CopySurface`: the contents of one surface into another (both are known to this backend as render targets or not at all).
     fn copy_surface(&mut self, g: &Guest, source: u32, destination: u32) {
+        self.flush_draws();
         if self.log && self.swaps < 400 {
             eprintln!(
                 "[gfx] copy surface {source:#x} (image {:#x}, {}x{}, format {:#x}) to {destination:#x} (image {:#x}, {}x{}, format {:#x})",
@@ -312,6 +316,7 @@ impl Gx2 {
     }
 
     fn clear(&mut self, g: &Guest, c: &Ctx) {
+        self.flush_draws();
         let Some(image) = self.target(g, c.r[3]) else { return };
         let f = |n: usize| f64::from(f64::from_bits(c.f[n]) as f32);
         let view = self.targets[&image].texture.create_view(&Default::default());
@@ -343,6 +348,7 @@ impl Gx2 {
     }
 
     fn copy_to_scan_buffer(&mut self, g: &Guest, c: &Ctx) {
+        self.flush_draws();
         if c.r[4] != TV {
             return;
         }
@@ -442,6 +448,7 @@ impl Gx2 {
 
     /// Shows the TV picture, scaled to the window with the picture's proportions kept.
     fn present(&mut self) {
+        self.flush_draws();
         let size = self.d.window.inner_size();
         if size.width == 0 || size.height == 0 {
             return;
@@ -564,6 +571,10 @@ impl Gx2 {
                     eprintln!("  vertex shader {v:#x}");
                 }
                 self.state().vertex_shader = v;
+            }
+            "gx2:GX2SetPrimitiveRestartIndex" => {
+                let v = a(0);
+                self.state().restart_index = Some(v);
             }
             "gx2:GX2SetPixelShader" => {
                 let v = a(0);

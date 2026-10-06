@@ -147,7 +147,14 @@ extern "C" fn import(c: *mut Ctx, number: u32) {
             Some(Handler::Gx2) => {
                 let guest = k.guest;
                 if let Some(b) = k.backend.as_mut() {
-                    b.call(&k.report.names[number as usize], c, &guest);
+                    let name = &k.report.names[number as usize];
+                    if k.gfx_times {
+                        let t = std::time::Instant::now();
+                        b.call(name, c, &guest);
+                        k.times.record(name, t.elapsed());
+                    } else {
+                        b.call(name, c, &guest);
+                    }
                 }
                 Step::Done
             }

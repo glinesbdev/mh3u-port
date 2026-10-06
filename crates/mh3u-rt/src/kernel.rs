@@ -85,6 +85,9 @@ pub struct Kernel {
     /// Functions found by name at run time (`OSDynLoad_FindExport`): a call to `DYNAMIC_BASE + 4 * n` is a call to the n-th of these.
     pub dynamic: Vec<String>,
     pub started: std::time::Instant,
+    /// MH3U_GFX_TIMES: the time spent in each graphics call, reported every ten seconds
+    pub gfx_times: bool,
+    pub times: CallTimes,
     /// The callbacks registered with `ProcUIRegisterCallback`: (type, function, parameter, priority), and whether the first foreground
     /// acquisition has been delivered.
     pub procui_callbacks: Vec<(u32, u32, u32, u32)>,
@@ -161,6 +164,8 @@ impl Kernel {
             queues: HashMap::new(),
             dynamic: Vec::new(),
             started: std::time::Instant::now(),
+            gfx_times: std::env::var_os("MH3U_GFX_TIMES").is_some(),
+            times: CallTimes::default(),
             procui_callbacks: Vec::new(),
             procui_acquired: false,
             ax_callbacks: Vec::new(),
@@ -225,6 +230,34 @@ pub fn pass_baton(mut guard: MutexGuard<'static, Option<Kernel>>, waiting: bool)
 }
 
 /// Sleeps the calling thread for `duration`, letting the others run meanwhile.
+/// Time spent in the graphics calls, by name.
+#[derive(Default)]
+pub struct CallTimes {
+    by_name: HashMap<String, (Duration, u64)>,
+    since: Option<Instant>,
+}
+
+impl CallTimes {
+    pub fn record(&mut self, name: &str, took: Duration) {
+        let since = *self.since.get_or_insert_with(Instant::now);
+        let e = self.by_name.entry(name.to_string()).or_default();
+        e.0 += took;
+        e.1 += 1;
+        if since.elapsed() >= Duration::from_secs(10) {
+            let wall = since.elapsed().as_secs_f64();
+            let mut v: Vec<_> = self.by_name.iter().collect();
+            v.sort_by_key(|(_, (d, _))| std::cmp::Reverse(*d));
+            let total: f64 = v.iter().map(|(_, (d, _))| d.as_secs_f64()).sum();
+            eprintln!("[gfx times] {wall:.1} s: {total:.1} s in graphics calls");
+            for (name, (d, n)) in v.iter().take(8) {
+                eprintln!("[gfx times]   {:>7.3} s {n:>8} calls  {name}", d.as_secs_f64());
+            }
+            self.by_name.clear();
+            self.since = Some(Instant::now());
+        }
+    }
+}
+
 /// A timer the game set: it calls `handler(alarm, context)` when `due` has come, and again every `period` if it has one.
 #[derive(Debug, Clone)]
 pub struct Alarm {

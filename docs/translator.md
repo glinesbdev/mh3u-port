@@ -136,6 +136,15 @@ with their text and the cloth background, upright, in the right places (the hunt
 - **The DMA engine** (`DMAECopyMem`) is how the game fills the GPU's constant buffers: without it every uniform block was zero.
 - `GX2CopySurface` copies between render targets (same size and format only); `GX2ClearColor`, `GX2ClearDepthStencilEx`.
 
+- **Speed** (the village scene went from 3.7 to about 13 frames a second): the draws of a frame are recorded into one command buffer and
+  one render pass while they go to the same targets (`flush_draws` hands them to the GPU at the next copy, clear or swap); the small
+  buffers of a draw (uniform blocks, vertex streams, indices, the geometry rings) are cut from big arena buffers that are reused after
+  each hand-over, instead of being made one by one; the geometry pipelines' compute work goes into a second command buffer that runs
+  first; only the vertices a draw uses are decoded (its indices are made relative to the lowest); and the decoded vertex streams are
+  kept on the GPU, found again by a hash of the vertex bytes (so a mesh the game draws every frame is decoded once). A strip's restart
+  index (`GX2SetPrimitiveRestartIndex`, 0xffff here) becomes the API's restart value: before that, strips drew a vertex 65535 away
+  and decoded all 64 thousand vertices before it for every such draw. `MH3U_GFX_TIMES=1` prints where the time goes (every ten seconds:
+  per graphics call, and per part of a draw).
 - **Textures** (`texture.rs`): a `GX2Texture` is read from the guest, untiled texel by texel (`tiling::address`) and uploaded in the
   format the GPU takes (the block-compressed ones as they are stored: the blocks are not byte-swapped; the packed ones are converted).
   The layout is `tiling::surface_info`, the same calculation the game's size call used. The tiling code is a restatement of the part of

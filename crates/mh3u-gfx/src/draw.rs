@@ -77,6 +77,30 @@ pub struct DrawCaches {
     /// Why draws were not drawn, and how many.
     pub skipped: HashMap<&'static str, u64>,
     pub gs_draws: HashMap<(u32, u32, u32, u32, u32), u64>,
+    /// Decoded vertex streams kept on the GPU, by what they were decoded from (the layout and a hash of the bytes).
+    pub streams: HashMap<(u64, u64), StreamEntry>,
+    pub stream_bytes: u64,
+}
+
+pub struct StreamEntry {
+    buffer: wgpu::Buffer,
+    meta: [[u32; 4]; 16],
+    size: u64,
+    used: u32,
+}
+
+/// A quick hash of bytes (eight at a time), for telling whether vertex data is what it was.
+fn hash_fast(b: &[u8], seed: u64) -> u64 {
+    let mut h = seed ^ (b.len() as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+    let (words, rest) = b.as_chunks::<8>();
+    for w in words {
+        h = (h ^ u64::from_le_bytes(*w)).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+        h ^= h >> 29;
+    }
+    for &x in rest {
+        h = (h ^ u64::from(x)).wrapping_mul(0x0100_0000_01b3);
+    }
+    h ^ (h >> 32)
 }
 
 fn hash_bytes(b: &[u8]) -> u64 {
@@ -608,6 +632,7 @@ impl Gx2 {
     }
 
     pub(crate) fn clear_depth(&mut self, g: &Guest, db: u32, depth: f32, stencil: u32, mode: u32) {
+        self.flush_draws();
         let Some((image, format)) = self.depth_target(g, db) else { return };
         let view = self.caches.depth[&image].0.create_view(&Default::default());
         let has_stencil = format == wgpu::TextureFormat::Depth24PlusStencil8;
@@ -650,6 +675,7 @@ impl Gx2 {
         g: &Guest,
         st: &State,
         fetch: &[AttribStream],
+        start: u32,
         vertices: u32,
         instances: u32,
     ) -> (Vec<u8>, [[u32; 4]; 16]) {
@@ -658,14 +684,14 @@ impl Gx2 {
         for (i, a) in fetch.iter().enumerate().take(16) {
             meta[i][0] = (data.len() / 16) as u32;
             let b = &st.attrib_buffers[(a.buffer as usize).min(15)];
-            let items = if a.per_instance {
-                instances.div_ceil(a.divisor.max(1))
+            let (first_item, items) = if a.per_instance {
+                (0, instances.div_ceil(a.divisor.max(1)))
             } else {
-                vertices
+                (start, vertices)
             };
             let size = attribute_size(a.format);
             let mut bytes = vec![0u8; size as usize];
-            for item in 0..items {
+            for item in first_item..first_item + items {
                 let at = b.address.wrapping_add(a.offset).wrapping_add(item.wrapping_mul(b.stride));
                 if b.address != 0 && item.wrapping_mul(b.stride).saturating_add(a.offset).saturating_add(size) <= b.size.max(1) {
                     g.read(at, &mut bytes);
@@ -690,19 +716,123 @@ impl Gx2 {
         (data, meta)
     }
 
-    /// The upload of one uniform block: the guest's big-endian words as the shader reads them.
-    pub(crate) fn uniform_buffer_pub(&self, g: &Guest, block: &crate::state::UniformBlock, vec4s: u32) -> wgpu::Buffer {
-        self.uniform_buffer(g, block, vec4s)
-    }
-
-    fn uniform_buffer(&self, g: &Guest, block: &crate::state::UniformBlock, vec4s: u32) -> wgpu::Buffer {
-        let size = u64::from(vec4s.max(1)) * 16;
+    /// The decoded streams of a draw on the GPU: made again only when the layout or the vertex bytes are not what they were (the bytes
+    /// are hashed, so a game that changes its vertex data without telling the GPU is still followed).
+    fn cached_streams(
+        &mut self,
+        g: &Guest,
+        st: &State,
+        fetch: &[AttribStream],
+        start: u32,
+        vertices: u32,
+        instances: u32,
+    ) -> (BufRef, [[u32; 4]; 16]) {
+        let mut lap = Lap::new();
+        let (mut h1, mut h2) = (0x1234_5678_9abc_def0u64, 0x0fed_cba9_8765_4321u64);
+        let mut mix = |v: u64| {
+            h1 = (h1 ^ v).wrapping_mul(0x9e37_79b9_7f4a_7c15).rotate_left(23);
+            h2 = (h2.wrapping_add(v)).wrapping_mul(0xc2b2_ae3d_27d4_eb4f).rotate_left(31);
+        };
+        mix(u64::from(start));
+        mix(u64::from(vertices));
+        mix(u64::from(instances));
+        // the bytes each buffer is read from: one span per buffer and range of items
+        let mut spans: Vec<(u32, u32, u32, u32)> = Vec::new(); // (buffer, first item, items, bytes needed past the last item's start)
+        for a in fetch.iter().take(16) {
+            for v in [
+                a.location,
+                a.buffer,
+                a.offset,
+                a.format,
+                a.endian,
+                a.divisor,
+                u32::from(a.per_instance),
+            ]
+            .into_iter()
+            .chain(a.select)
+            {
+                mix(u64::from(v));
+            }
+            let (first, items) = if a.per_instance {
+                (0, instances.div_ceil(a.divisor.max(1)))
+            } else {
+                (start, vertices)
+            };
+            let end = a.offset + attribute_size(a.format);
+            match spans.iter_mut().find(|s| (s.0, s.1, s.2) == (a.buffer, first, items)) {
+                Some(s) => s.3 = s.3.max(end),
+                None => spans.push((a.buffer, first, items, end)),
+            }
+        }
+        let mut raw = Vec::new();
+        for &(buffer, first, items, end) in &spans {
+            let b = &st.attrib_buffers[(buffer as usize).min(15)];
+            mix(u64::from(b.address != 0));
+            mix(u64::from(b.stride));
+            mix(u64::from(b.size));
+            if b.address == 0 || items == 0 {
+                continue;
+            }
+            let from = u64::from(first) * u64::from(b.stride);
+            let len = (u64::from(items) - 1) * u64::from(b.stride) + u64::from(end);
+            let len = len.min(u64::from(b.size).saturating_sub(from)).min(1 << 28);
+            raw.resize(len as usize, 0);
+            g.read(b.address.wrapping_add(from as u32), &mut raw);
+            mix(hash_fast(&raw, 1));
+        }
+        let key = (h1, h2);
+        let swaps = self.swaps;
+        lap.mark("stream hash");
+        if let Some(e) = self.caches.streams.get_mut(&key) {
+            lap.mark("stream hit");
+            e.used = swaps;
+            let (buffer, meta) = (e.buffer.clone(), e.meta);
+            let size = e.size;
+            return (BufRef { buffer, offset: 0, size }, meta);
+        }
+        let (data, meta) = self.decode_streams(g, st, fetch, start, vertices, instances);
+        lap.mark("stream miss: decode");
+        if std::env::var_os("MH3U_TRACE_STREAMS").is_some() {
+            eprintln!(
+                "[streams] miss: start {start} vertices {vertices} instances {instances} attributes {} bytes {}",
+                fetch.len(),
+                data.len()
+            );
+        }
+        let size = data.len() as u64;
         let buffer = self.d.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("uniform block"),
+            label: Some("vertex streams"),
             size,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
+        self.d.queue.write_buffer(&buffer, 0, &data);
+        // forget what has not been used for a while, or what is too much
+        self.caches.stream_bytes += size;
+        if self.caches.stream_bytes > (1 << 30) {
+            let before = self.caches.stream_bytes;
+            self.caches.streams.retain(|_, e| e.used + 120 >= swaps);
+            self.caches.stream_bytes = self.caches.streams.values().map(|e| e.size).sum::<u64>() + size;
+            if self.caches.stream_bytes > before / 2 && self.caches.stream_bytes > (1 << 30) {
+                self.caches.streams.clear();
+                self.caches.stream_bytes = size;
+            }
+        }
+        self.caches.streams.insert(
+            key,
+            StreamEntry {
+                buffer: buffer.clone(),
+                meta,
+                size,
+                used: swaps,
+            },
+        );
+        (BufRef { buffer, offset: 0, size }, meta)
+    }
+
+    /// The upload of one uniform block: the guest's big-endian words as the shader reads them.
+    pub(crate) fn uniform_buffer(&mut self, g: &Guest, block: &crate::state::UniformBlock, vec4s: u32) -> BufRef {
+        let size = u64::from(vec4s.max(1)) * 16;
         let mut bytes = vec![0u8; size as usize];
         let have = (block.size as usize).min(bytes.len());
         if block.address != 0 && have > 0 {
@@ -711,12 +841,13 @@ impl Gx2 {
                 w.reverse();
             }
         }
-        self.d.queue.write_buffer(&buffer, 0, &bytes);
-        buffer
+        self.arena_write(&bytes, size)
     }
 
     pub(crate) fn draw_call(&mut self, g: &Guest, primitive: u32, count: u32, indexed: Option<(u32, u32)>, first: u32, instances: u32) {
+        let mut lap = Lap::new();
         let st = self.contexts.entry(self.current).or_default().clone();
+        lap.mark("state clone");
         if st.vertex_shader == 0 || st.pixel_shader == 0 || count == 0 {
             *self.caches.skipped.entry("no shader or no vertices").or_default() += 1;
             return;
@@ -746,6 +877,7 @@ impl Gx2 {
                 *kind = tex_kind(g.u32(t), g.u32(t + 0x14));
             }
         }
+        lap.mark("target and kinds");
         let geometry = st.geometry_shader != 0 && st.shader_mode == 2;
         let geo = if geometry {
             match self.geometry_pass(g, &st, &fetch, primitive, count, first, indexed, instances) {
@@ -758,6 +890,7 @@ impl Gx2 {
         } else {
             None
         };
+        lap.mark("geometry pass");
         let vs = match &geo {
             Some(x) => x.copy.clone(),
             None => {
@@ -773,125 +906,109 @@ impl Gx2 {
             *self.caches.skipped.entry("pixel shader not translated").or_default() += 1;
             return;
         };
+        lap.mark("shaders");
         let device = self.d.device.clone();
-        let (va, meta_buffer, index_buffer, index_count, topology): (
-            wgpu::Buffer,
-            wgpu::Buffer,
-            wgpu::Buffer,
-            u32,
-            wgpu::PrimitiveTopology,
-        ) = if let Some(x) = &geo {
-            let dummy = device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("unused streams"),
-                size: 16,
-                usage: wgpu::BufferUsages::STORAGE,
-                mapped_at_creation: false,
-            });
-            let dummy_meta = device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("unused offsets"),
-                size: 256,
-                usage: wgpu::BufferUsages::UNIFORM,
-                mapped_at_creation: false,
-            });
-            (
-                dummy,
-                dummy_meta,
-                x.indices.clone(),
-                x.index_count,
-                wgpu::PrimitiveTopology::TriangleList,
-            )
-        } else {
-            // indices
-            let index_values: Option<Vec<u32>> = match indexed {
-                Some((kind, address)) => {
-                    let (wide, big) = (matches!(kind, 1 | 9), matches!(kind, 4 | 9));
-                    let size = if wide { 4 } else { 2 };
-                    let mut bytes = vec![0u8; (count * size) as usize];
-                    g.read(address, &mut bytes);
-                    Some(
-                        bytes
-                            .chunks_exact(size as usize)
-                            .map(|c| match (wide, big) {
-                                (true, true) => u32::from_be_bytes([c[0], c[1], c[2], c[3]]),
-                                (true, false) => u32::from_le_bytes([c[0], c[1], c[2], c[3]]),
-                                (false, true) => u32::from(u16::from_be_bytes([c[0], c[1]])),
-                                (false, false) => u32::from(u16::from_le_bytes([c[0], c[1]])),
-                            })
+        let (va, meta_buffer, index_buffer, index_count, topology): (BufRef, BufRef, BufRef, u32, wgpu::PrimitiveTopology) =
+            if let Some(x) = &geo {
+                let dummy = self.arena_alloc(Role::Read, 16);
+                let dummy_meta = self.arena_alloc(Role::Read, 256);
+                (
+                    dummy,
+                    dummy_meta,
+                    x.indices.clone(),
+                    x.index_count,
+                    wgpu::PrimitiveTopology::TriangleList,
+                )
+            } else {
+                // indices
+                let index_values: Option<Vec<u32>> = match indexed {
+                    Some((kind, address)) => {
+                        let (wide, big) = (matches!(kind, 1 | 9), matches!(kind, 4 | 9));
+                        let size = if wide { 4 } else { 2 };
+                        let mut bytes = vec![0u8; (count * size) as usize];
+                        g.read(address, &mut bytes);
+                        Some(
+                            bytes
+                                .chunks_exact(size as usize)
+                                .map(|c| match (wide, big) {
+                                    (true, true) => u32::from_be_bytes([c[0], c[1], c[2], c[3]]),
+                                    (true, false) => u32::from_le_bytes([c[0], c[1], c[2], c[3]]),
+                                    (false, true) => u32::from(u16::from_be_bytes([c[0], c[1]])),
+                                    (false, false) => u32::from(u16::from_le_bytes([c[0], c[1]])),
+                                })
+                                // the restart index of a strip is `u32::MAX` from here on (what the GPU API takes)
+                                .map(|i| if Some(i) == st.restart_index { u32::MAX } else { i })
+                                .collect(),
+                        )
+                    }
+                    None => None,
+                };
+                let (topology, expand): (wgpu::PrimitiveTopology, bool) = match primitive {
+                    1 => (wgpu::PrimitiveTopology::PointList, false),
+                    2 => (wgpu::PrimitiveTopology::LineList, false),
+                    3 => (wgpu::PrimitiveTopology::LineStrip, false),
+                    4 => (wgpu::PrimitiveTopology::TriangleList, false),
+                    6 => (wgpu::PrimitiveTopology::TriangleStrip, false),
+                    5 | 0x13 | 0x14 | 0x12 => (wgpu::PrimitiveTopology::TriangleList, true),
+                    other => {
+                        self.report(format!("the primitive type {other:#x} is not drawn"));
+                        *self.caches.skipped.entry("primitive type").or_default() += 1;
+                        return;
+                    }
+                };
+                // the list of vertex numbers the draw uses
+                let base: Vec<u32> = match &index_values {
+                    Some(v) => v.iter().map(|&i| if i == u32::MAX { i } else { i.wrapping_add(first) }).collect(),
+                    None => (first..first + count).collect(),
+                };
+                // only strips restart; elsewhere the restart value is an ordinary vertex number
+                let base: Vec<u32> = if matches!(primitive, 3 | 6) {
+                    base
+                } else {
+                    base.into_iter()
+                        .map(|i| if i == u32::MAX { st.restart_index.unwrap_or(i) } else { i })
+                        .collect()
+                };
+                let indices: Vec<u32> = if expand {
+                    match primitive {
+                        5 => (1..base.len().saturating_sub(1))
+                            .flat_map(|i| [base[0], base[i], base[i + 1]])
                             .collect(),
-                    )
-                }
-                None => None,
-            };
-            let (topology, expand): (wgpu::PrimitiveTopology, bool) = match primitive {
-                1 => (wgpu::PrimitiveTopology::PointList, false),
-                2 => (wgpu::PrimitiveTopology::LineList, false),
-                3 => (wgpu::PrimitiveTopology::LineStrip, false),
-                4 => (wgpu::PrimitiveTopology::TriangleList, false),
-                6 => (wgpu::PrimitiveTopology::TriangleStrip, false),
-                5 | 0x13 | 0x14 | 0x12 => (wgpu::PrimitiveTopology::TriangleList, true),
-                other => {
-                    self.report(format!("the primitive type {other:#x} is not drawn"));
-                    *self.caches.skipped.entry("primitive type").or_default() += 1;
+                        0x13 => base
+                            .as_chunks::<4>()
+                            .0
+                            .iter()
+                            .flat_map(|q| [q[0], q[1], q[2], q[0], q[2], q[3]])
+                            .collect(),
+                        0x14 => (0..base.len().saturating_sub(3))
+                            .step_by(2)
+                            .flat_map(|i| [base[i], base[i + 1], base[i + 3], base[i], base[i + 3], base[i + 2]])
+                            .collect(),
+                        _ => Vec::new(),
+                    }
+                } else {
+                    base
+                };
+                if indices.is_empty() {
                     return;
                 }
+                lap.mark("index list");
+                // only the vertices the draw uses are decoded: the indices are made relative to the lowest one
+                let real = || indices.iter().copied().filter(|&i| i != u32::MAX);
+                let lowest = real().min().unwrap_or(0);
+                let highest = real().max().unwrap_or(0);
+                let indices: Vec<u32> = indices.iter().map(|&i| if i == u32::MAX { i } else { i - lowest }).collect();
+                let vertices = highest - lowest + 1;
+                let (va, meta) = self.cached_streams(g, &st, &fetch, lowest, vertices.min(1 << 22), instances);
+                lap.mark("decode streams");
+                // buffers
+                let meta_bytes: Vec<u8> = meta.iter().flatten().flat_map(|v| v.to_le_bytes()).collect();
+                let meta_buffer = self.arena_write(&meta_bytes, 256);
+                let index_bytes: Vec<u8> = indices.iter().flat_map(|i| i.to_le_bytes()).collect();
+                let index_buffer = self.arena_write(&index_bytes, index_bytes.len() as u64);
+                (va, meta_buffer, index_buffer, indices.len() as u32, topology)
             };
-            // the list of vertex numbers the draw uses
-            let base: Vec<u32> = match &index_values {
-                Some(v) => v.iter().map(|i| i.wrapping_add(first)).collect(),
-                None => (first..first + count).collect(),
-            };
-            let indices: Vec<u32> = if expand {
-                match primitive {
-                    5 => (1..base.len().saturating_sub(1))
-                        .flat_map(|i| [base[0], base[i], base[i + 1]])
-                        .collect(),
-                    0x13 => base
-                        .as_chunks::<4>()
-                        .0
-                        .iter()
-                        .flat_map(|q| [q[0], q[1], q[2], q[0], q[2], q[3]])
-                        .collect(),
-                    0x14 => (0..base.len().saturating_sub(3))
-                        .step_by(2)
-                        .flat_map(|i| [base[i], base[i + 1], base[i + 3], base[i], base[i + 3], base[i + 2]])
-                        .collect(),
-                    _ => Vec::new(),
-                }
-            } else {
-                base
-            };
-            if indices.is_empty() {
-                return;
-            }
-            let vertices = indices.iter().copied().max().map_or(0, |m| m + 1);
-            let (stream_data, meta) = self.decode_streams(g, &st, &fetch, vertices.min(1 << 22), instances);
-            // buffers
-            let va = device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("vertex streams"),
-                size: stream_data.len() as u64,
-                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            });
-            self.d.queue.write_buffer(&va, 0, &stream_data);
-            let meta_bytes: Vec<u8> = meta.iter().flatten().flat_map(|v| v.to_le_bytes()).collect();
-            let meta_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("stream offsets"),
-                size: 256,
-                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            });
-            self.d.queue.write_buffer(&meta_buffer, 0, &meta_bytes);
-            let index_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("indices"),
-                size: (indices.len() * 4) as u64,
-                usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            });
-            self.d
-                .queue
-                .write_buffer(&index_buffer, 0, &indices.iter().flat_map(|i| i.to_le_bytes()).collect::<Vec<u8>>());
-            (va, meta_buffer, index_buffer, indices.len() as u32, topology)
-        };
+        lap.mark("indices, streams, buffers");
         // the pipeline
         let depth = if st.depth_buffer != 0 {
             self.depth_target(g, st.depth_buffer)
@@ -1006,10 +1123,11 @@ impl Gx2 {
                 e
             }
         };
+        lap.mark("pipeline");
         // the bindings
         let mut vs_entries = Vec::new();
         let mut ps_entries = Vec::new();
-        let mut keep: Vec<wgpu::Buffer> = Vec::new();
+        let mut keep: Vec<BufRef> = Vec::new();
         for (&bank, &len) in &vs.interface.banks {
             keep.push(self.uniform_buffer(g, &st.vertex_blocks[(bank as usize).min(15)], len));
         }
@@ -1020,14 +1138,14 @@ impl Gx2 {
         for &bank in vs.interface.banks.keys() {
             vs_entries.push(wgpu::BindGroupEntry {
                 binding: bank,
-                resource: keep[at].as_entire_binding(),
+                resource: keep[at].binding(),
             });
             at += 1;
         }
         for &bank in ps.interface.banks.keys() {
             ps_entries.push(wgpu::BindGroupEntry {
                 binding: bank,
-                resource: keep[at].as_entire_binding(),
+                resource: keep[at].binding(),
             });
             at += 1;
         }
@@ -1041,6 +1159,7 @@ impl Gx2 {
             layout: &entry.pipeline.get_bind_group_layout(1),
             entries: &ps_entries,
         });
+        lap.mark("uniforms and groups 0, 1");
         // textures: white stand-ins until the real ones are decoded
         let draw_image = image;
         let mut snapshots: Vec<(wgpu::Texture, wgpu::Texture)> = Vec::new();
@@ -1140,6 +1259,7 @@ impl Gx2 {
             this.caches.samplers.insert(key, s.clone());
             s
         };
+        lap.mark("texture views");
         let sampler_units: Vec<u32> = ps.interface.samplers.iter().copied().collect();
         let sampler_list: Vec<(u32, wgpu::Sampler)> = sampler_units.iter().map(|s| (16 + s, sampler_for(self, *s))).collect();
         let compare_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
@@ -1148,6 +1268,7 @@ impl Gx2 {
             min_filter: wgpu::FilterMode::Linear,
             ..Default::default()
         });
+        lap.mark("samplers");
         let mut tex_entries: Vec<wgpu::BindGroupEntry> = Vec::new();
         for (r, v) in &views {
             tex_entries.push(wgpu::BindGroupEntry {
@@ -1172,20 +1293,21 @@ impl Gx2 {
             layout: &entry.pipeline.get_bind_group_layout(2),
             entries: &tex_entries,
         });
+        lap.mark("group 2");
         let mut group3_entries = vec![
             wgpu::BindGroupEntry {
                 binding: 0,
-                resource: va.as_entire_binding(),
+                resource: va.binding(),
             },
             wgpu::BindGroupEntry {
                 binding: 1,
-                resource: meta_buffer.as_entire_binding(),
+                resource: meta_buffer.binding(),
             },
         ];
         if let Some(x) = &geo {
             group3_entries.push(wgpu::BindGroupEntry {
                 binding: 2,
-                resource: x.ring_out.as_entire_binding(),
+                resource: x.ring_out.binding(),
             });
         }
         let group3 = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -1193,21 +1315,36 @@ impl Gx2 {
             layout: &entry.pipeline.get_bind_group_layout(3),
             entries: &group3_entries,
         });
-        let colour_view = self.targets[&image].texture.create_view(&Default::default());
-        let depth_view = use_depth.map(|(image, _)| self.caches.depth[&image].0.create_view(&Default::default()));
-        let mut enc = device.create_command_encoder(&Default::default());
-        for (from, to) in &snapshots {
-            enc.copy_texture_to_texture(
-                from.as_image_copy(),
-                to.as_image_copy(),
-                wgpu::Extent3d {
-                    width: from.width(),
-                    height: from.height(),
-                    depth_or_array_layers: 1,
-                },
-            );
+        lap.mark("group 3");
+        // the draws are recorded into one command buffer and one render pass for as long as they go to the same targets; the pass
+        // and the buffer end at the next thing that is not such a draw (see `flush_draws`)
+        let key: PassKey = (image, use_depth.map(|d| d.0), ps.interface.colour_outputs.len());
+        if !snapshots.is_empty() {
+            self.end_pass();
+            let enc = self
+                .batch
+                .enc
+                .get_or_insert_with(|| device.create_command_encoder(&Default::default()));
+            for (from, to) in &snapshots {
+                enc.copy_texture_to_texture(
+                    from.as_image_copy(),
+                    to.as_image_copy(),
+                    wgpu::Extent3d {
+                        width: from.width(),
+                        height: from.height(),
+                        depth_or_array_layers: 1,
+                    },
+                );
+            }
         }
-        {
+        if self.batch.key != Some(key) {
+            self.end_pass();
+            let colour_view = self.targets[&image].texture.create_view(&Default::default());
+            let depth_view = use_depth.map(|(image, _)| self.caches.depth[&image].0.create_view(&Default::default()));
+            let enc = self
+                .batch
+                .enc
+                .get_or_insert_with(|| device.create_command_encoder(&Default::default()));
             let colour_attachments: Vec<Option<wgpu::RenderPassColorAttachment>> = ps
                 .interface
                 .colour_outputs
@@ -1224,8 +1361,8 @@ impl Gx2 {
                     })
                 })
                 .collect();
-            let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("draw"),
+            let pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("draws"),
                 color_attachments: &colour_attachments,
                 depth_stencil_attachment: depth_view.as_ref().map(|v| wgpu::RenderPassDepthStencilAttachment {
                     view: v,
@@ -1244,31 +1381,223 @@ impl Gx2 {
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
-            let [vx, vy, vw, vh, ..] = st.viewport;
-            if vw > 0.0 && vh > 0.0 {
-                let x = vx.clamp(0.0, target_w as f32);
-                let y = vy.clamp(0.0, target_h as f32);
-                pass.set_viewport(
-                    x,
-                    y,
-                    vw.min(target_w as f32 - x).max(1.0),
-                    vh.min(target_h as f32 - y).max(1.0),
-                    0.0,
-                    1.0,
-                );
-            }
-            let [sx, sy, sw, sh] = st.scissor;
-            if sw > 0 && sh > 0 && sx < target_w && sy < target_h {
-                pass.set_scissor_rect(sx, sy, sw.min(target_w - sx), sh.min(target_h - sy));
-            }
-            pass.set_pipeline(&entry.pipeline);
-            pass.set_bind_group(0, &group0, &[]);
-            pass.set_bind_group(1, &group1, &[]);
-            pass.set_bind_group(2, &group2, &[]);
-            pass.set_bind_group(3, &group3, &[]);
-            pass.set_index_buffer(index_buffer.slice(..), wgpu::IndexFormat::Uint32);
-            pass.draw_indexed(0..index_count, 0, 0..if geo.is_some() { 1 } else { instances.max(1) });
+            self.batch.pass = Some(pass.forget_lifetime());
+            self.batch.key = Some(key);
         }
-        self.d.queue.submit([enc.finish()]);
+        let Some(pass) = self.batch.pass.as_mut() else { return };
+        let [vx, vy, vw, vh, ..] = st.viewport;
+        if vw > 0.0 && vh > 0.0 {
+            let x = vx.clamp(0.0, target_w as f32);
+            let y = vy.clamp(0.0, target_h as f32);
+            pass.set_viewport(
+                x,
+                y,
+                vw.min(target_w as f32 - x).max(1.0),
+                vh.min(target_h as f32 - y).max(1.0),
+                0.0,
+                1.0,
+            );
+        } else {
+            pass.set_viewport(0.0, 0.0, target_w as f32, target_h as f32, 0.0, 1.0);
+        }
+        let [sx, sy, sw, sh] = st.scissor;
+        if sw > 0 && sh > 0 && sx < target_w && sy < target_h {
+            pass.set_scissor_rect(sx, sy, sw.min(target_w - sx), sh.min(target_h - sy));
+        } else {
+            pass.set_scissor_rect(0, 0, target_w, target_h);
+        }
+        pass.set_pipeline(&entry.pipeline);
+        pass.set_bind_group(0, &group0, &[]);
+        pass.set_bind_group(1, &group1, &[]);
+        pass.set_bind_group(2, &group2, &[]);
+        pass.set_bind_group(3, &group3, &[]);
+        pass.set_index_buffer(index_buffer.slice(), wgpu::IndexFormat::Uint32);
+        pass.draw_indexed(0..index_count, 0, 0..if geo.is_some() { 1 } else { instances.max(1) });
+        lap.mark("pass");
+    }
+
+    /// A part of an arena of at least `size` bytes (contents not defined).
+    pub(crate) fn arena_alloc(&mut self, role: Role, size: u64) -> BufRef {
+        let limits = self.d.device.limits();
+        let align = u64::from(
+            limits
+                .min_uniform_buffer_offset_alignment
+                .max(limits.min_storage_buffer_offset_alignment),
+        )
+        .max(16);
+        let size = size.max(16).next_multiple_of(4);
+        let usage = wgpu::BufferUsages::STORAGE
+            | wgpu::BufferUsages::UNIFORM
+            | wgpu::BufferUsages::INDEX
+            | wgpu::BufferUsages::COPY_DST
+            | wgpu::BufferUsages::COPY_SRC;
+        if size > ARENA_SIZE / 4 {
+            // too big to share
+            let buffer = self.d.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("big buffer"),
+                size,
+                usage,
+                mapped_at_creation: false,
+            });
+            return BufRef { buffer, offset: 0, size };
+        }
+        for a in &mut self.batch.arenas[role as usize] {
+            let at = a.used.next_multiple_of(align);
+            if at + size <= a.size {
+                a.used = at + size;
+                return BufRef {
+                    buffer: a.buffer.clone(),
+                    offset: at,
+                    size,
+                };
+            }
+        }
+        let buffer = self.d.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("arena"),
+            size: ARENA_SIZE,
+            usage,
+            mapped_at_creation: false,
+        });
+        self.batch.arenas[role as usize].push(Arena {
+            buffer: buffer.clone(),
+            size: ARENA_SIZE,
+            used: size,
+        });
+        BufRef { buffer, offset: 0, size }
+    }
+
+    /// The same, holding `data` (padded with zeros to `size` when that is more).
+    pub(crate) fn arena_write(&mut self, data: &[u8], size: u64) -> BufRef {
+        let r = self.arena_alloc(Role::Read, size.max(data.len() as u64));
+        if !data.is_empty() {
+            self.d.queue.write_buffer(&r.buffer, r.offset, data);
+        }
+        r
+    }
+
+    /// Ends the render pass the draws are recorded into (the command buffer stays open).
+    pub(crate) fn end_pass(&mut self) {
+        self.batch.pass = None;
+        self.batch.key = None;
+    }
+
+    /// Hands what has been drawn so far to the GPU. Everything that reads or writes a target another way, and the end of the frame,
+    /// calls this first.
+    pub(crate) fn flush_draws(&mut self) {
+        self.end_pass();
+        let mut work = Vec::new();
+        if let Some(pre) = self.batch.pre.take() {
+            work.push(pre.finish());
+        }
+        if let Some(enc) = self.batch.enc.take() {
+            work.push(enc.finish());
+        }
+        if !work.is_empty() {
+            self.d.queue.submit(work);
+        }
+        for a in self.batch.arenas.iter_mut().flatten() {
+            a.used = 0;
+        }
     }
 }
+
+/// MH3U_GFX_TIMES: how long the parts of a draw take, added up and reported every ten seconds.
+pub(crate) struct Lap {
+    on: bool,
+    at: std::time::Instant,
+}
+
+type LapTable = (
+    Option<std::time::Instant>,
+    std::collections::BTreeMap<&'static str, (std::time::Duration, u64)>,
+);
+
+static LAPS: std::sync::Mutex<LapTable> = std::sync::Mutex::new((None, std::collections::BTreeMap::new()));
+
+impl Lap {
+    pub(crate) fn new() -> Lap {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        Lap {
+            on: *ON.get_or_init(|| std::env::var_os("MH3U_GFX_TIMES").is_some()),
+            at: std::time::Instant::now(),
+        }
+    }
+
+    pub(crate) fn mark(&mut self, what: &'static str) {
+        if !self.on {
+            return;
+        }
+        let now = std::time::Instant::now();
+        let mut l = LAPS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let e = l.1.entry(what).or_default();
+        e.0 += now - self.at;
+        e.1 += 1;
+        self.at = now;
+        let since = *l.0.get_or_insert(now);
+        if now.duration_since(since) >= std::time::Duration::from_secs(10) {
+            for (name, (d, n)) in &l.1 {
+                eprintln!("[draw times] {:>8.3} s {n:>8}  {name}", d.as_secs_f64());
+            }
+            l.1.clear();
+            l.0 = Some(now);
+        }
+    }
+}
+
+/// The draws recorded and not yet submitted, and the memory they read from.
+#[derive(Default)]
+pub(crate) struct Batch {
+    enc: Option<wgpu::CommandEncoder>,
+    pass: Option<wgpu::RenderPass<'static>>,
+    key: Option<PassKey>,
+    /// The compute work of the geometry pipelines, which comes before the draws that read what it makes.
+    pub(crate) pre: Option<wgpu::CommandEncoder>,
+    arenas: [Vec<Arena>; 3],
+}
+
+/// A big buffer that the small buffers of a batch of draws are cut from (one allocation instead of several per draw). Its parts are not
+/// used again until the batch has been handed to the GPU, whose queue keeps the order of the writes and the commands.
+struct Arena {
+    buffer: wgpu::Buffer,
+    size: u64,
+    used: u64,
+}
+
+const ARENA_SIZE: u64 = 256 << 20;
+
+/// What a part of an arena is for. A buffer is used one way only inside one pass (read-only, or written), so what a compute pass reads
+/// and what it writes come from different buffers.
+#[derive(Clone, Copy)]
+pub(crate) enum Role {
+    /// Read by the shaders: uniform blocks, vertex streams, parameters, indices.
+    Read = 0,
+    /// The ring the vertex stage writes and the geometry stage reads.
+    RingIn = 1,
+    /// What the geometry stage writes and the draw reads.
+    Out = 2,
+}
+
+/// A part of a buffer.
+#[derive(Clone)]
+pub(crate) struct BufRef {
+    pub buffer: wgpu::Buffer,
+    pub offset: u64,
+    pub size: u64,
+}
+
+impl BufRef {
+    pub(crate) fn binding(&self) -> wgpu::BindingResource<'_> {
+        wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+            buffer: &self.buffer,
+            offset: self.offset,
+            size: std::num::NonZeroU64::new(self.size),
+        })
+    }
+
+    pub(crate) fn slice(&self) -> wgpu::BufferSlice<'_> {
+        self.buffer.slice(self.offset..self.offset + self.size)
+    }
+}
+
+/// What a render pass draws into: the colour target, the depth target, and the number of colour outputs.
+type PassKey = (u32, Option<u32>, usize);

@@ -59,6 +59,8 @@ pub struct State {
     pub front_face: u32,
     pub alpha_test: (bool, u32, f32),
     /// Whether clip-space depth is 0 to 1 (set by `GX2SetRasterizerClipControlEx`).
+    /// The index that ends a strip (set by `GX2SetPrimitiveRestartIndex`).
+    pub restart_index: Option<u32>,
     pub half_z: bool,
     /// `GX2SetShaderModeEx`: 0 uniform registers, 1 uniform blocks, 2 geometry shader, 3 compute.
     pub shader_mode: u32,
