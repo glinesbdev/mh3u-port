@@ -45,8 +45,25 @@ of something else is the translator's job to find (see "What is not translated y
 
 ## What is not translated yet
 
-- Jump tables (4,822 indirect jumps through `bctr`): they are `rt_jump` hooks until the tables are resolved.
-- The table for indirect calls (30,605 sites).
+- The table for indirect calls (30,605 `rt_call(c, t)` sites) and for the 4,312 indirect tail jumps that are not switches: both go through
+  the runtime, which must map an address to a translated function.
+- The import calls: 550 distinct call targets just past the end of `.text` (from 0x31963d8) are the import trampolines; the runtime must
+  map each to the Cafe OS function it stands for.
+- Not found: functions only reached by a tail jump, and the 6 words in the code that are not instructions (data between functions).
+
+## Switch tables (`switch_tables` in `mh3u-recomp`)
+
+The game's compiler makes a `switch` as: compare the index (`cmplwi`), branch to the default when above, shift the index by two, add it
+to an address built by `addis`/`addi` that is the address *right after the `bctr`*, `mtctr`, `bctr`; after the `bctr` comes a table of
+`b` instructions. 510 of the 4,822 `bctr` are of this kind (503 with a table length equal to the `cmplwi` bound; the translator takes
+the smaller of the bound and the run of branches). The C is a `switch` on the index with a `goto` to each branch's label, and it is
+checked against the interpreter in `c_diff.rs`. The other 4,312 `bctr` are tail calls through a function pointer or a vtable (a
+`lwz`/`mtctr` chain), not tables.
+
+## The whole executable (`mh3u-tools translate`)
+
+70,195 functions become 351 C files of 200 functions (245 MB, written in under 2 seconds, outside any git tree) and every file passes
+`clang -fsyntax-only` (15 s on 24 cores). Nothing links or runs yet: there is no runtime.
 
 ## Finding the functions (`mh3u-recomp`, `discover.rs`; `mh3u-tools functions`)
 

@@ -363,7 +363,7 @@ fn function_starts(words: &[u32], base: u32) -> BTreeSet<u32> {
     out
 }
 
-fn in_a_working_tree(path: &Path) -> bool {
+pub fn in_a_working_tree(path: &Path) -> bool {
     let absolute = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
     absolute.ancestors().any(|p| p.join(".git").exists())
 }

@@ -7,7 +7,7 @@
 pub mod discover;
 
 use mh3u_ppc::{Insn, Op};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 
 /// The C header the generated code includes.
@@ -22,6 +22,8 @@ pub struct Function<'a> {
     pub labels: &'a BTreeSet<u32>,
     /// The starts of all the functions known, to tell a call or a tail jump that can be made directly.
     pub functions: &'a BTreeSet<u32>,
+    /// The switch tables: the address of the `bctr` and how many branches the table after it holds.
+    pub tables: &'a BTreeMap<u32, u32>,
 }
 
 fn hex(v: u32) -> String {
@@ -759,6 +761,16 @@ fn emit_branch(insn: Insn, addr: u32, fx: &Function) -> Vec<String> {
                     "{{ uint32_t t = c->ctr & ~3u; int go = {go}; c->lr = {}; if (go) rt_call(c, t); }}",
                     hex(next)
                 ));
+            } else if let (Some(&n), true) = (fx.tables.get(&addr), always) {
+                // a switch: the table is `n` branches right after this instruction, and the target is one of them
+                let mut cases = String::new();
+                for k in 0..n {
+                    let _ = write!(cases, "case {k}: goto {}; ", label(next + 4 * k));
+                }
+                out.push(format!(
+                    "{{ uint32_t k = (c->ctr - {}) >> 2; switch (k) {{ {cases}default: rt_jump(c, c->ctr & ~3u); return; }} }}",
+                    hex(next)
+                ));
             } else {
                 out.push(format!("if ({go}) {{ rt_jump(c, c->ctr & ~3u); return; }}"));
             }
@@ -803,11 +815,57 @@ pub fn block_starts(start: u32, words: &[u32]) -> BTreeSet<u32> {
     set
 }
 
+/// The switch tables of a function: the compiler puts a table of `b` instructions right after the `bctr` and makes the jump go to the
+/// address after it plus four times the index. Returns the address of each such `bctr` and the number of entries (the run of
+/// branches after it, cut short by the `cmplwi` that bounds the index when that is smaller).
+pub fn switch_tables(start: u32, words: &[u32]) -> BTreeMap<u32, u32> {
+    let mut found = BTreeMap::new();
+    for (i, &w) in words.iter().enumerate() {
+        if w != 0x4e80_0420 {
+            continue;
+        }
+        let addr = start + 4 * i as u32;
+        let Some(m) = (i.saturating_sub(3)..i).rev().find(|&j| words[j] & 0xfc1f_ffff == 0x7c09_03a6) else {
+            continue;
+        };
+        let rs = (words[m] >> 21) & 31;
+        // the address in the register is built by an addis and an addi
+        let (mut lo, mut hi) = (None, None);
+        for j in (i.saturating_sub(12)..m).rev() {
+            let v = words[j];
+            if v >> 26 == 14 && (v >> 21) & 31 == rs && (v >> 16) & 31 == rs && lo.is_none() {
+                lo = Some(i32::from(v as i16));
+            } else if v >> 26 == 15 && (v >> 21) & 31 == rs && hi.is_none() && lo.is_some() {
+                hi = Some(i32::from(v as i16) << 16);
+            }
+        }
+        let (Some(lo), Some(hi)) = (lo, hi) else { continue };
+        if (hi + lo) as u32 != addr + 4 {
+            continue;
+        }
+        let run = words[i + 1..].iter().take_while(|&&x| x >> 26 == 18 && x & 3 == 0).count() as u32;
+        let bound = (i.saturating_sub(14)..i)
+            .rev()
+            .find(|&j| words[j] >> 26 == 10)
+            .map(|j| (words[j] & 0xffff) + 1);
+        let n = bound.map_or(run, |b| b.min(run));
+        if n > 0 {
+            found.insert(addr, n);
+        }
+    }
+    found
+}
+
 /// One C function for the PowerPC function whose words start at `start`.
 pub fn emit_function(start: u32, words: &[u32], functions: &BTreeSet<u32>) -> String {
     let end = start + 4 * words.len() as u32;
-    let labels = block_starts(start, words);
+    let tables = switch_tables(start, words);
+    let mut labels = block_starts(start, words);
+    for (&at, &n) in &tables {
+        labels.extend((0..n).map(|k| at + 4 + 4 * k));
+    }
     let fx = Function {
+        tables: &tables,
         start,
         end,
         labels: &labels,
@@ -817,7 +875,7 @@ pub fn emit_function(start: u32, words: &[u32], functions: &BTreeSet<u32>) -> St
     let _ = writeln!(out, "void {}(Ctx *c) {{", function_name(start));
     for (i, &w) in words.iter().enumerate() {
         let addr = start + 4 * i as u32;
-        if labels.contains(&addr) && addr != start {
+        if labels.contains(&addr) {
             let _ = writeln!(out, "{}:;", label(addr));
         }
         match Insn::decode(w) {
@@ -837,4 +895,30 @@ pub fn emit_function(start: u32, words: &[u32], functions: &BTreeSet<u32>) -> St
     }
     out.push_str("}\n");
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_switch_table_after_the_bctr_is_found_and_bounded() {
+        let start = 0x1000;
+        let base = start + 4 * 7;
+        let lo = base as u16;
+        let words = [
+            0x2803_0001,                 // cmplwi r3, 1
+            0x4181_0020,                 // bgt
+            0x5464_103a,                 // slwi r4, r3, 2
+            0x3ca4_0000,                 // addis r5, r4, 0
+            0x38a5_0000 | u32::from(lo), // addi r5, r5, lo
+            0x7ca9_03a6,                 // mtctr r5
+            0x4e80_0420,                 // bctr
+            0x4800_0010,                 // b
+            0x4800_000c,                 // b
+            0x4800_0008,                 // b (beyond the bound of two)
+        ];
+        assert_eq!(switch_tables(start, &words), BTreeMap::from([(start + 24, 2)]));
+        assert!(emit_function(start, &words, &BTreeSet::new()).contains("switch (k)"));
+    }
 }

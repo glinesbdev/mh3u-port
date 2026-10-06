@@ -279,6 +279,60 @@ fn the_translated_branches_go_where_the_interpreter_goes() {
     assert!(failures.is_empty(), "{} failures:\n{}", failures.len(), failures.join("\n"));
 }
 
+/// A switch: a table of branches after the `bctr`, as the game's compiler makes them. The translated C picks the branch by the index;
+/// the interpreter runs the jump through the register.
+#[test]
+fn the_translated_switch_goes_where_the_interpreter_goes() {
+    if compiler().is_none() {
+        return;
+    }
+    let base = test_address() + 4 * 7;
+    let lo = base as u16 as i16;
+    let hi = (base.wrapping_sub(lo as i32 as u32) >> 16) as u16;
+    // case k sets r6 to k + 1 and goes to the end, which sets r7
+    let mut words = vec![
+        0x2803_0003,                        // cmplwi r3, 3
+        0x4181_0000 | (4 * 18),             // bgt end
+        0x5464_103a,                        // slwi r4, r3, 2
+        0x3ca4_0000 | u32::from(hi),        // addis r5, r4, hi
+        0x38a5_0000 | u32::from(lo as u16), // addi r5, r5, lo
+        0x7ca9_03a6,                        // mtctr r5
+        0x4e80_0420,                        // bctr
+    ];
+    for k in 0..4u32 {
+        words.push(0x4800_0000 | (4 * (4 + k))); // b case k: entry k is at 7 + k, case k at 11 + 2k
+    }
+    for k in 0..4u32 {
+        words.push(0x38c0_0000 | (k + 1)); // li r6, k + 1
+        words.push(0x4800_0000 | (4 * (7 - 2 * k))); // b end
+    }
+    words.push(0x38e7_0001); // end: addi r7, r7, 1
+    let exe = build_program(&[words.clone()], "switch").expect("the translated C builds");
+    let mut rng = Rng(0x5eed_0000_1111_2222);
+    let mut states = Vec::new();
+    for _ in 0..CASES {
+        let mut st = St::default();
+        for r in 0..30 {
+            st.gpr[r] = rng.word();
+        }
+        st.gpr[3] = rng.below(6);
+        st.lr = 0x4;
+        states.push(st);
+    }
+    let c_states = run_program(&exe, 0, &states).expect("the program ran");
+    let mut failures = Vec::new();
+    for (k, st) in states.iter().enumerate() {
+        let (ours, _) = interpret(&words, st, k).expect("the interpreter ran");
+        let mut d = differences(Add, &c_states[k], &ours);
+        d.extend(ps_differences(&c_states[k], &ours));
+        if !d.is_empty() {
+            failures.push(format!("r3 = {}: {}", st.gpr[3], d.join("; ")));
+        }
+    }
+    let _ = std::fs::remove_dir_all(exe.parent().unwrap());
+    assert!(failures.is_empty(), "{} failures:\n{}", failures.len(), failures.join("\n"));
+}
+
 /// `lwarx` and `stwcx.`, the reservation pair.
 #[test]
 fn the_translated_reservation_pair_matches_the_interpreter() {
