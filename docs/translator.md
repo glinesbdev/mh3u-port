@@ -45,9 +45,20 @@ of something else is the translator's job to find (see "What is not translated y
 
 ## What is not translated yet
 
-- The paired singles (about 17,000 instructions): no oracle (QEMU has none); the semantics are written from the architecture book.
 - Jump tables (4,822 indirect jumps through `bctr`): they are `rt_jump` hooks until the tables are resolved.
-- Function discovery for the whole game and the table for indirect calls (30,605 sites).
+- The table for indirect calls (30,605 sites).
+
+## Finding the functions (`mh3u-recomp`, `discover.rs`; `mh3u-tools functions`)
+
+A function starts at the entry point, at every direct call (`bl`), and at every word of the data sections that points at an
+instruction right after a return, a jump or padding. The last rule matters: pointers into the middle of a function are jump-table
+entries, not functions (1,357 of the 32,186 code pointers in the data were of that kind). Result on the game's code: 39,366 functions
+from the entry and calls, 70,195 with the pointers (virtual functions); median 76 bytes, 99th percentile about 3 KB, largest 44 KB.
+A function that is only reached by a tail jump (`b` out of another function) is not found yet and would be merged into its neighbour.
+
+The paired singles (about 17,000 instructions) have no oracle (QEMU has none): their semantics are written from the architecture
+book, the C is checked against the interpreter on random states (including the second halves of the registers and the quantization
+registers), and a few cases are computed by hand in `mh3u-ppc`'s unit tests.
 
 ## Not tested against QEMU, with the reason
 

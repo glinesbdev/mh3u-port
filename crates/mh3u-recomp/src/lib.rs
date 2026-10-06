@@ -4,6 +4,8 @@
 //! interpreter is checked against QEMU; this against the interpreter, on the same random states). The statements work on a `Ctx` (the
 //! registers) and use the helpers of `ppc.h`. Control flow inside a function is `goto`; a call is a C call; `blr` is `return`.
 
+pub mod discover;
+
 use mh3u_ppc::{Insn, Op};
 use std::collections::BTreeSet;
 use std::fmt::Write as _;

@@ -15,3 +15,4 @@ mh3u-cemu.workspace = true
 mh3u-formats.workspace = true
 mh3u-latte.workspace = true
 mh3u-ppc.workspace = true
+mh3u-recomp.workspace = true

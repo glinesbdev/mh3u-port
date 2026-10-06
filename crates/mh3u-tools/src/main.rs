@@ -24,6 +24,8 @@ enum Tool {
     Dump { game_dir: PathBuf },
     /// List the sections of the game's executable.
     Sections { game_dir: PathBuf },
+    /// Find where the functions of the executable start (calls, code pointers in the data, the entry point) and say how many.
+    Functions { game_dir: PathBuf },
     /// Count the instructions of the executable's code by kind, and the ones that are not known.
     Coverage {
         game_dir: PathBuf,
@@ -148,6 +150,7 @@ fn main() -> Result<()> {
             Ok(())
         }
         Tool::Shaders { game_dir } => shaders(&dump(&game_dir)?),
+        Tool::Functions { game_dir } => functions(&dump(&game_dir)?),
         Tool::Coverage { game_dir, unknown } => coverage(&dump(&game_dir)?, unknown),
         Tool::Imports { game_dir, names } => imports(&dump(&game_dir)?, names),
         Tool::Arcls { arc } => {
@@ -514,5 +517,40 @@ fn arcsearch(dir: &Path, patterns: &[String]) -> Result<()> {
             }
         }
     }
+    Ok(())
+}
+
+fn functions(dump: &Dump) -> Result<()> {
+    let data = read(&dump.executable()?)?;
+    let text = rpx::section_at(&data, TEXT_ADDRESS)?;
+    let words: Vec<u32> = text.as_chunks::<4>().0.iter().map(|w| u32::from_be_bytes(*w)).collect();
+    let entry = u32::from_be_bytes(data.get(0x18..0x1c).context("short file")?.try_into()?);
+    let mut pointers = Vec::new();
+    for s in rpx::sections(&data)? {
+        if matches!(s.name.as_str(), ".rodata" | ".data") {
+            let body = rpx::contents(&data, &s)?;
+            pointers.extend(body.as_chunks::<4>().0.iter().map(|w| u32::from_be_bytes(*w)));
+        }
+    }
+    let calls = mh3u_recomp::discover::functions(TEXT_ADDRESS, &words, &[], entry);
+    let all = mh3u_recomp::discover::functions(TEXT_ADDRESS, &words, &pointers, entry);
+    println!("entry point {entry:#x}");
+    println!("{} functions from the entry and direct calls", calls.len());
+    println!(
+        "{} with the code pointers in the data ({} more)",
+        all.len(),
+        all.len() - calls.len()
+    );
+    let starts: Vec<u32> = all.iter().copied().collect();
+    let end = TEXT_ADDRESS + 4 * words.len() as u32;
+    let mut sizes: Vec<u32> = starts.windows(2).map(|w| w[1] - w[0]).collect();
+    sizes.push(end - starts[starts.len() - 1]);
+    sizes.sort_unstable();
+    println!(
+        "bytes per function: median {}, 99th percentile {}, largest {}",
+        sizes[sizes.len() / 2],
+        sizes[sizes.len() * 99 / 100],
+        sizes[sizes.len() - 1]
+    );
     Ok(())
 }
