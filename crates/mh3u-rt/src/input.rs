@@ -207,7 +207,15 @@ pub fn start_gamepads() {
             eprintln!("gamepad: {}", pad.name());
         }
         use gilrs::{Axis, Button, EventType};
-        while let Some(event) = gilrs.next_event_blocking(None) {
+        let trace = std::env::var_os("MH3U_TRACE_PAD").is_some();
+        // wake up now and then rather than waiting for ever: a wait that is cut short must not end the thread
+        loop {
+            let Some(event) = gilrs.next_event_blocking(Some(std::time::Duration::from_millis(200))) else {
+                continue;
+            };
+            if trace {
+                eprintln!("[gamepad] {:?}", event.event);
+            }
             match event.event {
                 EventType::ButtonPressed(b, _) | EventType::ButtonReleased(b, _) => {
                     let down = matches!(event.event, EventType::ButtonPressed(..));
