@@ -63,6 +63,17 @@ impl Guest {
         b[0]
     }
 
+    pub fn u16(&self, address: u32) -> u16 {
+        let mut b = [0; 2];
+        self.read(address, &mut b);
+        u16::from_be_bytes(b)
+    }
+
+    pub fn put_u16(&self, address: u32, v: u16) {
+        watched(address, 2, "put_u16");
+        self.write(address, &v.to_be_bytes());
+    }
+
     pub fn u32(&self, address: u32) -> u32 {
         let mut b = [0; 4];
         self.read(address, &mut b);

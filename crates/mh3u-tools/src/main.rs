@@ -914,6 +914,7 @@ fn run_game(dump: &Dump, c_dir: &Path, max_imports: u64, save: PathBuf, window: 
         return finish(options);
     }
     // the window belongs to this thread; the game runs on another one, drawing into it
+    mh3u_rt::input::start_gamepads();
     mh3u_gfx::run(move |display| {
         let mut options = options;
         options.backend = Some(Box::new(mh3u_gfx::Gx2::new(display)));

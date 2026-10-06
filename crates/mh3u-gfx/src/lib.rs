@@ -62,6 +62,59 @@ impl Display {
 struct App<F: FnOnce(Display) + Send + 'static> {
     start: Option<F>,
     failed: Option<anyhow::Error>,
+    /// The keys held (by position, named as `winit` does), the window's size and where the mouse is: what the game's input needs.
+    keys: std::collections::HashSet<String>,
+    size: (f32, f32),
+    cursor: (f32, f32),
+    mouse_down: bool,
+}
+
+impl<F: FnOnce(Display) + Send + 'static> App<F> {
+    /// Passes the keys on to the input state: buttons, and the sticks' axes (two keys of one axis cancel).
+    fn keys_changed(&self) {
+        use mh3u_rt::input::{INPUT, key_axis, key_button};
+        for code in [
+            "Enter",
+            "Backspace",
+            "KeyX",
+            "KeyC",
+            "KeyI",
+            "KeyK",
+            "KeyJ",
+            "KeyL",
+            "KeyQ",
+            "KeyE",
+            "Digit1",
+            "Digit3",
+            "KeyP",
+            "KeyO",
+            "Home",
+            "ShiftLeft",
+            "ShiftRight",
+        ] {
+            if let Some(mask) = key_button(code) {
+                INPUT.set_keyboard_button(mask, self.keys.contains(code));
+            }
+        }
+        let mut axes = [0.0f32; 4];
+        for code in &self.keys {
+            if let Some((axis, v)) = key_axis(code) {
+                axes[axis] += v;
+            }
+        }
+        for (i, v) in axes.iter().enumerate() {
+            INPUT.set_keyboard_axis(i, *v);
+        }
+    }
+
+    fn touch_changed(&self) {
+        let (w, h) = self.size;
+        let at = (self.mouse_down && w > 0.0 && h > 0.0).then(|| {
+            let (tx, ty) = mh3u_rt::input::TOUCH_SIZE;
+            ((self.cursor.0 / w * tx).clamp(0.0, tx), (self.cursor.1 / h * ty).clamp(0.0, ty))
+        });
+        mh3u_rt::input::INPUT.set_touch(at);
+    }
 }
 
 impl<F: FnOnce(Display) + Send + 'static> ApplicationHandler for App<F> {
@@ -70,6 +123,7 @@ impl<F: FnOnce(Display) + Send + 'static> ApplicationHandler for App<F> {
         let attributes = Window::default_attributes()
             .with_title("Monster Hunter 3 Ultimate")
             .with_inner_size(winit::dpi::LogicalSize::new(1280, 720));
+        self.size = (1280.0, 720.0);
         let made = event_loop
             .create_window(attributes)
             .context("opening the window")
@@ -86,8 +140,41 @@ impl<F: FnOnce(Display) + Send + 'static> ApplicationHandler for App<F> {
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _: WindowId, event: WindowEvent) {
-        if matches!(event, WindowEvent::CloseRequested) {
-            event_loop.exit();
+        use winit::event::{ElementState, MouseButton};
+        use winit::keyboard::PhysicalKey;
+        match event {
+            WindowEvent::CloseRequested => event_loop.exit(),
+            WindowEvent::KeyboardInput { event, .. } => {
+                if let PhysicalKey::Code(code) = event.physical_key {
+                    let name = format!("{code:?}");
+                    if event.state == ElementState::Pressed {
+                        self.keys.insert(name);
+                    } else {
+                        self.keys.remove(&name);
+                    }
+                    self.keys_changed();
+                }
+            }
+            WindowEvent::Focused(false) => {
+                self.keys.clear();
+                self.mouse_down = false;
+                self.keys_changed();
+                self.touch_changed();
+            }
+            WindowEvent::Resized(size) => self.size = (size.width as f32, size.height as f32),
+            WindowEvent::CursorMoved { position, .. } => {
+                self.cursor = (position.x as f32, position.y as f32);
+                self.touch_changed();
+            }
+            WindowEvent::MouseInput {
+                state,
+                button: MouseButton::Left,
+                ..
+            } => {
+                self.mouse_down = state == ElementState::Pressed;
+                self.touch_changed();
+            }
+            _ => {}
         }
     }
 }
@@ -100,6 +187,10 @@ pub fn run<F: FnOnce(Display) + Send + 'static>(start: F) -> Result<()> {
     let mut app = App {
         start: Some(start),
         failed: None,
+        keys: Default::default(),
+        size: (1280.0, 720.0),
+        cursor: (0.0, 0.0),
+        mouse_down: false,
     };
     event_loop.run_app(&mut app).context("running the window")?;
     match app.failed {

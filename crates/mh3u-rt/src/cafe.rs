@@ -132,19 +132,47 @@ fn simple(name: &str) -> Option<SimpleHandler> {
             g.put_u32(c.r[4], 1);
             c.r[3] = 0;
         },
-        // the GamePad: one sample of "no touch, sticks centred" with the buttons held as `Os::pad_hold` says
+        // the GamePad: one sample of what the player presses (see `input`), with the buttons `MH3U_PRESS` holds added
         "vpad.rpl:VPADRead" => |os, g, c| {
             let (buffer, error) = (c.r[4], c.r[6]);
             g.fill(buffer, 0, 0xac);
-            let hold = os.pad_hold();
+            let input = &crate::input::INPUT;
+            let hold = os.pad_hold() | input.hold();
             g.put_u32(buffer, hold);
             g.put_u32(buffer + 4, hold & !os.pad_before);
             g.put_u32(buffer + 8, os.pad_before & !hold);
             os.pad_before = hold;
+            let sticks = input.sticks();
+            for (i, v) in sticks.iter().enumerate() {
+                g.put_u32(buffer + 0xc + 4 * i as u32, v.to_bits());
+            }
+            // the touch panel's raw values run from 0 to 4095 over the screen (`VPADGetTPCalibratedPoint` scales them back)
+            let (size_x, size_y) = crate::input::TOUCH_SIZE;
+            let (x, y, touched) = match input.touch() {
+                Some((x, y)) => ((x / size_x * 4095.0) as u32, (y / size_y * 4095.0) as u32, 1),
+                None => (0, 0, 0),
+            };
+            g.put_u16(buffer + 0x58 - 4, x as u16);
+            g.put_u16(buffer + 0x58 - 2, y as u16);
+            g.put_u16(buffer + 0x58, touched);
+            g.put_u16(buffer + 0x5a, if touched == 1 { 3 } else { 0 });
+            // the filtered points are the same
+            g.copy(buffer + 0x54, buffer + 0x5c, 8);
+            g.copy(buffer + 0x54, buffer + 0x64, 8);
             if error != 0 {
                 g.put_u32(error, 0);
             }
             c.r[3] = 1;
+        },
+        // (channel, *calibrated, *raw): the raw touch values to screen coordinates
+        "vpad.rpl:VPADGetTPCalibratedPoint" => |_, g, c| {
+            let (out, raw) = (c.r[4], c.r[5]);
+            let (size_x, size_y) = crate::input::TOUCH_SIZE;
+            let (x, y) = (f32::from(g.u16(raw)), f32::from(g.u16(raw + 2)));
+            g.put_u16(out, (x / 4095.0 * size_x) as u16);
+            g.put_u16(out + 2, (y / 4095.0 * size_y) as u16);
+            g.put_u16(out + 4, g.u16(raw + 4));
+            g.put_u16(out + 6, g.u16(raw + 6));
         },
         // the DMA engine copies memory (the game uses it to fill the GPU's constant buffers); it is finished when the call returns
         "dmae.rpl:DMAECopyMem" => |_, g, c| {

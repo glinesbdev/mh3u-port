@@ -147,6 +147,15 @@ with their text and the cloth background, upright, in the right places (the hunt
   an array: the `CUBE` instruction (which turns a direction into a face number and the face's own coordinates) is done in the shader, so the
   lookup uses the face and coordinates as the hardware does.
 
+- **Input** (`mh3u-rt/src/input.rs`): `VPADRead` returns what the player presses: the keyboard and mouse (window events) and gamepads
+  (`gilrs`, on a thread of their own), combined in one shared state. Keys are named by position: WASD is the left stick, the arrow keys the
+  right stick, Enter A, Backspace B, X, C the X and Y buttons, I/J/K/L the D-pad, Q/E L and R, 1/3 ZL and ZR, P plus, O minus, Left
+  and Right Shift the stick clicks. A gamepad's buttons are placed like the GamePad's (the right-hand face button is A). A pushed stick also
+  sets the stick's direction buttons (the menus read those). The mouse is the touch panel (the picture is the TV's, so it only matters once
+  the GamePad's screen is shown). `VPADGetTPCalibratedPoint` scales the raw touch values (0 to 4095) to 1280 x 720 (a guess). The Wii
+  Remote and Pro Controller functions (`KPAD*`, `WPAD*`) are not answered: no controller of those kinds exists for the game.
+  `MH3U_PRESS` still works and is added to the real input.
+
 **Not done yet:** 3D textures, the component selectors of a texture (`compMap`), the rest of the sampler state (borders, the mip bias), alpha
 test and stencil, depth bias, other geometry inputs (lines, triangles, instances), loops and relative
 addressing in vertex shaders, rects and other primitive types, stream out, the second render target (the GamePad's picture is
