@@ -39,6 +39,7 @@ pub struct State {
     pub attrib_buffers: [AttribBuffer; 16],
     pub vertex_blocks: [UniformBlock; 16],
     pub pixel_blocks: [UniformBlock; 16],
+    pub geometry_blocks: [UniformBlock; 16],
     /// The texture and sampler (guest addresses of the `GX2Texture` and `GX2Sampler`) bound to each pixel unit.
     pub pixel_textures: [u32; 18],
     pub pixel_samplers: [u32; 18],
@@ -57,6 +58,10 @@ pub struct State {
     pub cull_back: bool,
     pub front_face: u32,
     pub alpha_test: (bool, u32, f32),
+    /// Whether clip-space depth is 0 to 1 (set by `GX2SetRasterizerClipControlEx`).
+    pub half_z: bool,
+    /// `GX2SetShaderModeEx`: 0 uniform registers, 1 uniform blocks, 2 geometry shader, 3 compute.
+    pub shader_mode: u32,
 }
 
 /// The argument `n` (from 0, counting from `r3`) of a call: in a register, or on the stack for the ninth on. `replay` is the stack of a

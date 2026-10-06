@@ -922,6 +922,7 @@ name = "mh3u-gfx"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "mh3u-latte",
  "mh3u-rt",
  "pollster",
  "wgpu",

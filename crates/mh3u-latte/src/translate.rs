@@ -30,6 +30,13 @@ pub struct Interface {
     pub depth_output: bool,
     /// Whether the program can discard the pixel.
     pub kills: bool,
+    /// For a vertex shader: whether it writes the position, and which parameters (outputs for the pixel shader).
+    pub position: bool,
+    pub params: BTreeSet<u32>,
+    /// For a geometry pipeline's shaders: the furthest dword written to a ring (the geometry shader's tells how many vertices it emits).
+    pub ring_dwords: u32,
+    /// Whether the shader reads the geometry shader's output ring.
+    pub reads_ring: bool,
 }
 
 #[derive(Debug)]
@@ -48,6 +55,9 @@ pub enum TexKind {
     Depth2d,
 }
 
+/// The resource a geometry pipeline's rings are read through.
+pub const RING_RESOURCE: u32 = 159;
+
 /// How many `vec4` a uniform block has when the program indexes it dynamically (the size the block was bound with is not known
 /// when the program is translated).
 pub const DYNAMIC_BANK: u32 = 4096;
@@ -59,6 +69,8 @@ pub struct PixelInputs {
     pub count: u32,
     /// Which of them are flat-shaded.
     pub flat: Vec<bool>,
+    /// The location of the vertex shader output each input comes from (input `i` by default).
+    pub locations: Vec<u32>,
 }
 
 pub struct Context<'a> {
@@ -77,6 +89,10 @@ struct Gen<'a> {
     predicated: bool,
     max_gpr: u32,
     errors: Vec<String>,
+    stage: Stage,
+    ring: RingConfig,
+    /// For a copy shader: the size of the geometry shader's output item in `vec4`s (its ring fetches use it).
+    ring_out_vec4: u32,
 }
 
 const HEADER: &str = "diagnostic(off, derivative_uniformity);
@@ -438,23 +454,99 @@ impl Gen<'_> {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Stage {
+    Vertex,
+    Pixel,
+    /// The vertex shader of a pipeline with a geometry shader: it runs as a compute shader and writes its outputs to the ring.
+    Es,
+    /// The geometry shader, as a compute shader that reads the ring, writes vertices to another ring and a list of triangles.
+    Gs,
+}
+
+/// How the rings between the stages of a geometry pipeline are laid out, in `vec4`s.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct RingConfig {
+    /// The vertex shader's output item (what the geometry shader reads for a vertex).
+    pub es_vec4: u32,
+    /// The geometry shader's output item (what the copy shader reads for a vertex).
+    pub gs_vec4: u32,
+    /// How many vertices one run of the geometry shader may emit.
+    pub max_vertices: u32,
+}
+
+/// A vertex attribute as the vertex shader sees it: which register the fetch shader fills, which stream of decoded attribute data it
+/// reads, and whether it advances per instance (every `divisor` instances) instead of per vertex.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VertexAttribute {
+    pub gpr: u32,
+    pub stream: u32,
+    pub per_instance: bool,
+    pub divisor: u32,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct VertexInputs {
+    pub attributes: Vec<VertexAttribute>,
+    /// Whether clip-space depth is already 0 to 1 (else it is -1 to 1 and is remapped).
+    pub half_z: bool,
+    /// For a copy shader (the vertex shader of a geometry pipeline): the size of the geometry shader's output item in `vec4`s, which
+    /// its fetches from the ring use. Zero for an ordinary vertex shader.
+    pub ring_out_vec4: u32,
+}
+
 /// Translates a pixel shader.
 pub fn translate_pixel(decoded: &Decoded, inputs: &PixelInputs, ctx: &Context) -> Result<Translated, String> {
+    translate(Stage::Pixel, decoded, Some(inputs), None, None, ctx)
+}
+
+/// Translates a vertex shader (its fetch shader is replaced by `inputs`).
+pub fn translate_vertex(decoded: &Decoded, inputs: &VertexInputs, ctx: &Context) -> Result<Translated, String> {
+    translate(Stage::Vertex, decoded, None, Some(inputs), None, ctx)
+}
+
+/// Translates the vertex shader of a geometry pipeline into a compute shader that writes the ring.
+pub fn translate_es(decoded: &Decoded, inputs: &VertexInputs, ring: RingConfig, ctx: &Context) -> Result<Translated, String> {
+    translate(Stage::Es, decoded, None, Some(inputs), Some(ring), ctx)
+}
+
+/// Translates a geometry shader into a compute shader.
+pub fn translate_gs(decoded: &Decoded, ring: RingConfig, ctx: &Context) -> Result<Translated, String> {
+    translate(Stage::Gs, decoded, None, None, Some(ring), ctx)
+}
+
+fn translate(
+    stage: Stage,
+    decoded: &Decoded,
+    pixel: Option<&PixelInputs>,
+    vertex: Option<&VertexInputs>,
+    ring: Option<RingConfig>,
+    ctx: &Context,
+) -> Result<Translated, String> {
+    let default_pixel = PixelInputs::default();
+    let inputs = pixel.unwrap_or(&default_pixel);
     let mut g = Gen {
         out: String::new(),
         iface: Interface::default(),
         ctx,
         kcache: [Kcache { bank: 0, mode: 0, line: 0 }; 2],
         predicated: false,
-        max_gpr: inputs.count,
+        max_gpr: inputs.count.max(1),
         errors: Vec::new(),
+        stage,
+        ring: ring.unwrap_or_default(),
+        ring_out_vec4: vertex.map_or(0, |v| v.ring_out_vec4),
     };
+    if let Some(v) = vertex {
+        for a in &v.attributes {
+            g.max_gpr = g.max_gpr.max(a.gpr + 1);
+        }
+    }
     g.predicated = decoded.cf.iter().any(|c| match c {
         Cf::Flow { inst, .. } => matches!(inst, 10..=17),
         Cf::Alu { kind, .. } => *kind != AluKind::Plain,
         _ => false,
     });
-    let mut pixel_outputs: Vec<(u32, [u32; 4], u32)> = Vec::new();
     for cf in &decoded.cf {
         match cf {
             Cf::Alu { kind, kcache, groups } => {
@@ -480,10 +572,7 @@ pub fn translate_pixel(decoded: &Decoded, inputs: &PixelInputs, ctx: &Context) -
                     other => g.err(format!("the ALU clause kind {other:?}")),
                 }
             }
-            Cf::Fetch { vertex, fetches } => {
-                if *vertex {
-                    g.err("a vertex fetch clause in a pixel shader".into());
-                }
+            Cf::Fetch { fetches, .. } => {
                 for f in fetches {
                     g.fetch(f);
                 }
@@ -496,52 +585,61 @@ pub fn translate_pixel(decoded: &Decoded, inputs: &PixelInputs, ctx: &Context) -
                 burst,
                 ..
             } => {
-                if *kind != 0 {
-                    g.err(format!("an export of kind {kind} in a pixel shader"));
-                    continue;
-                }
-                for b in 0..*burst {
-                    pixel_outputs.push((*array_base + b, *swizzle, *gpr + b));
-                }
                 for b in 0..*burst {
                     let (target, sel, reg) = (*array_base + b, *swizzle, *gpr + b);
                     let r = g.gpr(reg);
-                    let comp = |s: u32, k: usize| match s {
+                    let comp = |s: u32, k: usize, old: &str| match s {
                         0..=3 => format!("{r}.{}", swz(s)),
                         4 => "0.0".to_string(),
                         5 => "1.0".to_string(),
-                        _ => format!(
-                            "out_{}.{}",
-                            if target == 61 { "z".to_string() } else { target.to_string() },
-                            swz(k as u32)
-                        ),
+                        _ => format!("{old}.{}", swz(k as u32)),
                     };
-                    if target == 61 {
-                        g.iface.depth_output = true;
-                        let v = comp(sel[0], 0);
-                        let w = if g.predicated {
-                            "if (live) { out_z = VALUE; }"
-                        } else {
-                            "out_z = VALUE;"
-                        };
-                        g.line(1, &w.replace("VALUE", &v));
-                    } else if target < 8 {
-                        g.iface.colour_outputs.insert(target);
-                        let v = format!(
-                            "vec4<f32>({}, {}, {}, {})",
-                            comp(sel[0], 0),
-                            comp(sel[1], 1),
-                            comp(sel[2], 2),
-                            comp(sel[3], 3)
-                        );
-                        let w = if g.predicated {
-                            format!("if (live) {{ out_{target} = {v}; }}")
-                        } else {
-                            format!("out_{target} = {v};")
-                        };
-                        g.line(1, &w);
-                    } else {
-                        g.err(format!("an export to target {target}"));
+                    let guard = |text: String| if g.predicated { format!("if (live) {{ {text} }}") } else { text };
+                    match (stage, *kind) {
+                        (Stage::Pixel, 0) if target == 61 => {
+                            g.iface.depth_output = true;
+                            let line = guard(format!("out_z = {};", comp(sel[0], 0, "vec4<f32>(out_z)")));
+                            g.line(1, &line);
+                        }
+                        (Stage::Pixel, 0) if target < 8 => {
+                            g.iface.colour_outputs.insert(target);
+                            let old = format!("out_{target}");
+                            let v = format!(
+                                "vec4<f32>({}, {}, {}, {})",
+                                comp(sel[0], 0, &old),
+                                comp(sel[1], 1, &old),
+                                comp(sel[2], 2, &old),
+                                comp(sel[3], 3, &old)
+                            );
+                            let line = guard(format!("out_{target} = {v};"));
+                            g.line(1, &line);
+                        }
+                        (Stage::Vertex, 1) if target == 60 => {
+                            g.iface.position = true;
+                            let v = format!(
+                                "vec4<f32>({}, {}, {}, {})",
+                                comp(sel[0], 0, "out_pos"),
+                                comp(sel[1], 1, "out_pos"),
+                                comp(sel[2], 2, "out_pos"),
+                                comp(sel[3], 3, "out_pos")
+                            );
+                            let line = guard(format!("out_pos = {v};"));
+                            g.line(1, &line);
+                        }
+                        (Stage::Vertex, 2) => {
+                            g.iface.params.insert(target);
+                            let old = format!("out_p{target}");
+                            let v = format!(
+                                "vec4<f32>({}, {}, {}, {})",
+                                comp(sel[0], 0, &old),
+                                comp(sel[1], 1, &old),
+                                comp(sel[2], 2, &old),
+                                comp(sel[3], 3, &old)
+                            );
+                            let line = guard(format!("out_p{target} = {v};"));
+                            g.line(1, &line);
+                        }
+                        _ => g.err(format!("an export of kind {kind} to {target}")),
                     }
                 }
             }
@@ -557,9 +655,58 @@ pub fn translate_pixel(decoded: &Decoded, inputs: &PixelInputs, ctx: &Context) -
                 }
                 other => g.err(format!("the control flow instruction {other:#x}")),
             },
-            Cf::Nop => {}
-            Cf::CallFetchShader => g.err("a call to a fetch shader in a pixel shader".into()),
-            Cf::Return => {}
+            Cf::Nop | Cf::Return => {}
+            Cf::Ring {
+                array_base,
+                gpr,
+                burst,
+                mask,
+            } => {
+                if !matches!(stage, Stage::Es | Stage::Gs) {
+                    g.err("a write to a ring outside a geometry pipeline".into());
+                    continue;
+                }
+                g.iface.ring_dwords = g.iface.ring_dwords.max(array_base + 4 * burst);
+                for b in 0..*burst {
+                    let r = g.gpr(gpr + b);
+                    let element = if stage == Stage::Es {
+                        format!("vid * {}u + {}u", g.ring.es_vec4, array_base / 4 + b)
+                    } else {
+                        format!("base_out + {}u", array_base / 4 + b)
+                    };
+                    let target = if stage == Stage::Es { "ring_in" } else { "ring_out" };
+                    for (k, c) in ['x', 'y', 'z', 'w'].iter().enumerate() {
+                        if mask & (1 << k) != 0 {
+                            let text = format!("{target}[{element}].{c} = {r}.{c};");
+                            let line = if g.predicated { format!("if (live) {{ {text} }}") } else { text };
+                            g.line(1, &line);
+                        }
+                    }
+                }
+            }
+            Cf::Emit { inst } => {
+                if stage != Stage::Gs {
+                    g.err("a vertex emission outside a geometry shader".into());
+                    continue;
+                }
+                let mut text = String::new();
+                if matches!(inst, 0x15 | 0x16) {
+                    text.push_str(
+                        "{ let n = emitted; if (strip >= 2u) { let at = (base_idx + n) * 3u; if ((strip & 1u) == 0u) { gs_idx[at] = base_idx + n - 2u; gs_idx[at + 1u] = base_idx + n - 1u; } else { gs_idx[at] = base_idx + n - 1u; gs_idx[at + 1u] = base_idx + n - 2u; } gs_idx[at + 2u] = base_idx + n; } strip = strip + 1u; emitted = emitted + 1u; }",
+                    );
+                }
+                if matches!(inst, 0x16 | 0x17) {
+                    text.push_str(" strip = 0u;");
+                }
+                let line = if g.predicated { format!("if (live) {{ {text} }}") } else { text };
+                g.line(1, &line);
+            }
+            Cf::Memory { inst } => g.err(format!("the memory or geometry instruction {inst:#x}")),
+            Cf::CallFetchShader => {
+                if stage == Stage::Pixel {
+                    g.err("a call to a fetch shader in a pixel shader".into());
+                }
+            }
         }
     }
     if !g.errors.is_empty() {
@@ -567,17 +714,18 @@ pub fn translate_pixel(decoded: &Decoded, inputs: &PixelInputs, ctx: &Context) -
     }
     // assemble the module
     let mut m = String::from(HEADER);
+    let consts_group = if stage == Stage::Pixel { 1 } else { 0 };
     for (bank, len) in &g.iface.banks {
         let _ = writeln!(
             m,
-            "@group(0) @binding({bank}) var<uniform> cb{bank}: array<vec4<f32>, {}>;",
+            "@group({consts_group}) @binding({bank}) var<uniform> cb{bank}: array<vec4<f32>, {}>;",
             (*len).max(1)
         );
     }
     if g.iface.const_file > 0 {
         let _ = writeln!(
             m,
-            "@group(0) @binding(15) var<uniform> cfile: array<vec4<f32>, {}>;",
+            "@group({consts_group}) @binding(15) var<uniform> cfile: array<vec4<f32>, {}>;",
             g.iface.const_file
         );
     }
@@ -588,14 +736,27 @@ pub fn translate_pixel(decoded: &Decoded, inputs: &PixelInputs, ctx: &Context) -
             TexKind::Cube => "texture_cube<f32>",
             TexKind::Depth2d => "texture_depth_2d",
         };
-        let _ = writeln!(m, "@group(1) @binding({r}) var tex{r}: {ty};");
+        let _ = writeln!(m, "@group(2) @binding({r}) var tex{r}: {ty};");
     }
     for s in &g.iface.samplers {
-        let _ = writeln!(m, "@group(1) @binding({}) var smp{s}: sampler;", 16 + s);
+        let _ = writeln!(m, "@group(2) @binding({}) var smp{s}: sampler;", 16 + s);
     }
     for s in &g.iface.compare_samplers {
-        let _ = writeln!(m, "@group(1) @binding({}) var cmp{s}: sampler_comparison;", 32 + s);
+        let _ = writeln!(m, "@group(2) @binding({}) var cmp{s}: sampler_comparison;", 32 + s);
     }
+    match stage {
+        Stage::Pixel => assemble_pixel(&mut m, &g, inputs),
+        Stage::Vertex => assemble_vertex(&mut m, &g, vertex.expect("a vertex shader has its inputs")),
+        Stage::Es => assemble_es(&mut m, &g, vertex.expect("a vertex shader has its inputs")),
+        Stage::Gs => assemble_gs(&mut m, &g),
+    }
+    Ok(Translated {
+        wgsl: m,
+        interface: g.iface,
+    })
+}
+
+fn assemble_pixel(m: &mut String, g: &Gen, inputs: &PixelInputs) {
     m.push_str("struct In {\n");
     for i in 0..inputs.count {
         let flat = if inputs.flat.get(i as usize).copied().unwrap_or(false) {
@@ -603,7 +764,8 @@ pub fn translate_pixel(decoded: &Decoded, inputs: &PixelInputs, ctx: &Context) -
         } else {
             ""
         };
-        let _ = writeln!(m, "    @location({i}){flat} i{i}: vec4<f32>,");
+        let location = inputs.locations.get(i as usize).copied().unwrap_or(i);
+        let _ = writeln!(m, "    @location({location}){flat} i{i}: vec4<f32>,");
     }
     m.push_str("    @builtin(position) frag: vec4<f32>,\n}\n");
     m.push_str("struct Out {\n");
@@ -612,6 +774,9 @@ pub fn translate_pixel(decoded: &Decoded, inputs: &PixelInputs, ctx: &Context) -
     }
     if g.iface.depth_output {
         m.push_str("    @builtin(frag_depth) z: f32,\n");
+    }
+    if g.iface.colour_outputs.is_empty() && !g.iface.depth_output {
+        m.push_str("    @location(0) unused: vec4<f32>,\n");
     }
     m.push_str("}\n");
     m.push_str("@fragment fn main(in: In) -> Out {\n");
@@ -639,31 +804,95 @@ pub fn translate_pixel(decoded: &Decoded, inputs: &PixelInputs, ctx: &Context) -
         m.push_str("    o.z = out_z;\n");
     }
     m.push_str("    return o;\n}\n");
-    Ok(Translated {
-        wgsl: m,
-        interface: g.iface,
-    })
+}
+
+fn assemble_vertex(m: &mut String, g: &Gen, inputs: &VertexInputs) {
+    // the decoded attribute streams: one storage buffer of vec4 and, per stream, where it starts
+    m.push_str(
+        "@group(3) @binding(0) var<storage, read> va: array<vec4<f32>>;\n@group(3) @binding(1) var<uniform> vmeta: array<vec4<u32>, 16>;\n",
+    );
+    if g.iface.reads_ring {
+        m.push_str("@group(3) @binding(2) var<storage, read> ring_out: array<vec4<f32>>;\n");
+    }
+    m.push_str("struct VOut {\n    @builtin(position) pos: vec4<f32>,\n");
+    for p in &g.iface.params {
+        let _ = writeln!(m, "    @location({p}) p{p}: vec4<f32>,");
+    }
+    m.push_str("}\n@vertex fn main(@builtin(vertex_index) vid: u32, @builtin(instance_index) iid: u32) -> VOut {\n");
+    // the bindings are used even when the shader reads none of them, so the pipeline layout is always the same
+    m.push_str("    let touched = vmeta[0].x + u32(arrayLength(&va) > 0u);\n");
+    if g.iface.reads_ring {
+        m.push_str("    let touched_ring = arrayLength(&ring_out);\n");
+    }
+    for n in 0..g.max_gpr {
+        let init = if n == 0 {
+            "vec4<f32>(fu(vid), 0.0, 0.0, fu(iid))".to_string()
+        } else if let Some(a) = inputs.attributes.iter().find(|a| a.gpr == n) {
+            let index = if a.per_instance {
+                format!("(iid / {}u)", a.divisor.max(1))
+            } else {
+                "vid".to_string()
+            };
+            format!("va[vmeta[{}].x + {index}]", a.stream)
+        } else {
+            "vec4<f32>(0.0)".to_string()
+        };
+        let _ = writeln!(m, "    var r{n}: vec4<f32> = {init};");
+    }
+    m.push_str("    var pv = vec4<f32>(0.0);\n    var ps = 0.0;\n    var live = true;\n    var stack: array<bool, 16>;\n    var sp = 0;\n");
+    m.push_str("    var out_pos = vec4<f32>(0.0);\n");
+    for p in &g.iface.params {
+        let _ = writeln!(m, "    var out_p{p} = vec4<f32>(0.0);");
+    }
+    m.push_str(&g.out);
+    m.push_str("    var o: VOut;\n");
+    if inputs.half_z {
+        m.push_str("    o.pos = out_pos;\n");
+    } else {
+        // the depth range of clip space is -w to w; the target API's is 0 to w
+        m.push_str("    o.pos = vec4<f32>(out_pos.x, out_pos.y, (out_pos.z + out_pos.w) * 0.5, out_pos.w);\n");
+    }
+    for p in &g.iface.params {
+        let _ = writeln!(m, "    o.p{p} = out_p{p};");
+    }
+    m.push_str("    return o;\n}\n");
 }
 
 impl Gen<'_> {
     /// A vertex-style fetch in a texture clause on a resource from 128 up: the element of a uniform block chosen by an index in a
     /// register (what a dynamically indexed uniform array becomes).
     fn uniform_fetch(&mut self, f: &Fetch) {
-        if f.resource < 128 {
-            self.err(format!("a buffer fetch on resource {}", f.resource));
-            return;
-        }
-        let bank = f.resource - 128;
-        let entry = self.iface.banks.entry(bank).or_default();
-        *entry = DYNAMIC_BANK;
         let src = self.gpr(f.src_gpr);
         let index = match f.src_sel[0] {
             0..=3 => format!("{src}.{}", swz(f.src_sel[0])),
             _ => "0.0".to_string(),
         };
+        let element = if f.resource == RING_RESOURCE {
+            // a read of a ring: the geometry shader reads what the vertex shader wrote (its address is in dwords, the offset in bytes);
+            // the copy shader reads what the geometry shader wrote (its address is the vertex number)
+            match self.stage {
+                Stage::Gs => format!("ring_in[(iu({index}) * 4u + {}u) / 16u]", f.vtx_offset),
+                Stage::Vertex if self.ring_out_vec4 > 0 => {
+                    self.iface.reads_ring = true;
+                    format!("ring_out[iu({index}) * {}u + {}u]", self.ring_out_vec4, f.vtx_offset / 16)
+                }
+                _ => {
+                    self.err("a ring fetch outside a geometry pipeline".into());
+                    return;
+                }
+            }
+        } else if f.resource < 128 {
+            self.err(format!("a buffer fetch on resource {}", f.resource));
+            return;
+        } else {
+            let bank = f.resource - 128;
+            let entry = self.iface.banks.entry(bank).or_default();
+            *entry = DYNAMIC_BANK;
+            format!("cb{bank}[min(iu({index}), {}u)]", DYNAMIC_BANK - 1)
+        };
         let dst = self.gpr(f.dst_gpr);
         self.line(1, "{");
-        self.line(2, &format!("let e = cb{bank}[min(iu({index}), {}u)];", DYNAMIC_BANK - 1));
+        self.line(2, &format!("let e = {element};"));
         for (k, &d) in f.dst_sel.iter().enumerate() {
             let value = match d {
                 0..=3 => format!("e.{}", swz(d)),
@@ -760,6 +989,65 @@ impl Gen<'_> {
     }
 }
 
+fn assemble_es(m: &mut String, g: &Gen, inputs: &VertexInputs) {
+    m.push_str(
+        "@group(1) @binding(0) var<storage, read> va: array<vec4<f32>>;\n@group(1) @binding(1) var<uniform> vmeta: array<vec4<u32>, 16>;\n",
+    );
+    m.push_str("@group(1) @binding(2) var<storage, read_write> ring_in: array<vec4<f32>>;\n@group(1) @binding(5) var<uniform> params: vec4<u32>;\n");
+    m.push_str("@compute @workgroup_size(64) fn main(@builtin(global_invocation_id) gid: vec3<u32>) {\n    let vid = gid.x;\n");
+    m.push_str("    if (vid >= params.x + 0u * (vmeta[0].x + u32(arrayLength(&va) > 0u))) { return; }\n    let iid = 0u;\n");
+    for n in 0..g.max_gpr {
+        let init = if n == 0 {
+            "vec4<f32>(fu(vid), 0.0, 0.0, fu(iid))".to_string()
+        } else if let Some(a) = inputs.attributes.iter().find(|a| a.gpr == n) {
+            let index = if a.per_instance {
+                format!("(iid / {}u)", a.divisor.max(1))
+            } else {
+                "vid".to_string()
+            };
+            format!("va[vmeta[{}].x + {index}]", a.stream)
+        } else {
+            "vec4<f32>(0.0)".to_string()
+        };
+        let _ = writeln!(m, "    var r{n}: vec4<f32> = {init};");
+    }
+    m.push_str("    var pv = vec4<f32>(0.0);\n    var ps = 0.0;\n    var live = true;\n    var stack: array<bool, 16>;\n    var sp = 0;\n");
+    m.push_str(&g.out);
+    m.push_str("}\n");
+}
+
+fn assemble_gs(m: &mut String, g: &Gen) {
+    m.push_str("@group(1) @binding(2) var<storage, read_write> ring_in: array<vec4<f32>>;\n@group(1) @binding(3) var<storage, read_write> ring_out: array<vec4<f32>>;\n");
+    m.push_str(
+        "@group(1) @binding(4) var<storage, read_write> gs_idx: array<u32>;\n@group(1) @binding(5) var<uniform> params: vec4<u32>;\n",
+    );
+    let _ = writeln!(
+        m,
+        "@compute @workgroup_size(64) fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{\n    let p = gid.x;\n    if (p >= params.x + 0u * (u32(arrayLength(&ring_in) > 0u) + u32(arrayLength(&ring_out) > 0u) + u32(arrayLength(&gs_idx) > 0u))) {{ return; }}"
+    );
+    let _ = writeln!(
+        m,
+        "    let base_out = p * {}u;\n    let base_idx = p * {}u;\n    var emitted = 0u;\n    var strip = 0u;",
+        g.ring.max_vertices * g.ring.gs_vec4,
+        g.ring.max_vertices
+    );
+    for n in 0..g.max_gpr {
+        // the first register holds where the input vertex's item is in the ring, in dwords
+        let init = if n == 0 {
+            format!(
+                "vec4<f32>(fu((p + params.y) * {}u), 0.0, 0.0, fu(p + params.y))",
+                g.ring.es_vec4 * 4
+            )
+        } else {
+            "vec4<f32>(0.0)".to_string()
+        };
+        let _ = writeln!(m, "    var r{n}: vec4<f32> = {init};");
+    }
+    m.push_str("    var pv = vec4<f32>(0.0);\n    var ps = 0.0;\n    var live = true;\n    var stack: array<bool, 16>;\n    var sp = 0;\n");
+    m.push_str(&g.out);
+    m.push_str("}\n");
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -790,7 +1078,16 @@ mod tests {
         let ctx = Context {
             texture_kind: &|_| TexKind::D2,
         };
-        let t = translate_pixel(&d, &PixelInputs { count: 2, flat: vec![] }, &ctx).unwrap();
+        let t = translate_pixel(
+            &d,
+            &PixelInputs {
+                count: 2,
+                flat: vec![],
+                locations: vec![],
+            },
+            &ctx,
+        )
+        .unwrap();
         assert!(t.wgsl.contains("r0.x = t0;"), "{}", t.wgsl);
         assert!(t.wgsl.contains("mul_dx9(r1.x, 0.5) + 1.0"), "{}", t.wgsl);
         assert!(t.interface.colour_outputs.contains(&0));

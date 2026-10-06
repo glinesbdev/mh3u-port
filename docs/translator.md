@@ -117,15 +117,35 @@ systems, and it is fast enough for a console from 2012. The test machine's GPU i
 made the call, so it reads the guest's memory at the moment of the call and needs no copying or locking. A call that blocks (waiting
 for the next frame) blocks there, with the other guest threads waiting.
 
-**Done:** colour buffers become textures keyed by the address of their image; `GX2ClearColor` clears them;
-`GX2CopyColorBufferToScanBuffer` copies a buffer into the TV picture; `GX2SwapScanBuffers` shows it in the window, scaled with the
-picture's proportions kept, on a surface that does not encode the colours again (the game's are already in the display's encoding);
-`GX2WaitForVsync` paces to 60 Hz; `GX2GetSwapStatus` reports every swap as flipped. `mh3u-tools run ... --window` does this. The game
-swaps frames in the window (about 40 a second with call tracing on); the picture is black because nothing is drawn yet.
+**What it draws now** (the first real frames; textures are still white stand-ins): the game reaches its character screen and the
+backend draws it: the hunter model, the UI panels and the quest-board layout, upright, in the right places, without textures or text
+(the font and all textures are white). The pieces:
 
-**Next:** record the state calls (shaders, fetch shader, attribute buffers, textures, samplers, uniform blocks, blend, depth, cull,
-viewport, scissor, colour and depth buffers) and turn `GX2DrawEx`/`GX2DrawIndexedEx` into draws; translate the shaders' microcode
-(the census in `docs/spikes.md`) to WGSL; read textures through the exact tiling rules; display lists (`GX2BeginDisplayListEx`).
+- **State**: every `GX2Set*` call is recorded into the state of the current context (`GX2SetContextState`/`GX2SetupContextStateEx`
+  switch between them); display lists (`GX2BeginDisplayListEx`...) are recorded and replayed with their arguments.
+- **A draw** (`draw.rs`): the vertex and pixel shaders are read from the guest, translated (cached by address and a hash of the
+  program), the vertex attributes are decoded on the CPU into one stream of `vec4` per fetch-shader element (the fetch shader is not
+  run: `GX2InitFetchShaderEx` keeps the attribute descriptions), the uniform blocks are copied with their words swapped, a pipeline is
+  made from the state (blend, depth, cull, formats) and cached, and the draw is issued with generated indices (fans, quads and strips
+  that `wgpu` lacks are expanded). A vertex shader's outputs reach the pixel shader through the semantic numbers in the shaders'
+  headers (a pixel input takes the vertex output with the same semantic). A pass that samples the target it draws into gets a copy.
+- **Geometry pipelines** (`geometry.rs`): nearly every draw of the 2D interface and the effects goes through the same geometry
+  shader (it turns a point with a size and a rectangle into a quad). The hardware's vertex shader (writing a ring of 12 `vec4`
+  per vertex) and geometry shader (reading it, writing a ring of 11 `vec4` per emitted vertex, and `EMIT_VERTEX`) are translated into
+  compute shaders; the geometry shader also writes the triangles its strips make; the copy shader (a vertex shader that reads the
+  second ring) draws them with the pixel shader. Only point inputs are done.
+- **The DMA engine** (`DMAECopyMem`) is how the game fills the GPU's constant buffers: without it every uniform block was zero.
+- `GX2CopySurface` copies between render targets (same size and format only); `GX2ClearColor`, `GX2ClearDepthStencilEx`.
+
+**Not done yet:** textures (the GX2 tiling rules, the compressed formats, mipmaps, cube maps), samplers from `GX2Sampler`, alpha
+test and stencil, depth bias, other geometry inputs (lines, triangles, instances), `CUBE` in shaders, loops and relative
+addressing in vertex shaders, rects and other primitive types, stream out, the second render target (the GamePad's picture is
+drawn but not shown), and speed: every draw makes its own buffers and render pass.
+
+Looking at what it draws: `MH3U_GFX_SAVE=<folder>` writes the TV picture as a PPM every `MH3U_GFX_SAVE_EVERY` swaps (120 by default),
+`MH3U_GFX_SAVE_IMAGE=<hex image address>` saves a given colour buffer instead; `MH3U_GFX_SOLID=1` makes every pixel red (to see
+where the geometry is); `MH3U_GFX_DUMP=<folder>` writes shader programs and their tables as the game gave them; `MH3U_GFX_LOG=1`
+prints draw counts, the targets drawn into, and why draws were skipped.
 
 ## The shaders (`mh3u-latte`: `decode.rs`, `ops.rs`, `translate.rs`)
 
@@ -144,7 +164,10 @@ derivative_uniformity)`). **572 of the 579 different pixel programs become WGSL 
 other 7 use `CUBE` (not written: its output convention has to be worked out with a cube-map shader to look at). Whether a translated
 shader computes what the hardware does is not checked by anything but looking at the picture: the semantics are from the documents,
 so an operation the translator does not know is an error, never a guess.
-Vertex shaders (fetch shaders, loops, relative addressing) are next.
+Vertex shaders are translated with the fetch shader replaced by decoded attribute streams (vertex pulling); loops and relative
+addressing in them are not done. The geometry pipeline's three programs are translated by `translate_es`, `translate_gs` and
+`translate_vertex` with a ring configuration (the hardware's ring writes are dwords at an absolute offset; the item sizes come from
+the vertex shader's `ringItemsize` and the geometry shader's `sq_gs_vert_itemsize`).
 
 ## Getting the game to its first scene (what the runtime had to learn)
 

@@ -36,6 +36,12 @@ const CALLS: &[&str] = &[
     "gx2:GX2SetCullOnlyControl",
     "gx2:GX2SetPolygonControl",
     "gx2:GX2SetAlphaTest",
+    "gx2:GX2SetRasterizerClipControlEx",
+    "gx2:GX2SetShaderModeEx",
+    "gx2:GX2CalcFetchShaderSizeEx",
+    "gx2:GX2InitFetchShaderEx",
+    "gx2:GX2ClearDepthStencilEx",
+    "gx2:GX2CopySurface",
     "gx2:GX2DrawEx",
     "gx2:GX2DrawIndexedEx",
     "gx2:GX2ClearColor",
@@ -52,34 +58,39 @@ const FRAME: Duration = Duration::from_nanos(16_683_333);
 /// The console's TV scan target and its GamePad one.
 const TV: u32 = 1;
 
-struct Target {
-    texture: wgpu::Texture,
-    format: wgpu::TextureFormat,
+pub(crate) struct Target {
+    pub(crate) texture: wgpu::Texture,
+    pub(crate) format: wgpu::TextureFormat,
 }
 
 pub struct Gx2 {
-    d: Display,
-    config: wgpu::SurfaceConfiguration,
+    pub(crate) d: Display,
+    pub(crate) config: wgpu::SurfaceConfiguration,
     blit: wgpu::RenderPipeline,
     layout: wgpu::BindGroupLayout,
     sampler: wgpu::Sampler,
     /// The colour buffers the game has used, by the guest address of their image.
-    targets: HashMap<u32, Target>,
+    pub(crate) targets: HashMap<u32, Target>,
     /// What the TV shows: a copy of the colour buffer given to `GX2CopyColorBufferToScanBuffer`.
     tv: Option<wgpu::Texture>,
     swaps: u32,
     interval: u32,
     /// The state of each context the game has made, by the guest address of its `GX2ContextState`, and the one in use.
-    contexts: HashMap<u32, State>,
-    current: u32,
+    pub(crate) contexts: HashMap<u32, State>,
+    pub(crate) current: u32,
     /// Display lists: recorded calls by the address of their buffer, and the list being recorded.
     lists: HashMap<u32, Vec<Recorded>>,
     recording: Option<(u32, Vec<Recorded>)>,
-    draws: u64,
+    pub(crate) draws: u64,
+    dumped: std::collections::HashSet<u32>,
     null_draws: u64,
     real_draws: u64,
-    log: bool,
+    pub(crate) log: bool,
     next_vsync: Instant,
+    pub(crate) caches: crate::draw::DrawCaches,
+    pub(crate) last_tv_source: u32,
+    save_every: u32,
+    pub(crate) fetch_shaders: HashMap<u32, Vec<crate::draw::AttribStream>>,
 }
 
 /// The texture format of a `GX2SurfaceFormat` of a colour buffer.
@@ -197,15 +208,23 @@ impl Gx2 {
             lists: HashMap::new(),
             recording: None,
             draws: 0,
+            dumped: Default::default(),
             null_draws: 0,
             real_draws: 0,
             log: std::env::var_os("MH3U_GFX_LOG").is_some(),
             next_vsync: Instant::now(),
+            caches: Default::default(),
+            last_tv_source: 0,
+            save_every: std::env::var("MH3U_GFX_SAVE_EVERY")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(120),
+            fetch_shaders: HashMap::new(),
         }
     }
 
     /// The texture of the colour buffer at `cb` (a `GX2ColorBuffer`, which begins with its `GX2Surface`), made when first seen.
-    fn target(&mut self, g: &Guest, cb: u32) -> Option<u32> {
+    pub(crate) fn target(&mut self, g: &Guest, cb: u32) -> Option<u32> {
         let (width, height, format, image) = (g.u32(cb + 4), g.u32(cb + 8), g.u32(cb + 0x14), g.u32(cb + 0x24));
         if width == 0 || height == 0 || width > 8192 || height > 8192 {
             return None;
@@ -236,6 +255,53 @@ impl Gx2 {
             self.targets.insert(image, Target { texture, format });
         }
         Some(image)
+    }
+
+    /// `GX2CopySurface`: the contents of one surface into another (both are known to this backend as render targets or not at all).
+    fn copy_surface(&mut self, g: &Guest, source: u32, destination: u32) {
+        if self.log && self.swaps < 400 {
+            eprintln!(
+                "[gfx] copy surface {source:#x} (image {:#x}, {}x{}, format {:#x}) to {destination:#x} (image {:#x}, {}x{}, format {:#x})",
+                g.u32(source + 0x24),
+                g.u32(source + 4),
+                g.u32(source + 8),
+                g.u32(source + 0x14),
+                g.u32(destination + 0x24),
+                g.u32(destination + 4),
+                g.u32(destination + 8),
+                g.u32(destination + 0x14)
+            );
+        }
+        let (Some(from), Some(to)) = (self.target(g, source), self.target(g, destination)) else {
+            return;
+        };
+        if from == to {
+            return;
+        }
+        let (a, b) = (&self.targets[&from].texture, &self.targets[&to].texture);
+        if a.width() != b.width() || a.height() != b.height() || a.format() != b.format() {
+            self.caches_report(format!(
+                "a copy between surfaces of different sizes or formats ({}x{} {:?} to {}x{} {:?})",
+                a.width(),
+                a.height(),
+                a.format(),
+                b.width(),
+                b.height(),
+                b.format()
+            ));
+            return;
+        }
+        let mut enc = self.d.device.create_command_encoder(&Default::default());
+        enc.copy_texture_to_texture(
+            a.as_image_copy(),
+            b.as_image_copy(),
+            wgpu::Extent3d {
+                width: a.width(),
+                height: a.height(),
+                depth_or_array_layers: 1,
+            },
+        );
+        self.d.queue.submit([enc.finish()]);
     }
 
     fn clear(&mut self, g: &Guest, c: &Ctx) {
@@ -274,6 +340,7 @@ impl Gx2 {
             return;
         }
         let Some(image) = self.target(g, c.r[3]) else { return };
+        self.last_tv_source = image;
         let source = &self.targets[&image].texture;
         let (w, h) = (source.width(), source.height());
         let keep = self
@@ -292,7 +359,7 @@ impl Gx2 {
                 sample_count: 1,
                 dimension: wgpu::TextureDimension::D2,
                 format: source.format(),
-                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::COPY_SRC,
                 view_formats: &[],
             }));
         }
@@ -308,6 +375,62 @@ impl Gx2 {
             },
         );
         self.d.queue.submit([enc.finish()]);
+    }
+
+    /// Writes the TV picture as a PPM file (for looking at what the game drew without the window): MH3U_GFX_SAVE=<folder> saves one
+    /// every 120 swaps.
+    fn save_tv(&self, folder: &std::path::Path) {
+        // MH3U_GFX_SAVE_IMAGE=<hex address of a colour buffer's image> saves that buffer instead of the TV picture
+        let wanted = std::env::var("MH3U_GFX_SAVE_IMAGE")
+            .ok()
+            .and_then(|v| u32::from_str_radix(v.trim_start_matches("0x"), 16).ok());
+        let tv = match wanted {
+            Some(image) => self.targets.get(&image).map(|t| &t.texture),
+            None => self.tv.as_ref(),
+        };
+        let Some(tv) = tv else { return };
+        if tv.format() != wgpu::TextureFormat::Rgba8Unorm {
+            return;
+        }
+        let (w, h) = (tv.width(), tv.height());
+        let row = (w * 4).div_ceil(256) * 256;
+        let buffer = self.d.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("readback"),
+            size: u64::from(row * h),
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut enc = self.d.device.create_command_encoder(&Default::default());
+        enc.copy_texture_to_buffer(
+            tv.as_image_copy(),
+            wgpu::TexelCopyBufferInfo {
+                buffer: &buffer,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(row),
+                    rows_per_image: Some(h),
+                },
+            },
+            wgpu::Extent3d {
+                width: w,
+                height: h,
+                depth_or_array_layers: 1,
+            },
+        );
+        self.d.queue.submit([enc.finish()]);
+        let slice = buffer.slice(..);
+        slice.map_async(wgpu::MapMode::Read, |_| {});
+        let _ = self.d.device.poll(wgpu::PollType::wait_indefinitely());
+        let Ok(data) = slice.get_mapped_range() else { return };
+        let mut ppm = format!("P6\n{w} {h}\n255\n").into_bytes();
+        for y in 0..h {
+            for x in 0..w {
+                let at = (y * row + x * 4) as usize;
+                ppm.extend_from_slice(&data[at..at + 3]);
+            }
+        }
+        let _ = std::fs::create_dir_all(folder);
+        let _ = std::fs::write(folder.join(format!("tv-{:06}.ppm", self.swaps)), ppm);
     }
 
     /// Shows the TV picture, scaled to the window with the picture's proportions kept.
@@ -456,11 +579,13 @@ impl Gx2 {
                     *b = crate::state::AttribBuffer { address, size, stride };
                 }
             }
-            "gx2:GX2SetVertexUniformBlock" | "gx2:GX2SetPixelUniformBlock" => {
+            "gx2:GX2SetVertexUniformBlock" | "gx2:GX2SetPixelUniformBlock" | "gx2:GX2SetGeometryUniformBlock" => {
                 let (i, size, address) = (a(0), a(1), a(2));
                 let st = self.state();
                 let blocks = if name.contains("Vertex") {
                     &mut st.vertex_blocks
+                } else if name.contains("Geometry") {
+                    &mut st.geometry_blocks
                 } else {
                     &mut st.pixel_blocks
                 };
@@ -548,6 +673,31 @@ impl Gx2 {
                 let (e, f, r) = (a(0) != 0, a(1), farg(c, 0));
                 self.state().alpha_test = (e, f, r);
             }
+            "gx2:GX2SetShaderModeEx" => {
+                let mode = a(0);
+                self.state().shader_mode = mode;
+            }
+            "gx2:GX2SetRasterizerClipControlEx" => {
+                let half = a(2) != 0;
+                self.state().half_z = half;
+            }
+            // the size of the code the fetch shader would be: sixteen bytes for each attribute and a little control flow
+            "gx2:GX2CalcFetchShaderSizeEx" => c.r[3] = (32 + 16 * c.r[3]).div_ceil(16) * 16,
+            // (fetch shader, buffer, attribute count, attributes, type, tessellation): nothing of machine code is made, the attributes
+            // are kept and the draw reads them
+            "gx2:GX2InitFetchShaderEx" => {
+                let (fs, buffer, count, attribs) = (c.r[3], c.r[4], c.r[5], c.r[6]);
+                let streams: Vec<_> = (0..count.min(32))
+                    .map(|i| crate::draw::AttribStream::read(g, attribs + 32 * i))
+                    .collect();
+                g.fill(fs, 0, 0x28);
+                g.put_u32(fs + 8, (32 + 16 * count).div_ceil(16) * 16);
+                g.put_u32(fs + 0xc, buffer);
+                g.put_u32(fs + 0x10, count);
+                self.fetch_shaders.insert(fs, streams);
+            }
+            "gx2:GX2CopySurface" => self.copy_surface(g, c.r[3], c.r[6]),
+            "gx2:GX2ClearDepthStencilEx" => self.clear_depth(g, c.r[3], farg(c, 0), c.r[4], c.r[5]),
             "gx2:GX2DrawEx" => self.draw(g, a(0), a(1), None, a(2), a(3)),
             "gx2:GX2DrawIndexedEx" => self.draw(g, a(0), a(1), Some((a(2), a(3))), a(4), a(5)),
             "gx2:GX2ClearColor" => self.clear(g, c),
@@ -555,7 +705,19 @@ impl Gx2 {
             "gx2:GX2SwapScanBuffers" => {
                 self.present();
                 self.swaps += 1;
+                if let Some(dir) = std::env::var_os("MH3U_GFX_SAVE").filter(|_| self.swaps.is_multiple_of(self.save_every)) {
+                    self.save_tv(std::path::Path::new(&dir));
+                }
                 if self.log && self.swaps.is_multiple_of(120) {
+                    let mut gs: Vec<_> = self.caches.gs_draws.iter().collect();
+                    gs.sort_by_key(|(_, n)| std::cmp::Reverse(**n));
+                    for ((g_, vs, prim, count, inst), n) in gs.iter().take(6) {
+                        eprintln!("[gfx] gs draws: gs {g_:#x} vs {vs:#x} prim {prim} count {count} instances {inst}: {n}");
+                    }
+                    eprintln!(
+                        "[gfx] draws into {:x?}, last copy to the TV from {:#x}, skipped {:?}",
+                        self.caches.drawn_into, self.last_tv_source, self.caches.skipped
+                    );
                     eprintln!(
                         "[gfx] {} swaps, {} draws ({} with no shader, {} with)",
                         self.swaps, self.draws, self.null_draws, self.real_draws
@@ -578,8 +740,58 @@ impl Gx2 {
         }
     }
 
+    /// Writes the shader's structure and program to the folder named by MH3U_GFX_DUMP (once per shader), for looking at offline.
+    fn dump_shader(&mut self, g: &Guest, address: u32, vertex: bool) {
+        let Some(dir) = std::env::var_os("MH3U_GFX_DUMP") else { return };
+        if address == 0 || !self.dumped.insert(address) {
+            return;
+        }
+        let (struct_len, size_at, program_at) = if vertex { (0x140u32, 0xd0, 0xd4) } else { (0xe8, 0xa4, 0xa8) };
+        let (size, program) = (g.u32(address + size_at), g.u32(address + program_at));
+        let mut header = vec![0u8; struct_len as usize];
+        g.read(address, &mut header);
+        let mut code = vec![0u8; size.min(1 << 20) as usize];
+        g.read(program, &mut code);
+        let dir = std::path::Path::new(&dir);
+        let kind = if vertex { "vs" } else { "ps" };
+        let _ = std::fs::create_dir_all(dir);
+        // the tables the shader header points at, with their names
+        let mut text = String::new();
+        let table = |count_at: u32, ptr_at: u32, entry: u32, text: &mut String, what: &str| {
+            let (n, p) = (g.u32(address + count_at), g.u32(address + ptr_at));
+            for i in 0..n.min(64) {
+                let e = p + i * entry;
+                let words: Vec<String> = (0..entry / 4).map(|k| format!("{:#x}", g.u32(e + 4 * k))).collect();
+                let name = g.cstr(g.u32(e));
+                text.push_str(&format!("{what} {i}: {name:?} {}\n", words.join(" ")));
+            }
+        };
+        if vertex {
+            table(0xdc, 0xe0, 12, &mut text, "uniform block");
+            table(0xe4, 0xe8, 20, &mut text, "uniform var");
+            table(0xfc, 0x100, 12, &mut text, "sampler");
+            table(0x104, 0x108, 16, &mut text, "attrib");
+        } else {
+            table(0xb0, 0xb4, 12, &mut text, "uniform block");
+            table(0xb8, 0xbc, 20, &mut text, "uniform var");
+            table(0xd0, 0xd4, 12, &mut text, "sampler");
+        }
+        let _ = std::fs::write(dir.join(format!("{kind}-{address:08x}.txt")), text);
+        let _ = std::fs::write(dir.join(format!("{kind}-{address:08x}.struct")), header);
+        let _ = std::fs::write(dir.join(format!("{kind}-{address:08x}.code")), code);
+    }
+
     fn draw(&mut self, g: &Guest, primitive: u32, count: u32, indexed: Option<(u32, u32)>, offset: u32, instances: u32) {
         self.draws += 1;
+        self.draw_call(g, primitive, count, indexed, offset, instances);
+        {
+            let (vs, ps) = {
+                let st = self.contexts.entry(self.current).or_default();
+                (st.vertex_shader, st.pixel_shader)
+            };
+            self.dump_shader(g, vs, true);
+            self.dump_shader(g, ps, false);
+        }
         if !self.log {
             return;
         }

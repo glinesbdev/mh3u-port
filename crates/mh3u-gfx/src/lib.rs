@@ -1,5 +1,7 @@
 //! The graphics side: a window, a Vulkan (or Direct3D 12, or Metal) device through `wgpu`, and what the game's `GX2` calls become.
 
+mod draw;
+mod geometry;
 mod gx2;
 mod state;
 

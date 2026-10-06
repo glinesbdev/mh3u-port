@@ -16,6 +16,7 @@ pub fn wgsl(pack: &[u8], show: Option<usize>) -> Result<()> {
     let inputs = PixelInputs {
         count: 8,
         flat: vec![false; 8],
+        locations: Vec::new(),
     };
     let (mut ok, mut untranslated, mut invalid) = (0, BTreeMap::<String, usize>::new(), 0);
     let mut first_invalid = None;

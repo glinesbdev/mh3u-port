@@ -31,6 +31,25 @@ enum Tool {
     Functions { game_dir: PathBuf },
     /// Decode every shader program of the game's pack and count what they use.
     LatteCheck { game_dir: PathBuf },
+    /// Print a listing of a shader program (a file of microcode, as MH3U_GFX_DUMP writes them).
+    LatteList { file: PathBuf },
+    /// Translate one shader program file to WGSL (as a vertex shader with the given attribute registers, or as a pixel shader), print it
+    /// and say whether naga accepts it.
+    LatteTranslate {
+        file: PathBuf,
+        #[arg(long)]
+        vertex: bool,
+        /// As the vertex shader of a geometry pipeline (a compute shader), the geometry shader, or the copy shader.
+        #[arg(long)]
+        es: bool,
+        #[arg(long)]
+        gs: bool,
+        #[arg(long)]
+        copy: bool,
+        /// For a vertex shader: the registers the attributes arrive in (comma separated).
+        #[arg(long, default_value = "1")]
+        attributes: String,
+    },
     /// Translate every pixel program of the pack to WGSL and validate it.
     LatteWgsl {
         game_dir: PathBuf,
@@ -256,6 +275,79 @@ fn main() -> Result<()> {
                 let line = mh3u_ppc::format(at, w);
                 println!("{at:#x}  {w:08x}  {line}");
             }
+            Ok(())
+        }
+        Tool::LatteTranslate {
+            file,
+            vertex,
+            es,
+            gs,
+            copy,
+            attributes,
+        } => {
+            use mh3u_latte::translate::{Context, PixelInputs, TexKind, VertexAttribute, VertexInputs, translate_pixel, translate_vertex};
+            let d = mh3u_latte::decode::decode(&read(&file)?).map_err(|e| anyhow::anyhow!("{e}"))?;
+            let ctx = Context {
+                texture_kind: &|_| TexKind::D2,
+            };
+            let ring = mh3u_latte::translate::RingConfig {
+                es_vec4: 12,
+                gs_vec4: 11,
+                max_vertices: 4,
+            };
+            let t = if gs {
+                mh3u_latte::translate::translate_gs(&d, ring, &ctx)
+            } else if es || copy || vertex {
+                let attrs = attributes
+                    .split(',')
+                    .filter(|a| !a.is_empty())
+                    .enumerate()
+                    .map(|(i, g)| VertexAttribute {
+                        gpr: g.parse().unwrap_or(1),
+                        stream: i as u32,
+                        per_instance: false,
+                        divisor: 1,
+                    })
+                    .collect();
+                let inputs = VertexInputs {
+                    attributes: attrs,
+                    half_z: true,
+                    ring_out_vec4: if copy { 11 } else { 0 },
+                };
+                if es {
+                    mh3u_latte::translate::translate_es(&d, &inputs, ring, &ctx)
+                } else {
+                    translate_vertex(&d, &inputs, &ctx)
+                }
+            } else {
+                translate_pixel(
+                    &d,
+                    &PixelInputs {
+                        count: 8,
+                        flat: vec![false; 8],
+                        locations: Vec::new(),
+                    },
+                    &ctx,
+                )
+            }
+            .map_err(|e| anyhow::anyhow!("not translated: {e}"))?;
+            println!("{}", t.wgsl);
+            match naga::front::wgsl::parse_str(&t.wgsl)
+                .map_err(|e| e.emit_to_string(&t.wgsl))
+                .and_then(|m| {
+                    naga::valid::Validator::new(naga::valid::ValidationFlags::all(), naga::valid::Capabilities::all())
+                        .validate(&m)
+                        .map(|_| ())
+                        .map_err(|e| format!("{e:?}"))
+                }) {
+                Ok(()) => println!("// naga accepts it"),
+                Err(e) => println!("// naga rejects it: {e}"),
+            }
+            Ok(())
+        }
+        Tool::LatteList { file } => {
+            let d = mh3u_latte::decode::decode(&read(&file)?).map_err(|e| anyhow::anyhow!("{e}"))?;
+            print!("{}", mh3u_latte::decode::listing(&d));
             Ok(())
         }
         Tool::LatteWgsl { game_dir, show } => {

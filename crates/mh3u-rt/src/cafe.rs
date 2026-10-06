@@ -146,6 +146,15 @@ fn simple(name: &str) -> Option<SimpleHandler> {
             }
             c.r[3] = 1;
         },
+        // the DMA engine copies memory (the game uses it to fill the GPU's constant buffers); it is finished when the call returns
+        "dmae.rpl:DMAECopyMem" => |_, g, c| {
+            let (dst, src, words) = (c.r[3], c.r[4], c.r[5]);
+            if words > 0 && u64::from(dst) + u64::from(words) * 4 <= 1 << 32 && u64::from(src) + u64::from(words) * 4 <= 1 << 32 {
+                g.copy(src, dst, words * 4);
+            }
+            c.r[3] = 0;
+        },
+        "dmae.rpl:DMAEWaitDone" => |_, _, c| c.r[3] = 1,
         "coreinit:OSGetCoreId" | "coreinit:OSGetMainCoreId" => |_, _, c| c.r[3] = 1,
         "coreinit:__ghsLock" | "coreinit:__ghsUnlock" => |_, _, _| {},
         "coreinit:OSIsDebuggerInitialized" => |_, _, c| c.r[3] = 0,

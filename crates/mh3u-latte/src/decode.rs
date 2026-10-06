@@ -179,6 +179,23 @@ pub enum Cf {
         pop_count: u32,
         cond: u32,
     },
+    /// A write to a ring (`MEM_RING`, 0x26): `burst` consecutive registers from `gpr` go to the dword offset `array_base` of the
+    /// ring, only the components in `mask`. The vertex shader that feeds a geometry shader writes its outputs this way, and so does the
+    /// geometry shader.
+    Ring {
+        array_base: u32,
+        gpr: u32,
+        burst: u32,
+        mask: u32,
+    },
+    /// A geometry shader emitting a vertex (0x15), emitting and cutting the strip (0x16), or cutting it (0x17).
+    Emit {
+        inst: u32,
+    },
+    /// Other writes to memory: stream out (0x20 to 0x23), scratch, reduction; not translated.
+    Memory {
+        inst: u32,
+    },
     CallFetchShader,
     Return,
     Nop,
@@ -383,6 +400,14 @@ pub fn decode(program: &[u8]) -> Result<Decoded, Error> {
                     cond,
                 },
                 0x13 => Cf::CallFetchShader,
+                0x15..=0x17 => Cf::Emit { inst },
+                0x26 => Cf::Ring {
+                    array_base: w0 & 0x1fff,
+                    gpr: (w0 >> 15) & 0x7f,
+                    burst: ((w1 >> 17) & 0xf) + 1,
+                    mask: (w1 >> 12) & 0xf,
+                },
+                0x18 | 0x20..=0x25 => Cf::Memory { inst },
                 0x14 => Cf::Return,
                 0x27 | 0x28 => Cf::Export {
                     kind: (w0 >> 13) & 3,
@@ -402,4 +427,107 @@ pub fn decode(program: &[u8]) -> Result<Decoded, Error> {
         }
     }
     Ok(Decoded { cf, ends })
+}
+
+fn source_text(o: &Operand, literals: &[u32; 4]) -> String {
+    let c = ['x', 'y', 'z', 'w'][(o.channel & 3) as usize];
+    let base = match o.source {
+        Source::Gpr(n) => format!("R{n}.{c}"),
+        Source::Kcache { bank, index } => format!("KC{bank}[{index}].{c}"),
+        Source::ConstFile(n) => format!("C{n}.{c}"),
+        Source::Zero => "0".into(),
+        Source::One => "1.0".into(),
+        Source::OneInt => "1(int)".into(),
+        Source::MinusOneInt => "-1(int)".into(),
+        Source::Half => "0.5".into(),
+        Source::Literal => format!(
+            "L({:#x}={})",
+            literals[(o.channel & 3) as usize],
+            f32::from_bits(literals[(o.channel & 3) as usize])
+        ),
+        Source::PreviousVector => format!("PV.{c}"),
+        Source::PreviousScalar => "PS".into(),
+        Source::Other(n) => format!("sel{n}"),
+    };
+    let rel = if o.relative { "[AR]" } else { "" };
+    let mut t = format!("{base}{rel}");
+    if o.absolute {
+        t = format!("|{t}|");
+    }
+    if o.negate {
+        t = format!("-{t}");
+    }
+    t
+}
+
+/// A text listing of a decoded program, for reading.
+pub fn listing(d: &Decoded) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::new();
+    for (n, cf) in d.cf.iter().enumerate() {
+        match cf {
+            Cf::Alu { kind, kcache, groups } => {
+                let _ = writeln!(
+                    out,
+                    "{n:3} ALU {kind:?} kcache {:?}",
+                    kcache.iter().filter(|k| k.mode != 0).collect::<Vec<_>>()
+                );
+                for g in groups {
+                    for i in &g.insts {
+                        let name = if i.three { crate::ops::op3(i.op) } else { crate::ops::op2(i.op) }.map_or("?", |t| t.1);
+                        let used = if i.three { 3 } else { 2 };
+                        let srcs: Vec<String> = i.src[..used].iter().map(|s| source_text(s, &g.literals)).collect();
+                        let _ = writeln!(
+                            out,
+                            "      {}{} {}R{}{}.{} <- {}{}{}",
+                            if i.last { "" } else { "  " },
+                            name,
+                            if i.write { "" } else { "(nowrite) " },
+                            i.dst_gpr,
+                            if i.dst_relative { "[AR]" } else { "" },
+                            ['x', 'y', 'z', 'w'][(i.dst_channel & 3) as usize],
+                            srcs.join(", "),
+                            if i.omod != 0 { format!(" omod{}", i.omod) } else { String::new() },
+                            if i.clamp { " clamp" } else { "" },
+                        );
+                    }
+                }
+            }
+            Cf::Fetch { vertex, fetches } => {
+                let _ = writeln!(out, "{n:3} {} clause", if *vertex { "VTX" } else { "TEX" });
+                for f in fetches {
+                    let _ = writeln!(
+                        out,
+                        "      fetch inst {:#x} res {} smp {} offset {} mega {} src R{}{:?} -> R{}{:?} fmt {} num {}",
+                        f.inst,
+                        f.resource,
+                        f.sampler,
+                        f.vtx_offset,
+                        f.mega_fetch_count,
+                        f.src_gpr,
+                        f.src_sel,
+                        f.dst_gpr,
+                        f.dst_sel,
+                        f.data_format,
+                        f.num_format
+                    );
+                }
+            }
+            other => {
+                let _ = writeln!(out, "{n:3} {other:?}");
+            }
+        }
+    }
+    out
+}
+
+/// How many dwords of a ring a program writes: the furthest end of its ring writes (a geometry shader's tells how many vertices it emits).
+pub fn ring_extent(d: &Decoded) -> u32 {
+    d.cf.iter()
+        .filter_map(|c| match c {
+            Cf::Ring { array_base, burst, .. } => Some(array_base + 4 * burst),
+            _ => None,
+        })
+        .max()
+        .unwrap_or(0)
 }
