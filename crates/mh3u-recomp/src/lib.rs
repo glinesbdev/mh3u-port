@@ -834,19 +834,46 @@ pub fn switch_tables(start: u32, words: &[u32]) -> BTreeMap<u32, u32> {
         let Some(m) = (i.saturating_sub(3)..i).rev().find(|&j| words[j] & 0xfc1f_ffff == 0x7c09_03a6) else {
             continue;
         };
-        let rs = (words[m] >> 21) & 31;
-        // the address in the register is built by an addis and an addi
-        let (mut lo, mut hi) = (None, None);
-        for j in (i.saturating_sub(12)..m).rev() {
-            let v = words[j];
-            if v >> 26 == 14 && (v >> 21) & 31 == rs && (v >> 16) & 31 == rs && lo.is_none() {
-                lo = Some(i32::from(v as i16));
-            } else if v >> 26 == 15 && (v >> 21) & 31 == rs && hi.is_none() && lo.is_some() {
-                hi = Some(i32::from(v as i16) << 16);
+        // the table's address is built by `lis` and `addi`/`addic`/`ori` in some register (then added to the scaled index, or not)
+        // for each register: a value known outright, or a known part added to something unknown (the index)
+        let mut known: [Option<u32>; 32] = [None; 32];
+        let mut part: [Option<u32>; 32] = [None; 32];
+        let mut built = false;
+        for &v in &words[i.saturating_sub(16)..m] {
+            let (op, rd, ra, imm) = (v >> 26, ((v >> 21) & 31) as usize, ((v >> 16) & 31) as usize, i32::from(v as i16));
+            let (k, p) = match op {
+                15 if ra == 0 => (Some((imm << 16) as u32), None),
+                15 => (
+                    known[ra].map(|x| x.wrapping_add((imm << 16) as u32)),
+                    Some(
+                        part[ra]
+                            .or(known[ra].map(|_| 0))
+                            .map_or((imm << 16) as u32, |x| x.wrapping_add((imm << 16) as u32)),
+                    ),
+                ),
+                14 if ra == 0 => (Some(imm as u32), None),
+                14 | 12 => (
+                    known[ra].map(|x| x.wrapping_add(imm as u32)),
+                    part[ra].map(|x| x.wrapping_add(imm as u32)),
+                ),
+                // ori rA, rS, imm: the destination is in the second field
+                24 => {
+                    let (rs, dest) = (rd, ra);
+                    known[dest] = known[rs].map(|x| x | (v & 0xffff));
+                    part[dest] = part[rs].map(|x| x | (v & 0xffff));
+                    continue;
+                }
+                // other instructions that write their first field
+                13 | 7 | 8 | 10 | 11 | 31 | 32..=35 | 40..=43 | 46 | 20..=23 | 28 | 29 => (None, None),
+                _ => continue,
+            };
+            known[rd] = k;
+            part[rd] = p;
+            if k == Some(addr + 4) || p == Some(addr + 4) {
+                built = true;
             }
         }
-        let (Some(lo), Some(hi)) = (lo, hi) else { continue };
-        if (hi + lo) as u32 != addr + 4 {
+        if !built {
             continue;
         }
         let run = words[i + 1..].iter().take_while(|&&x| x >> 26 == 18 && x & 3 == 0).count() as u32;

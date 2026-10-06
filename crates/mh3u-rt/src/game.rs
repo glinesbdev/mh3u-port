@@ -28,6 +28,8 @@ pub struct DataImport {
 }
 
 pub struct Options {
+    /// Where the game's files are.
+    pub roots: crate::fs::Roots,
     pub data_imports: Vec<DataImport>,
     /// Where the entry point is.
     pub entry: u32,
@@ -172,6 +174,19 @@ extern "C" fn import(c: *mut Ctx, number: u32) {
 }
 
 extern "C" fn unknown_call(c: *mut Ctx, target: u32) {
+    if (kernel::DYNAMIC_BASE..kernel::DYNAMIC_BASE + 0x1_0000).contains(&target) {
+        let n = ((target - kernel::DYNAMIC_BASE) / 4) as usize;
+        let mut guard = lock();
+        let k = guard.as_mut().expect("the kernel is set while the game runs");
+        if let Some(name) = k.dynamic.get(n) {
+            if k.report.trace {
+                eprintln!("[{}] (dynamic) {name}", k.current);
+            }
+            // SAFETY: `c` is the context the translated code passed us
+            unsafe { (*c).r[3] = 0 };
+            return;
+        }
+    }
     stop(c, format!("a call to {target:#x}, which is not a translated function"));
 }
 
@@ -229,7 +244,11 @@ pub fn spawn(k: &Kernel, t: usize) {
 }
 
 /// Runs the game's entry point from the translated library at `library`, with `pieces` put in the guest's memory first.
-pub fn run(library: &Path, pieces: &[Piece], options: &Options) -> Result<Report> {
+pub fn run(library: &Path, pieces: &[Piece], options: Options) -> Result<Report> {
+    let mut options_roots = crate::fs::Roots::default();
+    let mut options = options;
+    std::mem::swap(&mut options_roots, &mut options.roots);
+    let options = &options;
     let mut memory = memmap2::MmapOptions::new()
         .len(1 << 32)
         .map_anon()
@@ -294,6 +313,7 @@ pub fn run(library: &Path, pieces: &[Piece], options: &Options) -> Result<Report
         started: true,
     };
     let by_addr = HashMap::from([(os.thread, 0)]);
+    let roots = std::mem::take(&mut options_roots);
     *lock() = Some(Kernel::new(
         os,
         guest,
@@ -313,6 +333,9 @@ pub fn run(library: &Path, pieces: &[Piece], options: &Options) -> Result<Report
             trace: std::env::var_os("MH3U_TRACE").is_some(),
         },
     ));
+    if let Some(k) = lock().as_mut() {
+        k.fs.roots = roots;
+    }
     let host = Host {
         import,
         unknown_call,

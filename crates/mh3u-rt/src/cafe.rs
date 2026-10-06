@@ -20,10 +20,10 @@ pub enum Handler {
 
 /// The look-up of an import by its "library:function" name.
 pub fn find(name: &str) -> Option<Handler> {
-    if let Some(h) = crate::sync::find(name) {
+    if let Some(h) = crate::sync::find(name).or_else(|| crate::fs::find(name)) {
         return Some(Handler::Kernel(h));
     }
-    simple(name).map(Handler::Simple)
+    simple(name).or_else(|| crate::gx2::find(name)).map(Handler::Simple)
 }
 
 fn simple(name: &str) -> Option<SimpleHandler> {
@@ -274,7 +274,7 @@ impl Os {
         self.make_heap(g, start, size)
     }
 
-    /// The heap that covers a whole memory: 0 is MEM1, 1 is MEM2, 5 is the foreground bucket.
+    /// The heap that covers a whole memory: 0 is MEM1, 1 is MEM2, 8 is the foreground bucket.
     fn base_heap(&mut self, g: &Guest, arena: u32) -> u32 {
         if let Some(&h) = self.base.get(&arena) {
             return h;
@@ -282,7 +282,7 @@ impl Os {
         let (start, size) = match arena {
             0 => MEM1,
             1 => MEM2,
-            5 => FOREGROUND,
+            5 | 8 => FOREGROUND,
             _ => return 0,
         };
         let h = self.make_heap(g, start, size);

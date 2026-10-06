@@ -64,6 +64,21 @@ pub fn find(name: &str) -> Option<KernelHandler> {
             done(c, u32::from(ended))
         },
         "coreinit:exit" | "coreinit:_Exit" | "coreinit:abort" => |_, c| Step::Stop(format!("the game called exit({})", c.r[3] as i32)),
+        // modules loaded at run time are all "found"; what they export are functions that do nothing and return 0
+        "coreinit:OSDynLoad_Acquire" => |k, c| {
+            k.guest.put_u32(c.r[4], 1);
+            done(c, 0)
+        },
+        "coreinit:OSDynLoad_FindExport" => |k, c| {
+            let name = k.guest.cstr(c.r[5]);
+            let n = k.dynamic.iter().position(|d| *d == name).unwrap_or_else(|| {
+                k.dynamic.push(name);
+                k.dynamic.len() - 1
+            });
+            k.guest.put_u32(c.r[6], crate::kernel::DYNAMIC_BASE + 4 * n as u32);
+            done(c, 0)
+        },
+        "coreinit:OSDynLoad_Release" => |_, _| Step::Done,
         "coreinit:OSYieldThread" => |_, _| Step::Yield,
         "coreinit:OSSleepTicks" => |k, c| {
             let me = k.current;

@@ -65,6 +65,7 @@ pub struct Queue {
 /// Everything the system functions share.
 pub struct Kernel {
     pub os: Os,
+    pub fs: crate::fs::Fs,
     pub guest: Guest,
     pub threads: Vec<Thread>,
     pub by_addr: HashMap<u32, usize>,
@@ -75,6 +76,8 @@ pub struct Kernel {
     pub events: HashMap<u32, (bool, bool)>,
     pub semaphores: HashMap<u32, i32>,
     pub queues: HashMap<u32, Queue>,
+    /// Functions found by name at run time (`OSDynLoad_FindExport`): a call to `DYNAMIC_BASE + 4 * n` is a call to the n-th of these.
+    pub dynamic: Vec<String>,
     /// How the translated library is called, for the threads made later.
     pub call: unsafe extern "C" fn(*mut Ctx, u32) -> i32,
     pub memory: *mut u8,
@@ -101,6 +104,9 @@ pub struct Reporting {
     pub trace: bool,
 }
 
+/// Where the calls to functions found by name at run time go (no code is there).
+pub const DYNAMIC_BASE: u32 = 0x0330_0000;
+
 pub static KERNEL: Mutex<Option<Kernel>> = Mutex::new(None);
 pub static BATON: Condvar = Condvar::new();
 
@@ -126,6 +132,7 @@ impl Kernel {
     ) -> Kernel {
         Kernel {
             os,
+            fs: crate::fs::Fs::default(),
             guest,
             threads,
             by_addr,
@@ -134,6 +141,7 @@ impl Kernel {
             events: HashMap::new(),
             semaphores: HashMap::new(),
             queues: HashMap::new(),
+            dynamic: Vec::new(),
             call,
             memory,
             report,

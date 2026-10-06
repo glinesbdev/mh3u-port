@@ -90,6 +90,15 @@ and the C library, `sync.rs` for threads and what they wait on) or, when none is
   `OSGetMemBound` and `OSGetForegroundBucketFreeArea`), MEM1 (0xf4000000, 32 MB) and the foreground bucket (0xe0000000, 48 MB); the
   runtime's own structures are at 0x0e000000.
 
-Result so far: the game's startup runs through its memory setup, threads, events, `ProcUIInit`, `GX2Init` and the setup of the TV and
-GamePad buffers, and stops in the graphics API: `GX2CalcSurfaceSizeAndAlignment` and the other GX2 calls are stubs, so the surface
-sizes the game then allocates are garbage. The to-do list is the `(stub)` lines of the report, in the order the game needs them.
+- **Files**: `FS*` and `SAVE*` (all synchronous: the game imports no async variant) read `/vol/content` from the update's `content` folder
+  first, then the base game's, matching names without regard to case; saves go to a folder of the owner's choosing (`--save-dir`).
+- **Graphics**: the `GX2` calls are stubs apart from the buffer and surface sizes (an approximation of the console's tiling rules, to be
+  replaced by the exact ones before textures are read). A function the game looks up by name at run time (`OSDynLoad_FindExport`) is
+  found, and calling it does nothing and returns 0 (the error-display module is the only one so far).
+- **Switch tables**: the table's address is found by following the constants (`lis`, `addi`, `addic`, `ori`) in the 16 instructions
+  before the `mtctr`; 1,102 tables in the game (the first rule, `addis`/`addi` into the register of the `mtctr`, found only 510).
+
+Result so far: the game starts, sets up its memory and threads, reads its archives from the owner's files, runs its render loop
+(`GX2DrawEx`, texture and sampler binds, copies to the scan buffer: hundreds of frames) and stops only at the limit on system calls
+that `run` sets. Nothing is drawn on a screen yet: every `GX2` call is a stub that does nothing. The to-do list is the `(stub)`
+lines of the report, most-called first.

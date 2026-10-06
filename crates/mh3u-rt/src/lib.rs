@@ -5,11 +5,14 @@
 //! owner's own files at run time; nothing of it is in this repository.
 
 mod cafe;
+mod fs;
 mod game;
 mod guest;
+mod gx2;
 mod kernel;
 mod sync;
 
+pub use fs::Roots;
 pub use game::{DataImport, Options, Report, run};
 
 /// The registers of a core, laid out as the translated C's `Ctx` (`ppc.h`); the library's size for it is checked when it is loaded.

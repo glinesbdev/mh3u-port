@@ -47,6 +47,9 @@ enum Tool {
     Run {
         game_dir: PathBuf,
         c_dir: PathBuf,
+        /// Where the game's saves go.
+        #[arg(long)]
+        save_dir: Option<PathBuf>,
         /// How many system calls to allow before stopping.
         #[arg(long, default_value_t = 100_000)]
         max_imports: u64,
@@ -218,8 +221,12 @@ fn main() -> Result<()> {
         Tool::Run {
             game_dir,
             c_dir,
+            save_dir,
             max_imports,
-        } => run_game(&dump(&game_dir)?, &c_dir, max_imports),
+        } => {
+            let save = save_dir.unwrap_or_else(|| c_dir.join("save"));
+            run_game(&dump(&game_dir)?, &c_dir, max_imports, save)
+        }
         Tool::Disasm { game_dir, start, count } => {
             let data = read(&dump(&game_dir)?.executable()?)?;
             let text = rpx::section_at(&data, TEXT_ADDRESS)?;
@@ -751,7 +758,7 @@ fn patch_import_addresses(rpx_data: &[u8], words: &mut [u32], imports: &Imports)
     Ok(())
 }
 
-fn run_game(dump: &Dump, c_dir: &Path, max_imports: u64) -> Result<()> {
+fn run_game(dump: &Dump, c_dir: &Path, max_imports: u64, save: PathBuf) -> Result<()> {
     let data = read(&dump.executable()?)?;
     let entry = u32::from_be_bytes(data.get(0x18..0x1c).context("short file")?.try_into()?);
     let mut pieces = Vec::new();
@@ -769,14 +776,20 @@ fn run_game(dump: &Dump, c_dir: &Path, max_imports: u64) -> Result<()> {
     }
     let library = c_dir.join(build_game::LIBRARY);
     let text = rpx::section_at(&data, TEXT_ADDRESS)?;
+    let mut content: Vec<PathBuf> = Vec::new();
+    if let Some(u) = &dump.update {
+        content.push(u.join("content"));
+    }
+    content.push(dump.base.join("content"));
     let options = mh3u_rt::Options {
+        roots: mh3u_rt::Roots { content, save },
         data_imports: import_targets(&data, &text)?.data,
         entry,
         max_imports,
         stack_top: 0xa010_0000,
         stack_size: 0x10_0000,
     };
-    let report = mh3u_rt::run(&library, &pieces, &options)?;
+    let report = mh3u_rt::run(&library, &pieces, options)?;
     println!("{}", report.end);
     for (name, n) in &report.imports {
         println!("  {n:>8}  {name}");
