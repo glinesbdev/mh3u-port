@@ -70,8 +70,26 @@ The 82,209 functions become 412 C files of 200 functions (247 MB, written in 2 s
 host as an import), and the hooks that route `rt_*` to the host. Every file passes `clang -fsyntax-only`.
 
 `build-game` compiles the files on every core into a shared library (`libgame.so` / `game.dll`): 41 s at `-O0` on 24 cores.
-`run` is the first runtime (`mh3u-rt`, the only crate with `unsafe`): it reserves the guest's 4 GiB address space, puts the
-executable's sections in it, loads the library, gives it a stack and calls the entry point. Every system function is for now a
-stub that returns 0 and is logged in order of first call. First result: the game's startup runs through 36 distinct system
-functions (heap, mutexes, file system, save, system config) and then calls a null pointer, since the heap allocator returned 0.
-The list of functions that need real code, in the order the game wants them, is the to-do list for the Cafe OS layer.
+
+## Running it (`mh3u-rt`, `mh3u-tools run`)
+
+`mh3u-rt` is the only crate with `unsafe`. It reserves the guest's 4 GiB address space, puts the executable's sections in it, loads the
+library, and runs the entry point; every system function the game imports is a handler written in Rust (`cafe.rs` for memory, heaps
+and the C library, `sync.rs` for threads and what they wait on) or, when none is written yet, a stub that returns 0 and shows as
+`(stub)` in the report. `MH3U_TRACE=1` prints every system call with its result.
+
+- **Threads** are host threads but only one runs guest code at a time: it holds a baton and passes it on when a system function has to
+  wait (locked mutex, unset event, sleep), yields, or ends. A waiting function is run again when its thread gets the baton back.
+  This makes runs repeatable; the cost is that a thread that waits by spinning on memory, never calling the system, would hold the
+  baton forever, and that all guest threads share one core of the host for now.
+- **Data imports** (variables the loader fills in, such as the default-heap function pointers) get an address the runtime treats as the
+  function's entry, so a call through them reaches the same handler.
+- **Relocations of the code**: the file holds stale halves in the `lis`/`addi`/`lwz` that build the address of an import; the
+  translator patches them from the relocations (types 4 and 6) before translating.
+- **Guest memory**: MEM2 (the application's, 0x10800000, 1.14 GB; the game asks for all of it, less a margin it computes from
+  `OSGetMemBound` and `OSGetForegroundBucketFreeArea`), MEM1 (0xf4000000, 32 MB) and the foreground bucket (0xe0000000, 48 MB); the
+  runtime's own structures are at 0x0e000000.
+
+Result so far: the game's startup runs through its memory setup, threads, events, `ProcUIInit`, `GX2Init` and the setup of the TV and
+GamePad buffers, and stops in the graphics API: `GX2CalcSurfaceSizeAndAlignment` and the other GX2 calls are stubs, so the surface
+sizes the game then allocates are garbage. The to-do list is the `(stub)` lines of the report, in the order the game needs them.

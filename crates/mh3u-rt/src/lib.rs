@@ -4,9 +4,13 @@
 //! code indexes with 32-bit guest addresses) and the calls into the translated library. Everything the game is made of comes from the
 //! owner's own files at run time; nothing of it is in this repository.
 
+mod cafe;
 mod game;
+mod guest;
+mod kernel;
+mod sync;
 
-pub use game::{Options, Report, run};
+pub use game::{DataImport, Options, Report, run};
 
 /// The registers of a core, laid out as the translated C's `Ctx` (`ppc.h`); the library's size for it is checked when it is loaded.
 #[repr(C)]

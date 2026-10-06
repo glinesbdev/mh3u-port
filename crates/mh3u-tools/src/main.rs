@@ -28,6 +28,14 @@ enum Tool {
     Sections { game_dir: PathBuf },
     /// Find where the functions of the executable start (calls, code pointers in the data, the entry point) and say how many.
     Functions { game_dir: PathBuf },
+    /// Print instructions of the code with their fields (for finding out what the code is doing; not a full disassembler).
+    Disasm {
+        game_dir: PathBuf,
+        /// The address to start at, in hex.
+        start: String,
+        #[arg(default_value_t = 24)]
+        count: u32,
+    },
     /// Compile the C that `translate` wrote into a library, OUT/libgame.so (or .dll), using every core.
     BuildGame {
         c_dir: PathBuf,
@@ -178,7 +186,7 @@ fn main() -> Result<()> {
         Tool::Translate { game_dir, out, per_file } => {
             let data = read(&dump(&game_dir)?.executable()?)?;
             let text = rpx::section_at(&data, TEXT_ADDRESS)?;
-            let words: Vec<u32> = text.as_chunks::<4>().0.iter().map(|w| u32::from_be_bytes(*w)).collect();
+            let mut words: Vec<u32> = text.as_chunks::<4>().0.iter().map(|w| u32::from_be_bytes(*w)).collect();
             let entry = u32::from_be_bytes(data.get(0x18..0x1c).context("short file")?.try_into()?);
             let mut pointers = Vec::new();
             for s in rpx::sections(&data)? {
@@ -187,7 +195,8 @@ fn main() -> Result<()> {
                     pointers.extend(body.as_chunks::<4>().0.iter().map(|w| u32::from_be_bytes(*w)));
                 }
             }
-            let (names, targets) = import_targets(&data, &text)?;
+            let imports = import_targets(&data, &text)?;
+            patch_import_addresses(&data, &mut words, &imports)?;
             let end = TEXT_ADDRESS + 4 * words.len() as u32;
             pointers.extend(rpx::relocation_targets(&data, TEXT_ADDRESS, end)?);
             let r = translate::run(
@@ -196,8 +205,8 @@ fn main() -> Result<()> {
                     base: TEXT_ADDRESS,
                     pointers: &pointers,
                     entry,
-                    imports: &names,
-                    targets: &targets,
+                    imports: &imports.names,
+                    targets: &imports.targets,
                 },
                 &out,
                 per_file,
@@ -211,6 +220,33 @@ fn main() -> Result<()> {
             c_dir,
             max_imports,
         } => run_game(&dump(&game_dir)?, &c_dir, max_imports),
+        Tool::Disasm { game_dir, start, count } => {
+            let data = read(&dump(&game_dir)?.executable()?)?;
+            let text = rpx::section_at(&data, TEXT_ADDRESS)?;
+            let start = u32::from_str_radix(start.trim_start_matches("0x"), 16)?;
+            for k in 0..count {
+                let at = start + 4 * k;
+                let o = at.wrapping_sub(TEXT_ADDRESS) as usize;
+                let Some(w) = text.get(o..o + 4) else { break };
+                let w = u32::from_be_bytes(w.try_into()?);
+                let line = match mh3u_ppc::Insn::decode(w) {
+                    Some(i) => format!(
+                        "{:<10} rd/rs={} ra={} rb={} simm={} uimm={:#x} bo={} bi={}",
+                        i.op.name(),
+                        i.rd(),
+                        i.ra(),
+                        i.rb(),
+                        i.simm(),
+                        i.uimm(),
+                        i.bo(),
+                        i.bi()
+                    ),
+                    None => "?".to_string(),
+                };
+                println!("{at:#x}  {w:08x}  {line}");
+            }
+            Ok(())
+        }
         Tool::Functions { game_dir } => functions(&dump(&game_dir)?),
         Tool::Coverage { game_dir, unknown } => coverage(&dump(&game_dir)?, unknown),
         Tool::Imports { game_dir, names } => imports(&dump(&game_dir)?, names),
@@ -620,15 +656,29 @@ fn functions(dump: &Dump) -> Result<()> {
     Ok(())
 }
 
-/// The import trampolines: the address of each (where a call to an import goes) and the names of the imports ("library:function"), in
-/// the order of the symbol table. The calls in the code name their import through the relocations; the trampolines of all the others
-/// follow from those, since they sit at the same distance from the symbols' own addresses.
-fn import_targets(rpx_data: &[u8], text: &[u8]) -> Result<(Vec<String>, std::collections::BTreeMap<u32, u32>)> {
+/// The imports of the executable as the translation and the run need them.
+struct Imports {
+    /// "library:function" for every import, functions and data, in the order of the symbol table; a call names its import by the index.
+    names: Vec<String>,
+    /// Where calls to an import go (the loader's trampolines), and the index of the import.
+    targets: std::collections::BTreeMap<u32, u32>,
+    /// For every import, where the loader puts it: the trampoline of a function, the variable of data (none when it is not known).
+    addresses: Vec<Option<u32>>,
+    /// The variables the loader fills in: where each is, the address a call through it goes to, and its name.
+    data: Vec<mh3u_rt::DataImport>,
+}
+
+/// Where the runtime's own call targets begin: the address a data import that holds a function points at (no code is there).
+const DATA_IMPORT_TARGETS: u32 = 0x0320_0000;
+
+/// The relocations of `.text` say which import each call means, and the trampolines of one library are all at the same distance from
+/// their symbols' own addresses, so the trampolines of the imports no call names follow from those.
+fn import_targets(rpx_data: &[u8], text: &[u8]) -> Result<Imports> {
     let symbols = rpx::import_addresses(rpx_data)?;
     let names: Vec<String> = symbols.iter().map(|(i, _)| format!("{}:{}", i.library, i.name)).collect();
-    // each library's trampolines are at one distance from the library's symbols
     let mut shift: std::collections::BTreeMap<String, u32> = std::collections::BTreeMap::new();
-    for (site, import) in rpx::import_sites(rpx_data)? {
+    for s in rpx::import_sites(rpx_data)?.into_iter().filter(|s| s.kind == 10) {
+        let (site, import) = (s.address, s.import);
         let at = site.wrapping_sub(TEXT_ADDRESS) as usize;
         let Some(w) = text.get(at..at + 4) else { continue };
         let w = u32::from_be_bytes(w.try_into()?);
@@ -638,7 +688,7 @@ fn import_targets(rpx_data: &[u8], text: &[u8]) -> Result<(Vec<String>, std::col
         let target = site.wrapping_add((((w & 0x03ff_fffc) as i32) << 6 >> 6) as u32);
         let value = symbols
             .iter()
-            .find(|(i, _)| i.library == import.library && i.name == import.name)
+            .find(|(i, _)| i.library == import.library && i.name == import.name && i.kind == rpx::ImportKind::Function)
             .map(|(_, v)| *v)
             .with_context(|| format!("no symbol for the import {}:{}", import.library, import.name))?;
         let this = target.wrapping_sub(value);
@@ -648,12 +698,57 @@ fn import_targets(rpx_data: &[u8], text: &[u8]) -> Result<(Vec<String>, std::col
             import.library
         );
     }
-    let targets = symbols
-        .iter()
-        .enumerate()
-        .filter_map(|(n, (i, v))| shift.get(&i.library).map(|s| (v.wrapping_add(*s), n as u32)))
-        .collect();
-    Ok((names, targets))
+    let mut targets = std::collections::BTreeMap::new();
+    let mut data = Vec::new();
+    let mut addresses = vec![None; symbols.len()];
+    for (n, (i, v)) in symbols.iter().enumerate() {
+        let Some(s) = shift.get(&i.library) else { continue };
+        addresses[n] = Some(v.wrapping_add(*s));
+        if i.kind == rpx::ImportKind::Function {
+            targets.insert(v.wrapping_add(*s), n as u32);
+        } else {
+            let target = DATA_IMPORT_TARGETS + 4 * n as u32;
+            targets.insert(target, n as u32);
+            data.push(mh3u_rt::DataImport {
+                slot: v.wrapping_add(*s),
+                target,
+                name: format!("{}:{}", i.library, i.name),
+            });
+        }
+    }
+    Ok(Imports {
+        names,
+        targets,
+        addresses,
+        data,
+    })
+}
+
+/// The code as the loader leaves it: an instruction that builds the address of an import (`lis`/`addi`, `lis`/`lwz`...) has the address's
+/// halves patched in, and the file holds other values there.
+fn patch_import_addresses(rpx_data: &[u8], words: &mut [u32], imports: &Imports) -> Result<()> {
+    let symbols = rpx::import_addresses(rpx_data)?;
+    for s in rpx::import_sites(rpx_data)? {
+        if s.kind != 4 && s.kind != 6 {
+            continue;
+        }
+        let n = symbols
+            .iter()
+            .position(|(i, _)| *i == s.import)
+            .with_context(|| format!("no symbol for {}", s.import.name))?;
+        let Some(address) = imports.addresses[n] else { continue };
+        let target = address.wrapping_add(s.addend as u32);
+        let Some(w) = words.get_mut((s.address.wrapping_sub(TEXT_ADDRESS) / 4) as usize) else {
+            continue;
+        };
+        let half = if s.kind == 4 {
+            target & 0xffff
+        } else {
+            (target.wrapping_add(0x8000) >> 16) & 0xffff
+        };
+        *w = (*w & 0xffff_0000) | half;
+    }
+    Ok(())
 }
 
 fn run_game(dump: &Dump, c_dir: &Path, max_imports: u64) -> Result<()> {
@@ -673,7 +768,9 @@ fn run_game(dump: &Dump, c_dir: &Path, max_imports: u64) -> Result<()> {
         });
     }
     let library = c_dir.join(build_game::LIBRARY);
+    let text = rpx::section_at(&data, TEXT_ADDRESS)?;
     let options = mh3u_rt::Options {
+        data_imports: import_targets(&data, &text)?.data,
         entry,
         max_imports,
         stack_top: 0xa010_0000,

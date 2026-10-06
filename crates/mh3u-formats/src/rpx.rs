@@ -216,7 +216,8 @@ pub fn imports(rpx: &[u8]) -> Result<Vec<Import>> {
     Ok(out)
 }
 
-/// Every imported function with the address its symbol gives (the address its calls go to).
+/// Every import, function or data, with the address its symbol gives (for a function, the address its calls go to before the loader's
+/// shift; for data, where the variable is).
 pub fn import_addresses(rpx: &[u8]) -> Result<Vec<(Import, u32)>> {
     let all = sections(rpx)?;
     let mut out = Vec::new();
@@ -233,28 +234,43 @@ pub fn import_addresses(rpx: &[u8]) -> Result<Vec<(Import, u32)>> {
                 be16(sym, 14).unwrap_or(0),
             );
             let Some(home) = all.get(shndx) else { continue };
-            let Some(library) = home.name.strip_prefix(".fimport_") else {
+            let (kind, library) = if let Some(l) = home.name.strip_prefix(".fimport_") {
+                (ImportKind::Function, l)
+            } else if let Some(l) = home.name.strip_prefix(".dimport_") {
+                (ImportKind::Data, l)
+            } else {
                 continue;
             };
             let name = cstr(&strtab, name);
             if name.is_empty() || name.starts_with('.') {
                 continue;
             }
-            let import = Import {
-                library: library.to_string(),
-                name,
-                kind: ImportKind::Function,
-            };
-            out.push((import, value));
+            out.push((
+                Import {
+                    library: library.to_string(),
+                    name,
+                    kind,
+                },
+                value,
+            ));
         }
     }
     out.sort();
     Ok(out)
 }
 
-/// The places in the code that name an import: the address of the instruction and the import (found through the relocations of
-/// `.text`, whose symbols are the imports).
-pub fn import_sites(rpx: &[u8]) -> Result<Vec<(u32, Import)>> {
+/// A place in the code that names an import: the address of the instruction, how the relocation uses the import's address (10 is a
+/// branch, 4 and 6 are the low and high halves of an address built by two instructions), the import and the addend.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImportSite {
+    pub address: u32,
+    pub kind: u32,
+    pub import: Import,
+    pub addend: i32,
+}
+
+/// Found through the relocations of `.text`, whose symbols are the imports.
+pub fn import_sites(rpx: &[u8]) -> Result<Vec<ImportSite>> {
     let all = sections(rpx)?;
     let Some(symtab) = all.iter().find(|s| s.kind == SHT_SYMTAB) else {
         return Ok(Vec::new());
@@ -267,28 +283,38 @@ pub fn import_sites(rpx: &[u8]) -> Result<Vec<(u32, Import)>> {
     let mut out = Vec::new();
     for rela in all.iter().filter(|s| s.name == ".rela.text") {
         for entry in contents(rpx, rela)?.as_chunks::<12>().0 {
-            let (site, info) = (be32(entry, 0).unwrap_or(0), be32(entry, 4).unwrap_or(0));
+            let (site, info, addend) = (
+                be32(entry, 0).unwrap_or(0),
+                be32(entry, 4).unwrap_or(0),
+                be32(entry, 8).unwrap_or(0) as i32,
+            );
             let Some(sym) = symbols.as_chunks::<SYMBOL>().0.get((info >> 8) as usize) else {
                 continue;
             };
             let Some(home) = all.get(be16(sym, 14).unwrap_or(0)) else {
                 continue;
             };
-            let Some(library) = home.name.strip_prefix(".fimport_") else {
+            let (kind, library) = if let Some(l) = home.name.strip_prefix(".fimport_") {
+                (ImportKind::Function, l)
+            } else if let Some(l) = home.name.strip_prefix(".dimport_") {
+                (ImportKind::Data, l)
+            } else {
                 continue;
             };
             let name = cstr(&strtab, be32(sym, 0).unwrap_or(0) as usize);
             if name.is_empty() || name.starts_with('.') {
                 continue;
             }
-            out.push((
-                site,
-                Import {
+            out.push(ImportSite {
+                address: site,
+                kind: info & 0xff,
+                import: Import {
                     library: library.to_string(),
                     name,
-                    kind: ImportKind::Function,
+                    kind,
                 },
-            ));
+                addend,
+            });
         }
     }
     Ok(out)
