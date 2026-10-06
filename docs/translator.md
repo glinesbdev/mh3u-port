@@ -118,8 +118,7 @@ made the call, so it reads the guest's memory at the moment of the call and need
 for the next frame) blocks there, with the other guest threads waiting.
 
 **What it draws now**: the game reaches its character screen and the backend draws it, textured: the hunter model, the UI panels
-with their text and the cloth background, upright, in the right places (a few of the hunter's textures are still wrong: white
-speckles on the clothing). The pieces:
+with their text and the cloth background, upright, in the right places (the hunter's clothing still shows white speckles: not understood yet). The pieces:
 
 - **State**: every `GX2Set*` call is recorded into the state of the current context (`GX2SetContextState`/`GX2SetupContextStateEx`
   switch between them); display lists (`GX2BeginDisplayListEx`...) are recorded and replayed with their arguments.
@@ -143,10 +142,13 @@ speckles on the clothing). The pieces:
   AMD's R6xx/R7xx address library (MIT, Copyright 2014 Advanced Micro Devices, Inc.) that maps coordinates to addresses and sizes
   surfaces; the order of steps of the surface size call and the rule for resolving the default tile mode are facts read from the
   decaf-emu sources, not copied. The memory configuration (2 pipes, 4 banks, 256-byte interleave, 2 KiB rows) is assumed from the
-  result: the text and the cloth only come out right with it. Only level 0 is read so far.
+  result: the text and the cloth only come out right with it. Every mip level is read (level 1 at the mip pointer, level n at the pointer plus
+  the n-th offset of the header) and the sampler's filters and level-of-detail range are used. A cube map is a texture of six layers, read as
+  an array: the `CUBE` instruction (which turns a direction into a face number and the face's own coordinates) is done in the shader, so the
+  lookup uses the face and coordinates as the hardware does.
 
-**Not done yet:** mipmaps, cube maps and 3D textures, the rest of the sampler state, alpha
-test and stencil, depth bias, other geometry inputs (lines, triangles, instances), `CUBE` in shaders, loops and relative
+**Not done yet:** 3D textures, the component selectors of a texture (`compMap`), the rest of the sampler state (borders, the mip bias), alpha
+test and stencil, depth bias, other geometry inputs (lines, triangles, instances), loops and relative
 addressing in vertex shaders, rects and other primitive types, stream out, the second render target (the GamePad's picture is
 drawn but not shown), and speed: every draw makes its own buffers and render pass.
 
@@ -168,8 +170,8 @@ predication per instruction, and uniform blocks indexed at run time through `VFE
 `translate_pixel` turns a decoded program into WGSL: registers are `vec4<f32>` holding raw bits, each group reads the registers as they
 were before it and writes together afterwards, `pv`/`ps` are the previous group's results, the exec-mask stack is a stack of booleans
 (a lane that is not active writes nothing), and texture fetches run for every lane so derivatives stay defined (`diagnostic(off,
-derivative_uniformity)`). **572 of the 579 different pixel programs become WGSL that naga validates** (`mh3u-tools latte-wgsl`); the
-other 7 use `CUBE` (not written: its output convention has to be worked out with a cube-map shader to look at). Whether a translated
+derivative_uniformity)`). **All 579 different pixel programs become WGSL that naga validates** (`mh3u-tools latte-wgsl`); `CUBE` follows the usual
+OpenGL face convention (its exact output is not checked against a cube-map picture yet). Whether a translated
 shader computes what the hardware does is not checked by anything but looking at the picture: the semantics are from the documents,
 so an operation the translator does not know is an error, never a guess.
 Vertex shaders are translated with the fetch shader replaced by decoded attribute streams (vertex pulling); loops and relative

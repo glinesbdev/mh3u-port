@@ -100,6 +100,19 @@ fn fi(x: i32) -> f32 { return bitcast<f32>(x); }
 fn fu(x: u32) -> f32 { return bitcast<f32>(x); }
 fn ii(x: f32) -> i32 { return bitcast<i32>(x); }
 fn iu(x: f32) -> u32 { return bitcast<u32>(x); }
+fn cube_face(v: vec3<f32>) -> vec4<f32> {
+    let a = abs(v);
+    if (a.x >= a.y && a.x >= a.z) {
+        if (v.x >= 0.0) { return vec4<f32>(-v.y, -v.z, 2.0 * a.x, 0.0); }
+        return vec4<f32>(-v.y, v.z, 2.0 * a.x, 1.0);
+    }
+    if (a.y >= a.z) {
+        if (v.y >= 0.0) { return vec4<f32>(v.z, v.x, 2.0 * a.y, 2.0); }
+        return vec4<f32>(-v.z, v.x, 2.0 * a.y, 3.0);
+    }
+    if (v.z >= 0.0) { return vec4<f32>(-v.y, v.x, 2.0 * a.z, 4.0); }
+    return vec4<f32>(-v.y, -v.x, 2.0 * a.z, 5.0);
+}
 fn mul_dx9(a: f32, b: f32) -> f32 { if (a == 0.0 || b == 0.0) { return 0.0; } return a * b; }
 fn set_f(c: bool) -> f32 { return select(0.0, 1.0, c); }
 fn set_i(c: bool) -> f32 { return fu(select(0u, 0xffffffffu, c)); }
@@ -219,6 +232,7 @@ impl Gen<'_> {
             .iter()
             .any(|i| !i.three && ops::op2(i.op).is_some_and(|t| t.3 == Slots::Reduction));
         let mut reduction_done = false;
+        let mut cube_done = false;
         for (k, i) in g.insts.iter().enumerate() {
             let used = if i.three { 3 } else { 2 };
             let src: Vec<String> = (0..used).map(|n| self.operand_value(&i.src[n], &g.literals)).collect();
@@ -232,7 +246,21 @@ impl Gen<'_> {
                 continue;
             };
             let slot = slot_of[k];
-            let expr = if reduction && ops::op2(i.op).is_some_and(|t| t.3 == Slots::Reduction) {
+            let expr = if name == "CUBE" {
+                // the four slots hold (z, z, y, x) and (y, x, z, z); the result of slot n is component n of
+                // (t, s, twice the major axis, the face)
+                if !cube_done {
+                    cube_done = true;
+                    let mut a = |n: usize| match slot_of.iter().position(|&s| s == n) {
+                        Some(j) => self.operand_value(&g.insts[j].src[0], &g.literals),
+                        None => "0.0".to_string(),
+                    };
+                    let (x, y, z) = (a(3), a(2), a(0));
+                    let v = format!("vec3<f32>({x}, {y}, {z})");
+                    self.line(indent, &format!("let cube = cube_face({v});"));
+                }
+                format!("cube.{}", swz(slot as u32))
+            } else if reduction && ops::op2(i.op).is_some_and(|t| t.3 == Slots::Reduction) {
                 if reduction_done {
                     // every slot of the group gets the same result
                     results.push((slot, "red".to_string()));
@@ -733,7 +761,7 @@ fn translate(
         let ty = match kind {
             TexKind::D2 => "texture_2d<f32>",
             TexKind::D3 => "texture_3d<f32>",
-            TexKind::Cube => "texture_cube<f32>",
+            TexKind::Cube => "texture_2d_array<f32>",
             TexKind::Depth2d => "texture_depth_2d",
         };
         let _ = writeln!(m, "@group(2) @binding({r}) var tex{r}: {ty};");
@@ -946,7 +974,9 @@ impl Gen<'_> {
         let coords: Vec<String> = f.src_sel.iter().map(|&s| sel(s)).collect();
         let uv = match kind {
             TexKind::D2 | TexKind::Depth2d => format!("vec2<f32>({}, {})", coords[0], coords[1]),
-            TexKind::D3 | TexKind::Cube => format!("vec3<f32>({}, {}, {})", coords[0], coords[1], coords[2]),
+            TexKind::D3 => format!("vec3<f32>({}, {}, {})", coords[0], coords[1], coords[2]),
+            // a cube map is read as six layers: the coordinates are the face's own (the CUBE instruction made them)
+            TexKind::Cube => format!("vec2<f32>({}, {}), i32(floor({} + 0.5))", coords[0], coords[1], coords[2]),
         };
         let call = if compare {
             self.iface.compare_samplers.insert(f.sampler);

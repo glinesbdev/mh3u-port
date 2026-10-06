@@ -20,6 +20,10 @@ pub struct Header {
     pub tile_mode: u32,
     pub swizzle: u32,
     pub pitch: u32,
+    /// Where the smaller levels are: the pointer, its size and the offsets of levels 2 and up.
+    pub mip_ptr: u32,
+    pub mip_size: u32,
+    pub mip_offsets: [u32; 13],
     /// How the components are chosen: four selectors for red, green, blue and alpha (0 to 3 a component, 4 zero, 5 one).
     pub select: [u32; 4],
 }
@@ -39,17 +43,26 @@ impl Header {
             tile_mode: g.u32(t + 0x30),
             swizzle: g.u32(t + 0x34),
             pitch: g.u32(t + 0x3c),
+            mip_ptr: g.u32(t + 0x2c),
+            mip_size: g.u32(t + 0x28),
+            mip_offsets: std::array::from_fn(|i| g.u32(t + 0x40 + 4 * i as u32)),
             select: [(comp >> 24) & 7, (comp >> 16) & 7, (comp >> 8) & 7, comp & 7],
         }
     }
 }
 
-/// What a texture becomes on the GPU: its size, format and the bytes of level 0 (every layer, one after the other).
+/// What a texture becomes on the GPU: its size and format, and each level's bytes (every layer, one after the other).
 pub struct Decoded {
     pub width: u32,
     pub height: u32,
     pub layers: u32,
     pub format: wgpu::TextureFormat,
+    pub levels: Vec<Level>,
+}
+
+pub struct Level {
+    pub width: u32,
+    pub height: u32,
     pub bytes_per_row: u32,
     pub data: Vec<u8>,
 }
@@ -301,60 +314,71 @@ pub fn decode(g: &Guest, h: &Header) -> Result<Decoded, String> {
     };
     let height = if h.dim == 0 { 1 } else { h.height.max(1) };
     let block = info.block;
-    let (bw, bh) = (h.width.div_ceil(block), height.div_ceil(block));
-    let elem_bytes = (info.bits / 8) as usize;
-    // the pitch in the header counts texels; the layout works in elements
-    let pitch = (h.pitch.max(h.width)).div_ceil(block);
     let (pipe_swizzle, bank_swizzle) = tiling::swizzles(h.swizzle);
-    // the size as laid out, by the same rules the game's own size calculation used
-    let laid = tiling::surface_info(&tiling::Request {
-        mode,
-        bits_per_element: info.bits,
-        compressed: block > 1,
-        width: h.width,
-        height,
-        slices: if h.dim == 3 { layers } else { 1 },
-        samples: 1,
-        level: 0,
-        cube: h.dim == 3,
-        depth: false,
-        display: false,
-    });
-    let surface = Surface {
-        mode: laid.mode,
-        bits_per_element: info.bits,
-        pitch: pitch.max(laid.pitch),
-        height: laid.height,
-        samples: 1,
-        depth: false,
-        pipe_swizzle,
-        bank_swizzle,
-    };
-    let mut data = Vec::new();
+    let elem_bytes = (info.bits / 8) as usize;
+    let max_levels = 32 - h.width.max(height).leading_zeros();
+    let count = h.mips.clamp(1, max_levels);
+    let mut levels = Vec::new();
     let mut element = vec![0u8; elem_bytes];
-    let probe = u64::from(h.image_size.max(1));
-    let mut out_of_range = 0u32;
-    for layer in 0..layers {
-        for y in 0..bh {
-            for x in 0..bw {
-                let offset = tiling::address(&surface, x, y, layer, 0);
-                if offset + elem_bytes as u64 > probe * u64::from(layers.max(1)) + 4096 {
-                    out_of_range += 1;
+    for level in 0..count {
+        let (w, hgt) = ((h.width >> level).max(1), (height >> level).max(1));
+        let (bw, bh) = (w.div_ceil(block), hgt.div_ceil(block));
+        // the size as laid out, by the same rules the game's own size calculation used
+        let laid = tiling::surface_info(&tiling::Request {
+            mode,
+            bits_per_element: info.bits,
+            compressed: block > 1,
+            width: w,
+            height: hgt,
+            slices: if h.dim == 3 { layers } else { 1 },
+            samples: 1,
+            level,
+            cube: h.dim == 3,
+            depth: false,
+            display: false,
+        });
+        let base = match level {
+            0 => h.image,
+            1 => h.mip_ptr,
+            n => h.mip_ptr.wrapping_add(h.mip_offsets[n as usize - 1]),
+        };
+        if base == 0 {
+            break;
+        }
+        let surface = Surface {
+            mode: laid.mode,
+            bits_per_element: info.bits,
+            pitch: laid.pitch,
+            height: laid.height,
+            samples: 1,
+            depth: false,
+            pipe_swizzle,
+            bank_swizzle,
+        };
+        let mut data = Vec::new();
+        for layer in 0..layers {
+            for y in 0..bh {
+                for x in 0..bw {
+                    let offset = tiling::address(&surface, x, y, layer, 0);
+                    g.read(base.wrapping_add(offset as u32), &mut element);
+                    (info.convert)(&element, &mut data);
                 }
-                g.read(h.image.wrapping_add(offset as u32), &mut element);
-                (info.convert)(&element, &mut data);
             }
         }
+        let texel_bytes = data.len() / (bw * bh * layers) as usize;
+        levels.push(Level {
+            width: bw * block,
+            height: bh * block,
+            bytes_per_row: bw * texel_bytes as u32,
+            data,
+        });
     }
-    let _ = out_of_range;
-    let texel_bytes = data.len() / (bw * bh * layers) as usize;
     Ok(Decoded {
         width: h.width.next_multiple_of(block),
         height: height.next_multiple_of(block),
         layers,
         format: info.format,
-        bytes_per_row: bw * texel_bytes as u32,
-        data,
+        levels,
     })
 }
 

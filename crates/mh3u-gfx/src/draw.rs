@@ -52,6 +52,7 @@ pub struct CachedTexture {
     pub texture: wgpu::Texture,
     pub layers: u32,
     pub range: (u32, u32),
+    pub mips: (u32, u32),
 }
 
 pub struct PipelineEntry {
@@ -427,6 +428,13 @@ impl Gx2 {
             }
             match crate::texture::decode(g, &h) {
                 Ok(d) => {
+                    if let Some(dir) = std::env::var_os("MH3U_GFX_TEXDUMP") {
+                        let name = format!(
+                            "tex-{:08x}-{}x{}-f{:x}-m{}.decoded",
+                            h.image, d.width, d.height, h.format, h.tile_mode
+                        );
+                        let _ = std::fs::write(std::path::Path::new(&dir).join(name), &d.levels[0].data);
+                    }
                     let texture = self.d.device.create_texture(&wgpu::TextureDescriptor {
                         label: Some("game texture"),
                         size: wgpu::Extent3d {
@@ -434,7 +442,7 @@ impl Gx2 {
                             height: d.height,
                             depth_or_array_layers: d.layers,
                         },
-                        mip_level_count: 1,
+                        mip_level_count: d.levels.len() as u32,
                         sample_count: 1,
                         dimension: wgpu::TextureDimension::D2,
                         format: d.format,
@@ -442,27 +450,32 @@ impl Gx2 {
                         view_formats: &[],
                     });
                     let block = d.format.block_dimensions();
-                    let rows = d.height.div_ceil(block.1);
-                    self.d.queue.write_texture(
-                        texture.as_image_copy(),
-                        &d.data,
-                        wgpu::TexelCopyBufferLayout {
-                            offset: 0,
-                            bytes_per_row: Some(d.bytes_per_row),
-                            rows_per_image: Some(rows),
-                        },
-                        wgpu::Extent3d {
-                            width: d.width,
-                            height: d.height,
-                            depth_or_array_layers: d.layers,
-                        },
-                    );
+                    for (n, l) in d.levels.iter().enumerate() {
+                        self.d.queue.write_texture(
+                            wgpu::TexelCopyTextureInfo {
+                                mip_level: n as u32,
+                                ..texture.as_image_copy()
+                            },
+                            &l.data,
+                            wgpu::TexelCopyBufferLayout {
+                                offset: 0,
+                                bytes_per_row: Some(l.bytes_per_row),
+                                rows_per_image: Some(l.height.div_ceil(block.1)),
+                            },
+                            wgpu::Extent3d {
+                                width: l.width,
+                                height: l.height,
+                                depth_or_array_layers: d.layers,
+                            },
+                        );
+                    }
                     self.caches.textures.insert(
                         key,
                         CachedTexture {
                             texture,
                             layers: d.layers,
                             range: (h.image, h.image.saturating_add(h.image_size)),
+                            mips: (h.mip_ptr, h.mip_ptr.saturating_add(h.mip_size)),
                         },
                     );
                 }
@@ -478,7 +491,7 @@ impl Gx2 {
         let cached = &self.caches.textures[&key];
         Some(cached.texture.create_view(&wgpu::TextureViewDescriptor {
             dimension: Some(match kind {
-                TexKind::Cube if cached.layers == 6 => wgpu::TextureViewDimension::Cube,
+                TexKind::Cube if cached.layers > 1 => wgpu::TextureViewDimension::D2Array,
                 _ => wgpu::TextureViewDimension::D2,
             }),
             array_layer_count: Some(if kind == TexKind::Cube { 6.min(cached.layers) } else { 1 }),
@@ -488,7 +501,9 @@ impl Gx2 {
 
     pub(crate) fn invalidate_textures(&mut self, address: u32, size: u32) {
         let end = address.saturating_add(size);
-        self.caches.textures.retain(|_, t| t.range.1 <= address || t.range.0 >= end);
+        self.caches
+            .textures
+            .retain(|_, t| (t.range.1 <= address || t.range.0 >= end) && (t.mips.1 <= address || t.mips.0 >= end));
     }
 
     fn fallback_texture(&mut self, kind: TexKind) -> wgpu::TextureView {
@@ -552,7 +567,7 @@ impl Gx2 {
         texture.create_view(&wgpu::TextureViewDescriptor {
             dimension: Some(match kind {
                 TexKind::D3 => wgpu::TextureViewDimension::D3,
-                TexKind::Cube => wgpu::TextureViewDimension::Cube,
+                TexKind::Cube => wgpu::TextureViewDimension::D2Array,
                 _ => wgpu::TextureViewDimension::D2,
             }),
             ..Default::default()
@@ -1113,7 +1128,13 @@ impl Gx2 {
                 address_mode_w: crate::texture::Sampler::address_mode(d.clamp[2]),
                 mag_filter: filter(d.mag_linear),
                 min_filter: filter(d.min_linear),
-                mipmap_filter: wgpu::MipmapFilterMode::Nearest,
+                mipmap_filter: if d.mip_linear {
+                    wgpu::MipmapFilterMode::Linear
+                } else {
+                    wgpu::MipmapFilterMode::Nearest
+                },
+                lod_min_clamp: d.min_lod,
+                lod_max_clamp: d.max_lod.max(d.min_lod),
                 ..Default::default()
             });
             this.caches.samplers.insert(key, s.clone());
