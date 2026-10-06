@@ -793,7 +793,10 @@ fn assemble_pixel(m: &mut String, g: &Gen, inputs: &PixelInputs) {
             ""
         };
         let location = inputs.locations.get(i as usize).copied().unwrap_or(i);
-        let _ = writeln!(m, "    @location({location}){flat} i{i}: vec4<f32>,");
+        // an input no vertex output feeds (the location is `u32::MAX`) reads as zero
+        if location != u32::MAX {
+            let _ = writeln!(m, "    @location({location}){flat} i{i}: vec4<f32>,");
+        }
     }
     m.push_str("    @builtin(position) frag: vec4<f32>,\n}\n");
     m.push_str("struct Out {\n");
@@ -809,7 +812,8 @@ fn assemble_pixel(m: &mut String, g: &Gen, inputs: &PixelInputs) {
     m.push_str("}\n");
     m.push_str("@fragment fn main(in: In) -> Out {\n");
     for n in 0..g.max_gpr {
-        let init = if n < inputs.count {
+        let fed = inputs.locations.get(n as usize).copied().unwrap_or(n) != u32::MAX;
+        let init = if n < inputs.count && fed {
             format!("in.i{n}")
         } else {
             "vec4<f32>(0.0)".to_string()
