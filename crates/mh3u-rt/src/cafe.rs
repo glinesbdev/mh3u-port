@@ -16,6 +16,8 @@ pub type SimpleHandler = fn(&mut Os, &Guest, &mut Ctx);
 pub enum Handler {
     Simple(SimpleHandler),
     Kernel(KernelHandler),
+    /// Done by the graphics backend.
+    Gx2,
 }
 
 /// The look-up of an import by its "library:function" name.

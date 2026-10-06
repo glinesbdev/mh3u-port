@@ -66,6 +66,7 @@ pub struct Queue {
 pub struct Kernel {
     pub os: Os,
     pub fs: crate::fs::Fs,
+    pub backend: Option<Box<dyn crate::Gx2Backend>>,
     pub guest: Guest,
     pub threads: Vec<Thread>,
     pub by_addr: HashMap<u32, usize>,
@@ -133,6 +134,7 @@ impl Kernel {
         Kernel {
             os,
             fs: crate::fs::Fs::default(),
+            backend: None,
             guest,
             threads,
             by_addr,

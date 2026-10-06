@@ -28,6 +28,8 @@ pub struct DataImport {
 }
 
 pub struct Options {
+    /// Draws for the game; without one the `gx2` calls without code of their own do nothing.
+    pub backend: Option<Box<dyn crate::Gx2Backend>>,
     /// Where the game's files are.
     pub roots: crate::fs::Roots,
     pub data_imports: Vec<DataImport>,
@@ -137,6 +139,13 @@ extern "C" fn import(c: *mut Ctx, number: u32) {
         let k = guard.as_mut().expect("the kernel is set while the game runs");
         let step = match k.report.handlers[number as usize] {
             Some(Handler::Kernel(h)) => h(k, c),
+            Some(Handler::Gx2) => {
+                let guest = k.guest;
+                if let Some(b) = k.backend.as_mut() {
+                    b.call(&k.report.names[number as usize], c, &guest);
+                }
+                Step::Done
+            }
             Some(Handler::Simple(h)) => {
                 let guest = k.guest;
                 h(&mut k.os, &guest, c);
@@ -247,6 +256,7 @@ pub fn spawn(k: &Kernel, t: usize) {
 pub fn run(library: &Path, pieces: &[Piece], options: Options) -> Result<Report> {
     let mut options_roots = crate::fs::Roots::default();
     let mut options = options;
+    let backend = options.backend.take();
     std::mem::swap(&mut options_roots, &mut options.roots);
     let options = &options;
     let mut memory = memmap2::MmapOptions::new()
@@ -322,7 +332,10 @@ pub fn run(library: &Path, pieces: &[Piece], options: Options) -> Result<Report>
         call,
         mem,
         Reporting {
-            handlers: names.iter().map(|n| cafe::find(n)).collect(),
+            handlers: names
+                .iter()
+                .map(|n| cafe::find(n).or_else(|| backend.as_ref().filter(|b| b.implements(n)).map(|_| Handler::Gx2)))
+                .collect(),
             names,
             first: Vec::new(),
             counts: BTreeMap::new(),
@@ -335,6 +348,7 @@ pub fn run(library: &Path, pieces: &[Piece], options: Options) -> Result<Report>
     ));
     if let Some(k) = lock().as_mut() {
         k.fs.roots = roots;
+        k.backend = backend;
     }
     let host = Host {
         import,

@@ -102,3 +102,27 @@ Result so far: the game starts, sets up its memory and threads, reads its archiv
 (`GX2DrawEx`, texture and sampler binds, copies to the scan buffer: hundreds of frames) and stops only at the limit on system calls
 that `run` sets. Nothing is drawn on a screen yet: every `GX2` call is a stub that does nothing. The to-do list is the `(stub)`
 lines of the report, most-called first.
+
+## Graphics (`mh3u-gfx`)
+
+**API: `wgpu`**, which runs on Vulkan on Linux and Windows (Direct3D 12 and Metal are the other backends it can use). It was chosen over
+raw Vulkan because the whole crate stays safe Rust (the workspace allows `unsafe` only in `mh3u-rt`), one code path serves both target
+systems, and it is fast enough for a console from 2012. The test machine's GPU is an AMD Radeon RX 7800 XT on the Mesa Vulkan driver
+(`mh3u-gfx/examples/probe.rs` opens a window and prints which adapter it got). If the game turns out to need what `wgpu` does not have
+(geometry shaders, stream output), the answer is `wgpu-hal` or a Vulkan binding for that part only; the game imports
+`GX2SetGeometryShader`, but how often it is called is not measured yet.
+
+**Shape.** The window belongs to the thread that started the program; the game runs on another and draws from there: the backend
+(`Gx2`, implementing `mh3u_rt::Gx2Backend`) is called by the runtime for every `gx2` import it has code for, on whichever guest thread
+made the call, so it reads the guest's memory at the moment of the call and needs no copying or locking. A call that blocks (waiting
+for the next frame) blocks there, with the other guest threads waiting.
+
+**Done:** colour buffers become textures keyed by the address of their image; `GX2ClearColor` clears them;
+`GX2CopyColorBufferToScanBuffer` copies a buffer into the TV picture; `GX2SwapScanBuffers` shows it in the window, scaled with the
+picture's proportions kept, on a surface that does not encode the colours again (the game's are already in the display's encoding);
+`GX2WaitForVsync` paces to 60 Hz; `GX2GetSwapStatus` reports every swap as flipped. `mh3u-tools run ... --window` does this. The game
+swaps frames in the window (about 40 a second with call tracing on); the picture is black because nothing is drawn yet.
+
+**Next:** record the state calls (shaders, fetch shader, attribute buffers, textures, samplers, uniform blocks, blend, depth, cull,
+viewport, scissor, colour and depth buffers) and turn `GX2DrawEx`/`GX2DrawIndexedEx` into draws; translate the shaders' microcode
+(the census in `docs/spikes.md`) to WGSL; read textures through the exact tiling rules; display lists (`GX2BeginDisplayListEx`).

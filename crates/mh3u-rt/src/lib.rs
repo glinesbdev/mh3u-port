@@ -14,6 +14,7 @@ mod sync;
 
 pub use fs::Roots;
 pub use game::{DataImport, Options, Report, run};
+pub use guest::Guest;
 
 /// The registers of a core, laid out as the translated C's `Ctx` (`ppc.h`); the library's size for it is checked when it is loaded.
 #[repr(C)]
@@ -33,6 +34,14 @@ pub struct Ctx {
     pub tb: u64,
     /// Where guest address 0 is in the host's memory.
     pub mem: *mut u8,
+}
+
+/// What draws for the game: the runtime hands it every `gx2` call it has no code of its own for, with the registers and the memory.
+/// A call that blocks (waiting for the next frame) blocks here, with the other guest threads waiting for it.
+pub trait Gx2Backend: Send {
+    /// Whether the backend does something for this import ("gx2:GX2SwapScanBuffers"); the others stay stubs.
+    fn implements(&self, name: &str) -> bool;
+    fn call(&mut self, name: &str, c: &mut Ctx, g: &Guest);
 }
 
 /// A piece of the executable to put in the guest's memory, or to clear.
