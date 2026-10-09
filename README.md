@@ -37,6 +37,10 @@ The first four crates started as copies of the readers in the [companion app](ht
 domain, same author); from here on they change on their own. Run `scripts/check.sh` (on Windows, `scripts\check.ps1`) before every
 commit; there is no CI.
 
+To build and play on Windows, `scripts\win-build.ps1` builds the tools and `game.dll`, and `scripts\win-run.ps1` runs the game in a
+window, also writing what it prints to `mh3u_latest.log`. Their switches include `-Profile`, `-Lto`, `-Fps`, `-Report`, `-Dump`
+and `-PadLayout` (see [`docs/windows.md`](docs/windows.md)). On Linux, `scripts/run.sh` runs the game the same way.
+
 ## Licence
 
 Public domain (`LICENSE`), for the code here. It says nothing about the game, which is Capcom's. The repository is private; decide
