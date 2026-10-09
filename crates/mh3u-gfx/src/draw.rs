@@ -744,6 +744,13 @@ fn depth_copy_pipeline(device: &wgpu::Device) -> (wgpu::RenderPipeline, wgpu::Bi
     (pipeline, layout)
 }
 
+/// Whether the colour hardware blends into a buffer of this format: not one of 32-bit float components (the shadow pass draws its
+/// r32f map with the blending of the draws before it still on, and the value it writes, z/w, is also its alpha), so it writes over.
+fn blends(format: wgpu::TextureFormat) -> bool {
+    use wgpu::TextureFormat as F;
+    !matches!(format, F::R32Float | F::Rg32Float | F::Rgba32Float)
+}
+
 /// The comparison of a shadow lookup's sampler: the sampler's own (`GX2CompareFunction`), or less or equal when it has none (15).
 fn compare_sampler_function(f: u32) -> wgpu::CompareFunction {
     if f > 7 { wgpu::CompareFunction::LessEqual } else { compare(f) }
@@ -2028,7 +2035,7 @@ impl Gx2 {
         let entry = match self.caches.pipelines.get(&key) {
             Some(e) => e.clone(),
             None => {
-                let blend_on = st.colour_control[1] & 1 != 0;
+                let blend_on = st.colour_control[1] & 1 != 0 && blends(target_format);
                 let b = &st.blend[0];
                 let blend = blend_on.then(|| wgpu::BlendState {
                     color: wgpu::BlendComponent {
@@ -3122,6 +3129,19 @@ mod tests {
         assert_eq!(raw, [255, 128, 0, 51]);
         let colour: Vec<f32> = raw.iter().map(|&v| (v as i32) as f32 * 0.003_921_569).collect();
         assert!((colour[0] - 1.0).abs() < 1e-6 && (colour[1] - 0.502).abs() < 1e-3 && colour[2] == 0.0 && (colour[3] - 0.2).abs() < 1e-6);
+    }
+
+    #[test]
+    fn a_float_shadow_map_keeps_its_precision_and_is_written_over() {
+        // the village's shadow map: 1024x1024 colour buffer of format 0x80e (r32f)
+        let format = crate::gx2::texture_format(0x80e);
+        assert_eq!(format, wgpu::TextureFormat::R32Float);
+        assert_eq!(crate::gx2::texture_format(0x80d), wgpu::TextureFormat::Rg32Float);
+        assert_eq!(crate::gx2::texture_format(0x823), wgpu::TextureFormat::Rgba32Float);
+        // its blending, left on by the draws before, does not apply; 8-bit and 16-bit float buffers still blend
+        assert!(!blends(format));
+        assert!(blends(wgpu::TextureFormat::Rgba8Unorm));
+        assert!(blends(wgpu::TextureFormat::Rgba16Float));
     }
 
     #[test]

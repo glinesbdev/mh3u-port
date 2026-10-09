@@ -186,6 +186,9 @@ with their text and the cloth background, upright, in the right places (the hunt
   made from the state (blend, depth, cull, formats) and cached, and the draw is issued with generated indices (fans, quads and strips
   that `wgpu` lacks are expanded). A vertex shader's outputs reach the pixel shader through the semantic numbers in the shaders'
   headers (a pixel input takes the vertex output with the same semantic). A pass that samples the target it draws into gets a copy.
+  The position is `@invariant`, so a mesh's depth-only and colour draws (same vertex shader, different pixel shaders) give the same
+  depth. Colour buffers of the 32-bit float formats (`0x80e`, `0x80d`, `0x823`) are made as `R32Float`, `Rg32Float` and
+  `Rgba32Float` and are never blended, as on the hardware; other unlisted formats are still `Rgba8Unorm`.
 - **Geometry pipelines** (`geometry.rs`): nearly every draw of the 2D interface and the effects goes through the same geometry
   shader (it turns a point with a size and a rectangle into a quad). The hardware's vertex shader (writing a ring of 12 `vec4`
   per vertex) and geometry shader (reading it, writing a ring of 11 `vec4` per emitted vertex, and `EMIT_VERTEX`) are translated into
@@ -326,7 +329,8 @@ with their text and the cloth background, upright, in the right places (the hunt
   - **Shadow maps drawn as colour**: a buffer drawn into as colour (the village's 1024x1024 `r32f`) and read with a comparison
     (`SAMPLE_C`) is copied into a depth texture (first component, clamped to 0..1) when it has changed since the last copy, and the
     comparison is the sampler's own (`GX2InitSamplerDepthCompare`; less or equal when none was set). Before, such a lookup read a
-    1x1 depth stand-in.
+    1x1 depth stand-in. The game's shadow bias is in the receiving shader (reference `z - c`, `c` from pixel block 4), not a depth
+    bias, so the map must keep 32-bit precision (up to fb2f3db it was made 8-bit, and it was blended).
 
 **Not done yet:** the rest of the sampler state (borders, the mip bias), separate stencil masks and depth bias for back faces, other
 geometry inputs (lines, triangles, instances), rects and other primitive types, stream out, a viewport larger than its target (it is

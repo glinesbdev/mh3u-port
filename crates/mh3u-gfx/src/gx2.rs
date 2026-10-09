@@ -139,13 +139,18 @@ pub struct Gx2 {
 }
 
 /// The texture format of a `GX2SurfaceFormat` of a colour buffer.
-fn texture_format(gx2: u32) -> wgpu::TextureFormat {
+pub(crate) fn texture_format(gx2: u32) -> wgpu::TextureFormat {
     match gx2 {
         0x41a => wgpu::TextureFormat::Rgba8UnormSrgb,
         0x19 => wgpu::TextureFormat::Rgb10a2Unorm,
         0x816 | 0x810 => wgpu::TextureFormat::Rgba16Float,
         0x1 => wgpu::TextureFormat::R8Unorm,
         0x7 => wgpu::TextureFormat::Rg8Unorm,
+        // the 32-bit float formats keep their precision: the village's shadow map is z/w in an r32f colour buffer, and in 8 bits
+        // its steps (1/255) outgrow the game's shadow bias (about 0.0115) and the lit side of a figure shadows itself in bands
+        0x80e => wgpu::TextureFormat::R32Float,
+        0x80d => wgpu::TextureFormat::Rg32Float,
+        0x823 => wgpu::TextureFormat::Rgba32Float,
         _ => wgpu::TextureFormat::Rgba8Unorm,
     }
 }

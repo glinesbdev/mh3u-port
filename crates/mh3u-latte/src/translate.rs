@@ -1209,6 +1209,12 @@ fn assemble_pixel(m: &mut String, g: &Gen, inputs: &PixelInputs) {
     m.push_str("    return o;\n}\n");
 }
 
+/// The position a vertex shader hands on, invariant: the game draws a mesh's depth first with one pixel shader and its colour
+/// after, testing less-or-equal against that depth, and without `@invariant` the GPU's compiler may work out the same position
+/// differently for the two pipelines (outputs one pixel shader does not read are dropped, and multiply-adds fused or not), so the
+/// colour pass loses to its own depth in bands.
+pub const VOUT_POSITION: &str = "struct VOut {\n    @invariant @builtin(position) pos: vec4<f32>,\n";
+
 fn assemble_vertex(m: &mut String, g: &Gen, inputs: &VertexInputs) {
     // the decoded attribute streams: one storage buffer of vec4 and, per stream, where it starts
     m.push_str(
@@ -1217,7 +1223,7 @@ fn assemble_vertex(m: &mut String, g: &Gen, inputs: &VertexInputs) {
     if g.iface.reads_ring {
         m.push_str("@group(3) @binding(2) var<storage, read> ring_out: array<vec4<f32>>;\n");
     }
-    m.push_str("struct VOut {\n    @builtin(position) pos: vec4<f32>,\n");
+    m.push_str(VOUT_POSITION);
     for p in &g.iface.params {
         let _ = writeln!(m, "    @location({p}) p{p}: vec4<f32>,");
     }
@@ -1548,6 +1554,14 @@ mod tests {
         let d = decode(&p).unwrap();
         let ctx = Context::new(&|_| TexKind::D2);
         assert!(translate_pixel(&d, &PixelInputs::default(), &ctx).is_err());
+    }
+
+    #[test]
+    fn the_vertex_position_is_invariant() {
+        assert!(VOUT_POSITION.contains("@invariant @builtin(position)"));
+        valid(&format!(
+            "{VOUT_POSITION}}}\n@vertex fn main() -> VOut {{\n    var o: VOut;\n    o.pos = vec4<f32>(0.0, 0.0, 0.0, 1.0);\n    return o;\n}}\n"
+        ));
     }
 
     /// Parses and validates a module the way the GPU backend will.

@@ -227,15 +227,35 @@ the figures. Why the offsets differ is not settled (the units, 2^-24 for a 24-bi
 `MH3U_GFX_DEPTH_BIAS=off` tests the explanation.
 
 **3l. Why the colour draws' bias differed from their depth-only twins (run 9).** With `MH3U_GFX_DEPTH_BIAS=off` the village's
-figures appear (and the red tint is gone with ddb7c25's uniform fix), but the shadow pass loses its bias and the player gets
-shadow acne, so the bias itself is wanted, only not where it was. Run 9's dump has the same pattern as run 8 (offsets -192 for
+figures appear (and the red tint is gone with ddb7c25's uniform fix), but the player gets streaks outside (taken then for the
+shadow pass losing its bias; 3m shows the shadow pass has none of the game's). Run 9's dump has the same pattern as run 8 (offsets -192 for
 draws 0-53, then -384, -256, -512, ... changing per mesh, every draw "front true"). The pipeline cache was not it: its key holds
 the bias (constant, slope scale, clamp). The cause is `GX2SetCullOnlyControl`: GX2 does it as `GX2SetPolygonControl(face,
 cullFront, cullBack, no polygon modes, offsets off)`, writing the whole of `PA_SU_SC_MODE_CNTL` (decaf, read for facts), but here it
-only set the face and culling and left the offset enables as they were. Once the shadow pass turned the offset on with
-`GX2SetPolygonControl`, every later draw kept it, with whatever `GX2SetPolygonOffset` the game had set last (it sets one per
+only set the face and culling and left the offset enables as they were. Once a draw turned the offset on with
+`GX2SetPolygonControl`, every later draw kept it (into the next frame's shadow pass too), with whatever `GX2SetPolygonOffset` the game had set last (it sets one per
 material whether or not the offset is on), and the first mesh of a pass kept the value of the pass before. Now
 `GX2SetCullOnlyControl` turns the offset off; the offset values are kept for the next `GX2SetPolygonControl`.
+
+**3m. The streaks on the player outside the village (run 10, fb2f3db).** fb2f3db did what 3l predicted: in run 10's village dump
+(frame 2400) 453 of the 488 draws have the offset off and 35 have it on, a few per mesh group in both the depth-only and colour
+passes (the game's own decals and overlays); the figures render. The shadow pass (draws 0-53: 1024x1024 colour buffer `0x80e`
+(r32f) at `0xf561e800`, D24 depth at `0x15ef0000`) now has the offset off, so the -192 it had before was the stale one from the end
+of the frame before, and it never mattered: its pixel shader writes `z/w` of the light's projection (or `w` times a scale when
+block 4's `[0].w` is not 0) as colour, which a depth bias does not touch. The receivers (the map is read by draws 218-396; e.g. draw 218, pixel shader `0x16e2f740`)
+take four `SAMPLE_C` taps at +-1/1024 with reference `sat(z - c)`, `c` = pixel block 4 `[0].x` = 0.0115 here, against that map
+(sampler comparison 4, greater: 1 where the receiver is behind what the light sees). So the bias is the game's, in the shader.
+What broke it: colour buffers were made in `Rgba8Unorm` for every format we had not listed, `0x80e` among them, so the map held
+`z/w` in steps of 1/255 (0.0039, a third of `c`), and in the field, where the light's frustum is deep, a step is a long way: the
+lit side of the player, sloped against the light, fell behind its own stored depth in bands. The map was also blended: the draws
+leave blending on (source alpha, one minus source alpha) and the exported alpha is `z/w` itself. The 32-bit float colour formats
+(`0x80e`, `0x80d`, `0x823`) are now made as `R32Float`, `Rg32Float` and `Rgba32Float` and never blended (the hardware's blender
+does not take 32-bit float components; wgpu does not either without an extra feature); the depth copy was already
+`Depth32Float`. Also, the vertex position is now `@invariant`: every depth-only/colour pair uses the same vertex and fetch shader
+(e.g. draws 54 and 218: `0x1697a580`, `0x1d526d50`, depth test less or equal, no bias on either) with different pixel shaders, and
+without it the GPU's compiler may compute the position differently for the two pipelines. The dump's frame is the village, so the
+field itself is still to be seen; the dump's PNG of the r32f map is black (it is not read back from the GPU), so the precision is
+inferred from the format table, not measured.
 
 ## 4. Does the generated code compile in a reasonable time? (done: as C yes, as one Rust crate no)
 
