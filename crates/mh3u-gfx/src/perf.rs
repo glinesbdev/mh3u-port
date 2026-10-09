@@ -158,7 +158,7 @@ pub(crate) fn pipelines_text(p: &PipelineCounts) -> String {
 impl Perf {
     pub(crate) fn from_env() -> Perf {
         Perf {
-            on: crate::draw::Lap::enabled() || std::env::var_os("MH3U_FPS").is_some(),
+            on: std::env::var_os("MH3U_GFX_TIMES").is_some() || std::env::var_os("MH3U_FPS").is_some(),
             ..Perf::idle()
         }
     }

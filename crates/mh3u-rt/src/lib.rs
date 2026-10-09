@@ -52,6 +52,14 @@ pub trait Gx2Backend: Send {
     fn call_id(&mut self, _id: Option<u32>, name: &str, c: &mut Ctx, g: &Guest) {
         self.call(name, c, g);
     }
+    /// Whether the backend times each call itself (then `last_call_time` says how long the last one took, and the runtime's
+    /// MH3U_GFX_TIMES report uses that instead of reading the clock around the call a second time).
+    fn times_calls(&self) -> bool {
+        false
+    }
+    fn last_call_time(&self) -> std::time::Duration {
+        std::time::Duration::ZERO
+    }
 }
 
 /// Frames shown so far: the graphics backend counts its swaps here, so the timing reports (MH3U_GFX_TIMES) can give per-frame averages.

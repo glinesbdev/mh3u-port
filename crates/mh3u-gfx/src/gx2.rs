@@ -143,6 +143,13 @@ pub struct Gx2 {
     pub(crate) pipes: crate::pipelines::Pipelines,
     /// Frame times, cache sizes and area changes for the log (`perf.rs`).
     pub(crate) perf: crate::perf::Perf,
+    /// With timing on: when the graphics call running now started (the swap moves it to its own end of the frame, see `swap_point`).
+    call_started: Option<Instant>,
+    /// With MH3U_GFX_TIMES: each non-draw call's time and count in this frame, by `Call` (for `[gfx slow frame]`; an array, not the
+    /// shared step table, as there are thousands of these calls a frame).
+    call_frame: Vec<(std::time::Duration, u64)>,
+    /// How long the last call took, for the runtime's `[gfx times]` (see `Gx2Backend::times_calls`).
+    last_call: std::time::Duration,
 }
 
 /// The texture format of a `GX2SurfaceFormat` of a colour buffer.
@@ -300,6 +307,9 @@ impl Gx2 {
             diag: crate::report::Diagnostics::from_env(),
             pipes,
             perf: crate::perf::Perf::from_env(),
+            call_started: None,
+            last_call: std::time::Duration::ZERO,
+            call_frame: vec![Default::default(); Call::ALL.len()],
         }
     }
 
@@ -1012,6 +1022,7 @@ impl Gx2 {
                 self.prune();
                 self.pipes.collect();
                 if self.perf.on {
+                    self.swap_point();
                     let (pipes, work) = (self.pipes.counts, self.caches.work);
                     // taken out for the call, so the caches can be measured while it runs
                     let mut perf = std::mem::replace(&mut self.perf, crate::perf::Perf::idle());
@@ -1022,8 +1033,16 @@ impl Gx2 {
                         eprintln!("{line}");
                     }
                     if crate::draw::Lap::enabled() {
-                        let laps = crate::draw::Lap::take_frame();
+                        let mut laps = crate::draw::Lap::take_frame();
+                        let calls = std::mem::replace(&mut self.call_frame, vec![Default::default(); Call::ALL.len()]);
                         if ms >= slow_frame_ms() {
+                            laps.times.extend(
+                                Call::ALL
+                                    .iter()
+                                    .zip(calls)
+                                    .filter(|(_, (_, n))| *n > 0)
+                                    .map(|(call, (d, n))| (call.name(), d, n)),
+                            );
                             eprintln!("{}", crate::draw::slow_frame_text(self.swaps - 1, ms, gfx, &laps));
                         }
                     }
@@ -1261,15 +1280,33 @@ impl Gx2Backend for Gx2 {
     }
 
     fn call_id(&mut self, id: Option<u32>, name: &str, c: &mut Ctx, g: &Guest) {
-        let started = self.perf.on.then(Instant::now);
-        match id.and_then(|id| Call::ALL.get(id as usize)) {
-            Some(&call) => self.run(call, c, g),
+        // one clock reading at each end of a call, for both the frame's time in graphics calls (the area-change and slow-frame lines)
+        // and the call's own line in `[gfx slow frame]`
+        let began = self.perf.on.then(Instant::now);
+        self.call_started = began;
+        let call = id.and_then(|id| Call::ALL.get(id as usize)).copied();
+        match call {
+            Some(call) => self.run(call, c, g),
             None => self.call(name, c, g),
         }
-        // the frame's time in graphics calls, for the area-change lines (the swap's own call counts in the next frame)
-        if let Some(t) = started {
-            self.perf.frame_gfx += t.elapsed();
+        if let (Some(began), Some(t)) = (began, self.call_started.take()) {
+            let now = Instant::now();
+            // since the call began, or since the swap's frame ended inside it
+            let d = now - t;
+            self.perf.frame_gfx += d;
+            if let Some(call) = call {
+                self.add_call_time(call, d);
+            }
+            self.last_call = now - began;
         }
+    }
+
+    fn times_calls(&self) -> bool {
+        self.perf.on
+    }
+
+    fn last_call_time(&self) -> std::time::Duration {
+        self.last_call
     }
 
     fn call(&mut self, name: &str, c: &mut Ctx, g: &Guest) {
@@ -1280,23 +1317,35 @@ impl Gx2Backend for Gx2 {
 }
 
 impl Gx2 {
-    /// A call from the game. With `MH3U_GFX_TIMES`, the calls other than the draws (which have their own steps) and the display list
-    /// ones are timed for the frame's `[gfx slow frame]` line.
-    fn run(&mut self, call: Call, c: &mut Ctx, g: &Guest) {
-        let timed = crate::draw::Lap::enabled()
+    /// With `MH3U_GFX_TIMES` (not `=calls`), a call's time goes to the frame's `[gfx slow frame]` line, except the draws (which have
+    /// their own steps) and the display list ones.
+    fn add_call_time(&mut self, call: Call, d: std::time::Duration) {
+        if crate::draw::Lap::enabled()
             && !matches!(
                 call,
                 Call::DirectCallDisplayList | Call::DrawEx | Call::DrawIndexedEx | Call::BeginDisplayListEx | Call::EndDisplayList
-            );
-        let started = timed.then(Instant::now);
-        self.run_call(call, c, g);
-        if let Some(t) = started {
-            crate::draw::Lap::frame_time(call.name(), t.elapsed());
+            )
+        {
+            let e = &mut self.call_frame[call as usize];
+            e.0 += d;
+            e.1 += 1;
         }
     }
 
-    /// The display list ones here, the others recorded into the list being made or run now.
-    fn run_call(&mut self, call: Call, c: &mut Ctx, g: &Guest) {
+    /// Inside the swap, where a frame ends for the frame-time lines: the swap's time so far (presenting, and letting go of what the
+    /// caches no longer use) counts in the frame it ends, and the rest of the call in the next one.
+    fn swap_point(&mut self) {
+        if let Some(t) = self.call_started {
+            let now = Instant::now();
+            let d = now - t;
+            self.perf.frame_gfx += d;
+            self.add_call_time(Call::SwapScanBuffers, d);
+            self.call_started = Some(now);
+        }
+    }
+
+    /// A call from the game: the display list ones here, the others recorded into the list being made or run now.
+    fn run(&mut self, call: Call, c: &mut Ctx, g: &Guest) {
         match call {
             Call::BeginDisplayListEx => {
                 self.recording = Some(Recording {
@@ -1360,6 +1409,26 @@ pub(crate) fn blank_ctx() -> Ctx {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_swaps_time_so_far_counts_in_the_frame_it_ends() {
+        // run 18: a frame's own present and cache pruning showed up in the next frame's graphics time (an 11.3 ms frame with 13.6 ms
+        // in graphics calls), and a 26 ms frame with 12 ms
+        let mut gx2 = super::Gx2::new(crate::Display::noop());
+        let started = std::time::Instant::now() - std::time::Duration::from_millis(10);
+        gx2.call_started = Some(started);
+        gx2.swap_point();
+        assert!(gx2.perf.frame_gfx >= std::time::Duration::from_millis(10));
+        let reset = gx2.call_started.expect("still in the call");
+        assert!(
+            reset > started && reset.elapsed() < std::time::Duration::from_millis(5),
+            "the rest goes to the next frame"
+        );
+        // with timing off nothing is measured
+        let mut off = super::Gx2::new(crate::Display::noop());
+        off.swap_point();
+        assert_eq!(off.perf.frame_gfx, std::time::Duration::ZERO);
+    }
+
     use super::*;
 
     #[test]

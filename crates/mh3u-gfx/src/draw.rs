@@ -405,13 +405,27 @@ const SLOT_SIZE: u64 = 64 << 10;
 const SLOTS_PER_BUFFER: usize = 16;
 
 pub struct StreamEntry {
-    buffer: wgpu::Buffer,
-    /// Where each stream starts, as the shaders read it (a small buffer of its own, so a draw's bind group 3 is the same every frame).
-    meta: wgpu::Buffer,
+    /// The streams and where each starts (as the shaders read it), in buffers of their own once they have been drawn with in a later
+    /// frame than the one they were made in. A buffer of its own keeps a draw's bind group 3 the same every frame.
+    own: Option<(wgpu::Buffer, wgpu::Buffer)>,
+    /// Until then: the decoded bytes (streams, starts), and where they are in an arena for the batch of that generation. Vertex data
+    /// the game rewrites every frame never gets buffers of its own, so it costs no buffer to make and none to destroy (run 18: about
+    /// 20 such streams a frame, 2,400 buffers destroyed at once every 60 frames, 26 ms frames).
+    pending: Option<(Vec<u8>, Vec<u8>)>,
+    placed: Option<(u64, BufRef, BufRef)>,
     size: u64,
     used: u32,
     /// Drawn with in a later frame than the one it was made in (vertex data that changes every frame makes entries that never are).
     reused: bool,
+}
+
+/// A draw's decoded vertex streams on the GPU (see `Gx2::cached_streams`).
+pub(crate) struct Streams {
+    pub data: BufRef,
+    /// Where each stream starts (256 bytes).
+    pub meta: BufRef,
+    /// In buffers that stay (so a bind group with them is worth keeping); false for streams in this batch's arena.
+    pub kept: bool,
 }
 
 /// How long a decoded vertex stream is kept without being drawn with, in frames; one never drawn with after the frame it was made in
@@ -419,11 +433,16 @@ pub struct StreamEntry {
 const STREAM_AGE: u32 = 120;
 
 /// Whether a vertex stream last drawn with in `used` is kept at `swaps`: not drawn with for `STREAM_AGE` frames, it goes; one made from
-/// bytes that were never drawn again (vertex data the game rewrites every frame) goes once its frame is over. Every stream is two GPU
-/// buffers, and wgpu's per-pass and per-submit bookkeeping grows with how many buffers there are (run 12: 31,000 streams, the replay
-/// three times slower at the same draws).
+/// bytes that were never drawn again (vertex data the game rewrites every frame) goes once its frame is over. A stream drawn again
+/// is two GPU buffers, and wgpu's per-pass and per-submit bookkeeping grows with how many buffers there are (run 12: 31,000 streams,
+/// the replay three times slower at the same draws). Checked every frame, so what goes goes a little at a time.
 pub(crate) fn keep_stream(used: u32, reused: bool, swaps: u32) -> bool {
     used.saturating_add(STREAM_AGE) >= swaps && (reused || used.saturating_add(2) >= swaps)
+}
+
+/// The bytes of the vertex streams that have buffers of their own.
+fn own_stream_bytes(streams: &HashMap<(u64, u64), StreamEntry>) -> u64 {
+    streams.values().filter(|e| e.own.is_some()).map(|e| e.size).sum()
 }
 
 /// A quick hash of bytes (eight at a time), for telling whether vertex data is what it was.
@@ -1626,7 +1645,8 @@ impl Gx2 {
     }
 
     /// The decoded streams of a draw on the GPU: made again only when the layout or the vertex bytes are not what they were (the bytes
-    /// are hashed, so a game that changes its vertex data without telling the GPU is still followed).
+    /// are hashed, so a game that changes its vertex data without telling the GPU is still followed). New streams go into the batch's
+    /// arena; they get buffers of their own when they are drawn again in a later frame.
     pub(crate) fn cached_streams(
         &mut self,
         g: &Guest,
@@ -1635,7 +1655,7 @@ impl Gx2 {
         start: u32,
         vertices: u32,
         instances: u32,
-    ) -> (BufRef, BufRef) {
+    ) -> Streams {
         let mut lap = Lap::new();
         let (mut h1, mut h2) = (0x1234_5678_9abc_def0u64, 0x0fed_cba9_8765_4321u64);
         let mut mix = |v: u64| {
@@ -1700,22 +1720,49 @@ impl Gx2 {
         let key = (h1, h2);
         let swaps = self.swaps;
         lap.mark("stream hash");
+        let generation = self.batch.generation;
         if let Some(e) = self.caches.streams.get_mut(&key) {
             lap.mark("stream hit");
             if e.used != swaps {
                 e.reused = true;
             }
             e.used = swaps;
-            let (buffer, meta) = (e.buffer.clone(), e.meta.clone());
             let size = e.size;
-            return (
-                BufRef { buffer, offset: 0, size },
-                BufRef {
-                    buffer: meta,
-                    offset: 0,
-                    size: 256,
-                },
-            );
+            if let Some((buffer, meta)) = &e.own {
+                return Streams {
+                    data: BufRef {
+                        buffer: buffer.clone(),
+                        offset: 0,
+                        size,
+                    },
+                    meta: BufRef {
+                        buffer: meta.clone(),
+                        offset: 0,
+                        size: 256,
+                    },
+                    kept: true,
+                };
+            }
+            if let Some((at, data, meta)) = &e.placed
+                && *at == generation
+            {
+                return Streams {
+                    data: data.clone(),
+                    meta: meta.clone(),
+                    kept: false,
+                };
+            }
+            let reused = e.reused;
+            let (data, meta) = e.pending.take().expect("a stream without buffers of its own keeps its bytes");
+            let streams = if reused {
+                // drawn again in a later frame: worth buffers of its own
+                self.stream_buffers(key, &data, &meta)
+            } else {
+                // drawn again in another batch of the frame it was made in
+                self.place_streams(key, data, meta)
+            };
+            lap.mark("stream miss: buffers and upload");
+            return streams;
         }
         let (data, meta) = self.decode_streams(g, st, fetch, start, vertices, instances);
         lap.mark("stream miss: decode");
@@ -1726,53 +1773,85 @@ impl Gx2 {
                 data.len()
             );
         }
+        Lap::count("vertex stream bytes made", data.len() as u64);
+        let meta_bytes: Vec<u8> = meta.iter().flatten().flat_map(|v| v.to_le_bytes()).collect();
+        self.caches.streams.insert(
+            key,
+            StreamEntry {
+                own: None,
+                pending: None,
+                placed: None,
+                size: data.len() as u64,
+                used: swaps,
+                reused: false,
+            },
+        );
+        let streams = self.place_streams(key, data, meta_bytes);
+        lap.mark("stream miss: buffers and upload");
+        streams
+    }
+
+    /// Puts a stream entry's bytes into this batch's arena (they go up with the arena when the batch is handed to the GPU) and keeps
+    /// them, and where they went, in the entry.
+    fn place_streams(&mut self, key: (u64, u64), data: Vec<u8>, meta: Vec<u8>) -> Streams {
         let size = data.len() as u64;
-        Lap::count("vertex stream bytes made", size);
+        let data_ref = self.arena_write(&data, size);
+        let meta_ref = self.arena_write(&meta, 256);
+        let generation = self.batch.generation;
+        if let Some(e) = self.caches.streams.get_mut(&key) {
+            e.pending = Some((data, meta));
+            e.placed = Some((generation, data_ref.clone(), meta_ref.clone()));
+        }
+        Streams {
+            data: data_ref,
+            meta: meta_ref,
+            kept: false,
+        }
+    }
+
+    /// Gives a stream entry buffers of its own, holding its bytes.
+    fn stream_buffers(&mut self, key: (u64, u64), data: &[u8], meta: &[u8]) -> Streams {
+        let size = data.len() as u64;
         let buffer = self.d.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("vertex streams"),
             size,
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        self.d.queue.write_buffer(&buffer, 0, &data);
+        self.d.queue.write_buffer(&buffer, 0, data);
         let meta_buffer = self.d.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("vertex stream starts"),
             size: 256,
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        let meta_bytes: Vec<u8> = meta.iter().flatten().flat_map(|v| v.to_le_bytes()).collect();
-        self.d.queue.write_buffer(&meta_buffer, 0, &meta_bytes);
-        lap.mark("stream miss: buffers and upload");
+        self.d.queue.write_buffer(&meta_buffer, 0, meta);
+        Lap::count("vertex streams given buffers", 1);
         // forget what has not been used for a while, or what is too much
+        let swaps = self.swaps;
         self.caches.stream_bytes += size;
         if self.caches.stream_bytes > (1 << 30) {
             let before = self.caches.stream_bytes;
-            self.caches.streams.retain(|_, e| keep_stream(e.used, e.reused, swaps));
-            self.caches.stream_bytes = self.caches.streams.values().map(|e| e.size).sum::<u64>() + size;
+            self.caches.streams.retain(|k, e| *k == key || keep_stream(e.used, e.reused, swaps));
+            self.caches.stream_bytes = own_stream_bytes(&self.caches.streams) + size;
             if self.caches.stream_bytes > before / 2 && self.caches.stream_bytes > (1 << 30) {
-                self.caches.streams.clear();
+                self.caches.streams.retain(|k, _| *k == key);
                 self.caches.stream_bytes = size;
             }
         }
-        self.caches.streams.insert(
-            key,
-            StreamEntry {
-                buffer: buffer.clone(),
-                meta: meta_buffer.clone(),
-                size,
-                used: swaps,
-                reused: false,
-            },
-        );
-        (
-            BufRef { buffer, offset: 0, size },
-            BufRef {
+        if let Some(e) = self.caches.streams.get_mut(&key) {
+            e.own = Some((buffer.clone(), meta_buffer.clone()));
+            e.placed = None;
+        }
+        Streams {
+            data: BufRef { buffer, offset: 0, size },
+            meta: BufRef {
                 buffer: meta_buffer,
                 offset: 0,
                 size: 256,
             },
-        )
+            kept: true,
+        }
     }
 
     /// The index buffer of a draw (vertex numbers relative to `lowest`), and the vertices it uses; `None` when it draws nothing or its
@@ -2002,8 +2081,19 @@ impl Gx2 {
     pub(crate) fn prune(&mut self) {
         self.caches.spent = std::time::Duration::ZERO;
         let swaps = self.swaps;
+        let mut lap = Lap::new();
+        // bind groups and vertex streams hold GPU objects, whose destruction (in the driver) is spread over the frames: what has gone
+        // unused goes every frame, not 60 frames' worth at once (run 18: 26 ms frames every 60 frames in the field)
+        let before = self.caches.bind_groups.len();
+        self.caches.bind_groups.retain(|_, e| e.1 + 60 >= swaps);
+        Lap::count("bind groups aged out", (before - self.caches.bind_groups.len()) as u64);
+        let before = self.caches.streams.len();
+        self.caches.streams.retain(|_, e| keep_stream(e.used, e.reused, swaps));
+        if self.caches.streams.len() != before {
+            self.caches.stream_bytes = own_stream_bytes(&self.caches.streams);
+            Lap::count("vertex streams aged out", (before - self.caches.streams.len()) as u64);
+        }
         if swaps.is_multiple_of(60) {
-            self.caches.bind_groups.retain(|_, e| e.1 + 60 >= swaps);
             self.caches.uniforms.retain(|_, u| u.swap + 60 >= swaps);
             // index lists drawn once and not again are not kept long
             self.caches
@@ -2022,12 +2112,8 @@ impl Gx2 {
             let aged =
                 self.caches.vertex_front.sweep(swaps) + self.caches.pixel_front.sweep(swaps) + self.caches.geometry_front.sweep(swaps);
             Lap::count("shader front entries aged out", aged as u64);
-            // vertex streams not drawn with for a while, and the ones made from bytes that were drawn once
-            let before = self.caches.streams.len();
-            self.caches.streams.retain(|_, e| keep_stream(e.used, e.reused, swaps));
-            self.caches.stream_bytes = self.caches.streams.values().map(|e| e.size).sum();
-            Lap::count("vertex streams aged out", (before - self.caches.streams.len()) as u64);
         }
+        lap.mark("caches aged out (at the swap)");
     }
 
     pub(crate) fn draw_call(&mut self, g: &Guest, primitive: u32, count: u32, indexed: Option<(u32, u32)>, first: u32, instances: u32) {
@@ -2125,6 +2211,8 @@ impl Gx2 {
         };
         lap.mark("shaders");
         let device = self.d.device.clone();
+        // a bind group with streams in this batch's arena is not worth keeping: next frame they are somewhere else
+        let mut streams_kept = true;
         let (va, meta_buffer, index_buffer, index_count, topology): (BufRef, BufRef, BufRef, u32, wgpu::PrimitiveTopology) =
             if let Some(x) = &geo {
                 let dummy = self.arena_alloc(Role::Read, 16);
@@ -2152,9 +2240,10 @@ impl Gx2 {
                     return;
                 };
                 lap.mark("index list");
-                let (va, meta_buffer) = self.cached_streams(g, &st, &fetch, lowest, vertices.min(1 << 22), instances);
+                let streams = self.cached_streams(g, &st, &fetch, lowest, vertices.min(1 << 22), instances);
                 lap.mark("decode streams");
-                (va, meta_buffer, index_buffer, index_count, topology)
+                streams_kept = streams.kept;
+                (streams.data, streams.meta, index_buffer, index_count, topology)
             };
         lap.mark("indices, streams, buffers");
         // the pipeline
@@ -2386,7 +2475,7 @@ impl Gx2 {
         if let Some(x) = &geo {
             group3_entries.push((2, x.ring_out.bound()));
         }
-        let group3 = self.bind_group(&entry.layouts[3], group3_entries, true);
+        let group3 = self.bind_group(&entry.layouts[3], group3_entries, streams_kept);
         lap.mark("group 3");
         // the draws are recorded into one command buffer and one render pass for as long as they go to the same targets; the pass
         // and the buffer end at the next thing that is not such a draw (see `flush_draws`)
@@ -2614,6 +2703,9 @@ impl Gx2 {
         }
         self.batch.generation += 1;
         self.batch.slots_used = 0;
+        lap.mark("arena uploads");
+        // wgpu 30 records a pass's commands when the pass ends but checks them, tracks the resources and makes the backend's (Vulkan's
+        // or D3D12's) commands only here, in `finish`: the batch's draws cost most of their GPU-side CPU time at this point
         let mut work = Vec::new();
         if let Some(pre) = self.batch.pre.take() {
             work.push(pre.finish());
@@ -2621,7 +2713,7 @@ impl Gx2 {
         if let Some(enc) = self.batch.enc.take() {
             work.push(enc.finish());
         }
-        lap.mark("arena uploads");
+        lap.mark("command encoding (finish)");
         if !work.is_empty() {
             self.d.queue.submit(work);
             lap.mark("submit");
@@ -2791,17 +2883,39 @@ struct LapTable {
     times: std::collections::BTreeMap<&'static str, (std::time::Duration, u64)>,
     counts: std::collections::BTreeMap<&'static str, u64>,
     /// The same for the frame being drawn (with the non-draw graphics calls' own times too), for `[gfx slow frame]`.
-    frame: std::collections::BTreeMap<&'static str, (std::time::Duration, u64)>,
-    frame_counts: std::collections::BTreeMap<&'static str, u64>,
+    /// Small lists searched by the name's address first (the same literal is the same address), cheaper than a map for the dozen
+    /// marks of every draw.
+    frame: Vec<(&'static str, std::time::Duration, u64)>,
+    frame_counts: Vec<(&'static str, u64)>,
+}
+
+/// The entry of `list` named `what`, added if there is none.
+fn named<'a, T: Default>(list: &'a mut Vec<(&'static str, T)>, what: &'static str) -> &'a mut T {
+    let at = match list.iter().position(|e| std::ptr::eq(e.0, what)) {
+        Some(i) => i,
+        None => match list.iter().position(|e| e.0 == what) {
+            Some(i) => i,
+            None => {
+                list.push((what, T::default()));
+                list.len() - 1
+            }
+        },
+    };
+    &mut list[at].1
 }
 
 static LAPS: std::sync::Mutex<LapTable> = std::sync::Mutex::new(LapTable {
     since: None,
     times: std::collections::BTreeMap::new(),
     counts: std::collections::BTreeMap::new(),
-    frame: std::collections::BTreeMap::new(),
-    frame_counts: std::collections::BTreeMap::new(),
+    frame: Vec::new(),
+    frame_counts: Vec::new(),
 });
+
+/// Whether MH3U_GFX_TIMES (`value`) asks for the draws' steps: any value but `calls`.
+pub(crate) fn steps_on(value: Option<&str>) -> bool {
+    value.is_some_and(|v| v.trim() != "calls")
+}
 
 /// What one frame's time went to, by step (see `Lap::take_frame`).
 pub(crate) struct FrameLaps {
@@ -2833,9 +2947,11 @@ pub(crate) fn slow_frame_text(frame: u32, ms: f64, gfx: f64, laps: &FrameLaps) -
 }
 
 impl Lap {
+    /// The draws' steps and the counts: with MH3U_GFX_TIMES, unless it is `calls` (only the calls' and frames' times, which cost
+    /// two clock readings a call instead of about 25 a draw).
     pub(crate) fn enabled() -> bool {
         static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        *ON.get_or_init(|| std::env::var_os("MH3U_GFX_TIMES").is_some())
+        *ON.get_or_init(|| steps_on(std::env::var("MH3U_GFX_TIMES").ok().as_deref()))
     }
 
     pub(crate) fn new() -> Lap {
@@ -2854,12 +2970,21 @@ impl Lap {
         let now = std::time::Instant::now();
         let mut l = LAPS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let d = now - self.at;
-        let e = l.times.entry(what).or_default();
-        e.0 += d;
-        e.1 += 1;
-        let f = l.frame.entry(what).or_default();
-        f.0 += d;
-        f.1 += 1;
+        // the frame's table only; it is added to the window's at the end of the frame (`take_frame`)
+        let f = match l
+            .frame
+            .iter()
+            .position(|e| std::ptr::eq(e.0, what))
+            .or_else(|| l.frame.iter().position(|e| e.0 == what))
+        {
+            Some(i) => &mut l.frame[i],
+            None => {
+                l.frame.push((what, std::time::Duration::ZERO, 0));
+                l.frame.last_mut().expect("just pushed")
+            }
+        };
+        f.1 += d;
+        f.2 += 1;
         self.at = now;
         Lap::maybe_print(&mut l, now);
     }
@@ -2870,28 +2995,26 @@ impl Lap {
             return;
         }
         let mut l = LAPS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        *l.counts.entry(what).or_default() += n;
-        *l.frame_counts.entry(what).or_default() += n;
+        *named(&mut l.frame_counts, what) += n;
     }
 
-    /// Adds `d` to `what` for this frame only (the non-draw graphics calls, which `[gfx times]` already has per window).
-    pub(crate) fn frame_time(what: &'static str, d: std::time::Duration) {
-        if !Lap::enabled() {
-            return;
-        }
-        let mut l = LAPS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        let f = l.frame.entry(what).or_default();
-        f.0 += d;
-        f.1 += 1;
-    }
-
-    /// The frame's steps and counts, emptied for the next frame.
+    /// The frame's steps and counts, added to the window's and emptied for the next frame (called at every swap).
     pub(crate) fn take_frame() -> FrameLaps {
         let mut l = LAPS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        FrameLaps {
-            times: std::mem::take(&mut l.frame).into_iter().map(|(k, (d, n))| (k, d, n)).collect(),
-            counts: std::mem::take(&mut l.frame_counts).into_iter().collect(),
+        let l = &mut *l;
+        let frame = FrameLaps {
+            times: std::mem::take(&mut l.frame),
+            counts: std::mem::take(&mut l.frame_counts),
+        };
+        for &(k, d, n) in &frame.times {
+            let e = l.times.entry(k).or_default();
+            e.0 += d;
+            e.1 += n;
         }
+        for &(k, n) in &frame.counts {
+            *l.counts.entry(k).or_default() += n;
+        }
+        frame
     }
 
     fn maybe_print(l: &mut LapTable, now: std::time::Instant) {
@@ -3453,6 +3576,7 @@ mod tests {
                 .collect(),
             counts: vec![("texture decodes", 3), ("bind group misses", 0)],
         };
+        assert!(steps_on(Some("1")) && steps_on(Some("")) && !steps_on(Some("calls")) && !steps_on(None));
         let line = slow_frame_text(1561, 39.4, 34.0, &laps);
         assert!(
             line.starts_with("[gfx slow frame] frame 1561: 39.4 ms (34.0 ms in graphics calls); steps: o 14.00 ms/14, n 13.00 ms/13"),
@@ -3517,26 +3641,110 @@ mod tests {
             gx2.cached_streams(&g, &st, &fetch, 0, 64, 1);
             g.put_u32(0x4000, frame);
             st.attrib_buffers[0].address = 0x4000;
-            gx2.cached_streams(&g, &st, &fetch, 0, 64, 1);
+            let changing = gx2.cached_streams(&g, &st, &fetch, 0, 64, 1);
+            assert!(!changing.kept, "vertex data rewritten every frame stays in the arena");
+            gx2.flush_draws();
             gx2.prune();
             most = most.max(gx2.caches.streams.len());
         }
-        assert!(
-            most <= 64,
-            "at most a prune's worth of one-frame streams, not one per frame: {most}"
-        );
-        // the static mesh is still the one made first
-        let (a, _) = {
-            st.attrib_buffers[0].address = 0x1000;
-            gx2.cached_streams(&g, &st, &fetch, 0, 64, 1)
-        };
-        let (b, _) = gx2.cached_streams(&g, &st, &fetch, 0, 64, 1);
-        assert!(a.buffer == b.buffer);
+        assert!(most <= 4, "only the last frames' one-frame streams, pruned every frame: {most}");
+        // run 18: only the stream drawn again got buffers of its own (each made and destroyed buffers before)
+        assert_eq!(gx2.caches.streams.values().filter(|e| e.own.is_some()).count(), 1);
+        // the static mesh is still the one given buffers in its second frame
+        st.attrib_buffers[0].address = 0x1000;
+        let a = gx2.cached_streams(&g, &st, &fetch, 0, 64, 1);
+        let b = gx2.cached_streams(&g, &st, &fetch, 0, 64, 1);
+        assert!(a.kept && b.kept && a.data.buffer == b.data.buffer && a.data.offset == 0);
         let kept: u64 = gx2.caches.streams.values().map(|e| e.size).sum();
         gx2.swaps += 60 - gx2.swaps % 60;
         gx2.prune();
-        assert_eq!(gx2.caches.stream_bytes, gx2.caches.streams.values().map(|e| e.size).sum::<u64>());
+        assert_eq!(gx2.caches.stream_bytes, own_stream_bytes(&gx2.caches.streams));
         assert!(gx2.caches.stream_bytes <= kept);
+    }
+
+    #[test]
+    fn a_new_stream_is_in_the_batch_arena_until_drawn_in_a_later_frame() {
+        let mut gx2 = Gx2::new(crate::Display::noop());
+        let mut m = vec![0u8; 0x1_0000];
+        let g = Guest::new(m.as_mut_ptr());
+        let fetch = [stream(0, 0, 0x811)];
+        let mut st = State::default();
+        st.attrib_buffers[0] = crate::state::AttribBuffer {
+            address: 0x1000,
+            size: 12 * 64,
+            stride: 12,
+        };
+        for k in 0..64 * 3 {
+            g.put_u32(0x1000 + k * 4, (k as f32).to_bits());
+        }
+        gx2.swaps = 10;
+        let first = gx2.cached_streams(&g, &st, &fetch, 0, 64, 1);
+        assert!(!first.kept);
+        // the same batch: the same place in the arena
+        let again = gx2.cached_streams(&g, &st, &fetch, 0, 64, 1);
+        assert!(again.data.buffer == first.data.buffer && again.data.offset == first.data.offset);
+        assert!(again.meta.buffer == first.meta.buffer && again.meta.offset == first.meta.offset);
+        // another batch of the same frame: written into the arena again, still no buffer of its own
+        gx2.flush_draws();
+        let later_batch = gx2.cached_streams(&g, &st, &fetch, 0, 64, 1);
+        assert!(!later_batch.kept);
+        assert!(gx2.caches.streams.values().all(|e| e.own.is_none() && e.pending.is_some()));
+        // the arena's bytes are the decoded streams
+        let key = *gx2.caches.streams.keys().next().expect("one stream");
+        let (data, meta) = gx2.caches.streams[&key].pending.clone().expect("kept bytes");
+        let arena = &gx2.batch.arenas[Role::Read as usize][0];
+        let at = later_batch.data.offset as usize;
+        assert_eq!(&arena.shadow[at..at + data.len()], &data[..]);
+        let at = later_batch.meta.offset as usize;
+        assert_eq!(&arena.shadow[at..at + meta.len()], &meta[..]);
+        // the next frame: buffers of its own, kept from then on, and the bytes let go
+        gx2.flush_draws();
+        gx2.swaps += 1;
+        gx2.prune();
+        let next = gx2.cached_streams(&g, &st, &fetch, 0, 64, 1);
+        assert!(next.kept && next.data.offset == 0 && next.data.size == data.len() as u64);
+        assert!(gx2.caches.streams[&key].pending.is_none());
+        assert_eq!(gx2.caches.stream_bytes, data.len() as u64);
+        gx2.swaps += 1;
+        let after = gx2.cached_streams(&g, &st, &fetch, 0, 64, 1);
+        assert!(after.kept && after.data.buffer == next.data.buffer);
+    }
+
+    #[test]
+    fn unused_bind_groups_go_every_frame_not_sixty_frames_at_once() {
+        let mut gx2 = Gx2::new(crate::Display::noop());
+        let layout = gx2.d.device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: None,
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::VERTEX,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            }],
+        });
+        let mut most_gone = 0;
+        for frame in 1..=200u32 {
+            gx2.swaps = frame;
+            // a new group each frame (a uniform block somewhere else in the arena)
+            let r = gx2.arena_alloc(Role::Read, 256 * u64::from(frame % 7 + 1));
+            let r = BufRef {
+                offset: 0,
+                size: 256 * u64::from(frame),
+                ..r
+            };
+            gx2.bind_group(&layout, vec![(0, r.bound())], true);
+            let before = gx2.caches.bind_groups.len();
+            gx2.flush_draws();
+            gx2.swaps += 1;
+            gx2.prune();
+            most_gone = most_gone.max(before - gx2.caches.bind_groups.len());
+        }
+        assert!(most_gone <= 1, "at most one frame's groups go at a time: {most_gone}");
+        assert!(gx2.caches.bind_groups.len() <= 62, "{}", gx2.caches.bind_groups.len());
     }
 
     #[test]

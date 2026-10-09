@@ -10,6 +10,12 @@ With the work in PRs #1–#3 (`perf/regs-flags-dispatch` → `windows-build` →
 - `MH3U_FPS=1`: an `[fps]` line every 5 s.
 - `MH3U_GFX_TIMES=1`: per report window (`MH3U_TIMES_WINDOW`, default 10 s), time per graphics call and per draw step, with
   per-frame columns; `[draw counts]` for cache hits and misses; `[baton]` for guest thread handoffs.
+  - `MH3U_GFX_TIMES=calls` keeps only the per-call and per-frame times, without the draw steps.
+  - The timing has a cost of its own. Before perf/entry-dips' second commit, a Moga Woods frame read the clock about 57,000 times
+    (six readings per graphics call, about 25 per draw). That is roughly 2–2.5 ms of a 16 ms frame at ~36 ns a reading (the box;
+    Windows' QPC is a little cheaper).
+  - It is now two readings a call and a cheaper step table: 52 ns a step mark, down from 78. The profile's `Instant::now` (7.3%
+    total) was this.
 - With either of the two above, every window also has `[gfx frames]` (slowest frame, frames over 33 and 50 ms), `[gfx caches]`
   (cache sizes), `[gfx pipelines]` and `[gfx invalidates]`, and entering an area prints `[gfx] area change at frame N` and,
   180 frames later, how those frames went (PR #5; `translator.md` has the details). Since PR #6 the first line also splits the
@@ -38,7 +44,8 @@ move the village on its own.
    steps add up to about 4 ms. The other 12+ ms is not measured. *Guess:* wgpu command encoding, submission or the flush at
    the end of the list. Run 12 showed that most of this untimed part is wgpu's own bookkeeping, and that it grows with the
    number of GPU buffers (concern 3). `[draw times]` now has `render pass end` (wgpu checks and records a whole pass when it
-   ends; the count is the number of passes), `arena uploads` and `submit`.
+   ends; the count is the number of passes), `arena uploads`, `command encoding (finish)` (where wgpu 30 really does that
+   work; see concern 7, run 18) and `submit`.
 2. **Pipeline creation when entering an area.** "pipeline" reached ~4 ms per frame in the first window after a load (0.2 ms
    otherwise). Run 11 (500c143): about 3.5 s of window 1 and 2.4 s of window 2 (village load, leaving for the field) went to
    it, against 0.1 ms a frame once the field was set up: the hitching the user feels on an area change. Texture decoding (at
@@ -160,10 +167,46 @@ move the village on its own.
    - **Texture decodes:** 57–75 in the 180 frames after an entry (7.7–17.7 ms in all). Too little to explain a 39 ms frame
      alone, but they cluster.
 
-   Branch `perf/entry-dips` (0382f7b, no PR yet) adds `[gfx slow frame]`. Any frame of 25 ms or more (`MH3U_GFX_SLOW_MS`)
-   prints its twelve longest steps, including each non-draw graphics call, with that frame's counts. It also times stream
-   buffer creation and bind group creation, and counts arena uploads and their bytes. The user is profiling the entry in
-   Visual Studio.
+   Branch `perf/entry-dips` (0382f7b) adds `[gfx slow frame]`. Any frame of 25 ms or more (`MH3U_GFX_SLOW_MS`) prints its
+   twelve longest steps, including each non-draw graphics call, with that frame's counts. It also times stream buffer creation
+   and bind group creation, and counts arena uploads and their bytes.
+
+   **Run 18 (ab8ddec, `MH3U_GFX_TIMES=1`, a PDB build, entering Moga Woods with a Visual Studio profile; Vulkan on AMD):**
+   - **What the field's steady 3.6 ms "arena uploads" was:** it held more than the uploads. Only 3 of the 12 flushes a frame
+     upload anything. The lap also covered `CommandEncoder::finish`, where wgpu 30 does the deferred work: checking the passes,
+     tracking resources, barriers, and making the Vulkan commands (in `amdvk64.dll`). It is now its own step, `command
+     encoding (finish)`. It is the largest steady CPU cost in the field, and it grows with the draws and state changes of a frame.
+   - **The 26 ms frames every 60 frames in the field.** Frames 2099, 2219, 2279, 2399, 2519 and 2819 took 25.6–29.4 ms against
+     ~16 ms. They are all frame index ≡ 59 (mod 60), and each counted 961–1,469 `vertex streams aged out`.
+     - About 20 streams a frame were made from vertex data the game rewrites every frame: two buffers, two writes and a bind group
+       each.
+     - Once a second the prune destroyed 1,000–1,500 of them at once (about 2,400 buffers and their bind groups), on the render
+       thread and in the driver.
+     - Their "12 ms in graphics calls" hid the rest: the swap's own time was counted in the next frame. That is fixed, and the
+       area-change line no longer shows more graphics time than the frame (11.3 ms with 13.6 ms in graphics calls).
+   - **The 40 ms frames after entering:**
+     - Frame 1446 (41.1 ms): `decode streams` 13.9 ms over 302 draws, 10.9 ms of it decoding 171 new streams (6.3 MB). Then
+       texture views 5.7 ms (34 decodes, 3.5 ms), `arena uploads` 2.6 ms, stream buffers 2.6 ms and 1,026 bind groups made (2.2 ms).
+     - Frame 1985 (39.7 ms): textures 9.5 ms (62 decodes, 5.9 ms), streams 6.8 ms, `arena uploads` 3.9 ms, 1,064 bind groups.
+
+     This is mostly first-sight CPU work in this code, spread over the frame.
+   - **One-off frames:** frames 71 (55 ms) and 2694 (37.6 ms) spent 35.8 and 19.8 ms in `geometry pass`. A new
+     geometry-shader combination is translated and its two compute pipelines made on the render thread, and those are neither on
+     disk nor on workers. Frame 491 (217 ms, 3 textures, 40 MB decoded) is a loading screen.
+   - **The profile:** 37% of samples were at one address in `amdvk64.dll`. One address taking that much looks like a wait loop:
+     the village runs at the display's 120 Hz with `GX2SwapScanBuffers` at 4.95 ms a frame, which is waiting for the
+     presentation. It is not work, but the call stack above that address in Visual Studio says which wait it is. `Instant::now`
+     at 7.3% total was the timing (see the top of this file).
+
+   **The fix (perf/entry-dips):**
+   - New vertex streams go into the batch's arena. They get buffers of their own only when drawn again in a later frame, so
+     data rewritten every frame costs no buffer creation or destruction, and its bind groups are not kept.
+   - Unused bind groups and streams go every frame, a few at a time, not 60 frames' worth at once.
+   - What is still open: the post-entry decodes, geometry pipelines on workers or on disk, and the command encoding's size.
+
+   To check it: `scripts\win-run.ps1 -Fps` in Moga Woods. There should be no `[gfx slow frame]` every 60 frames, `[draw counts]`
+   should show `vertex streams given buffers` well under the old ~20 stream misses a frame, and `[gfx caches]` should show fewer
+   bind groups. `command encoding (finish)` gives the steady cost that is left.
 
 ## Fixed (for the record)
 

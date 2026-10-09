@@ -146,9 +146,11 @@ extern "C" fn import(c: *mut Ctx, number: u32) {
                 if let Some(b) = k.backend.as_mut() {
                     let name = &k.report.names[number as usize];
                     if k.gfx_times {
-                        let t = std::time::Instant::now();
+                        // a backend that times its calls already says how long this one took (one pair of clock readings a call)
+                        let t = (!b.times_calls()).then(std::time::Instant::now);
                         b.call_id(id, name, c, &guest);
-                        k.times.record(number, t.elapsed(), &k.report.names);
+                        let took = t.map_or_else(|| b.last_call_time(), |t| t.elapsed());
+                        k.times.record(number, took, &k.report.names);
                     } else {
                         b.call_id(id, name, c, &guest);
                     }
