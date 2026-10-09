@@ -909,7 +909,10 @@ fn run_game(dump: &Dump, c_dir: &Path, max_imports: u64, save: PathBuf, window: 
     content.push(dump.base.join("content"));
     let options = mh3u_rt::Options {
         backend: None,
-        roots: mh3u_rt::Roots { content, save },
+        roots: mh3u_rt::Roots {
+            content,
+            save: save.clone(),
+        },
         data_imports: import_targets(&data, &text)?.data,
         entry,
         max_imports,
@@ -932,13 +935,13 @@ fn run_game(dump: &Dump, c_dir: &Path, max_imports: u64, save: PathBuf, window: 
     // the pipelines made are kept with the build, in its cache folder
     let cache = c_dir.join("cache");
     // the overlay reads the game's data from the base game, and keeps its files (the wishlist) with the build
-    let (dump_base, mods_dir) = (dump.base.clone(), c_dir.join("mods"));
+    let (dump_base, mods_dir, save_dir) = (dump.base.clone(), c_dir.join("mods"), save.clone());
     let fullscreen = mh3u_gfx::fullscreen_wanted(fullscreen, std::env::var("MH3U_FULLSCREEN").ok().as_deref());
     mh3u_gfx::run(fullscreen, move |display| {
         let mut options = options;
         let mut gx2 = mh3u_gfx::Gx2::new(display);
         gx2.use_cache_dir(&cache);
-        gx2.use_overlay(dump_base, mods_dir);
+        gx2.use_overlay(dump_base, mods_dir, save_dir);
         options.backend = Some(Box::new(gx2));
         if let Err(e) = finish(options) {
             eprintln!("{e:#}");

@@ -28,6 +28,11 @@ impl Guest {
         unsafe { self.base.add(address as usize) }
     }
 
+    /// Where guest address 0 is in the host (for the mods' search thread, which reads with atomic loads).
+    pub fn base_addr(&self) -> usize {
+        self.base as usize
+    }
+
     /// Whether the page at `address` has been touched (see `memory::touched`).
     pub fn touched(&self, address: u32) -> bool {
         crate::memory::touched(self.at(address))

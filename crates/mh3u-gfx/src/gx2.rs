@@ -186,10 +186,11 @@ struct Out { @builtin(position) position: vec4<f32>, @location(0) uv: vec2<f32> 
 ";
 
 impl Gx2 {
-    /// Draws the mod overlay (unless `MH3U_OVERLAY=off`), with the game's data from the dump's base folder and the wishlist in `dir`.
-    pub fn use_overlay(&mut self, dump_base: std::path::PathBuf, dir: std::path::PathBuf) {
+    /// Draws the mod overlay (unless `MH3U_OVERLAY=off`), with the game's data from the dump's base folder, the wishlist in `dir`, and
+    /// the hunters' names from the game's save folder (to find the live save by).
+    pub fn use_overlay(&mut self, dump_base: std::path::PathBuf, dir: std::path::PathBuf, save_dir: std::path::PathBuf) {
         if crate::overlay::enabled() && self.d.window.is_some() {
-            self.overlay = Some(crate::overlay::Overlay::new(dump_base, dir));
+            self.overlay = Some(crate::overlay::Overlay::new(dump_base, dir, save_dir));
         }
     }
 

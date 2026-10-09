@@ -11,7 +11,8 @@ and a blacksmith wishlist built on the companion app's reverse engineering.
   - **The combination's buttons are kept from the game until they are let go.** Back pressed on its own still reaches the game.
 - **`MH3U_OVERLAY=off`** turns the overlay off entirely.
 - **When closed it costs one atomic load per frame**, and egui does not run. While the wishlist has something on it, the live save
-  is also looked at four times a second, from the frame snapshot (a 35 KB copy), for the notices.
+  is also looked at four times a second, from the frame snapshot (a 35 KB copy), for the notices. Searching for it
+  happens on a thread of its own.
 - **The wishlist window:**
   1. Pick an equipment kind and type part of a name, then press `+` on a piece.
   2. Each wished piece shows what it is still missing. Open it for have/need per material (green when there is enough) and, for a
@@ -42,13 +43,23 @@ borderless fullscreen on the window's monitor.
 - **Read-only memory for mods** (`mh3u-rt/src/mods.rs`): a mod never reads guest memory itself.
   - It names the ranges it wants (`mods::watch`, up to 1 MiB). At each buffer swap the game thread copies them into a `Snapshot`.
     The game thread holds the baton there, so no game code runs during the copy and it cannot tear.
-  - `mods::search(from, to, test)` looks through memory for a place a test accepts, 8 MiB per frame, so it never stalls a frame.
-    Pages the game never touched are skipped (on Windows, reading them would commit memory).
-- **The live save** (`mh3u-mods/src/live.rs`) is found as the companion's `docs/live.md` describes. The game holds three copies of
-  the hunter's save data laid out like the `user1` file, and the live one's header points at itself: the word at +0x08 is its address
-  minus 0xc, and the word at +0x24 is that plus 0x34.
-  - The search covers MEM2 for that header, and the block found is watched and parsed with the companion's save parser.
-  - If it stops parsing (the hunter was unloaded), it is looked for again every ten seconds.
+  - `mods::search(ranges, finder)` reads memory on a thread of its own while the game runs, with atomic word loads. A value can be
+    stale or mixed, so what it finds are only candidates, checked again from a snapshot. It rests 1 ms per 8 MiB, skips pages the
+    game never touched (on Windows reading them would commit memory), and never holds up the game thread or the audio thread.
+- **The live save** (`mh3u-mods/src/live.rs`). As the companion's `docs/live.md` describes, the game holds three copies of the
+  hunter's save data laid out like the `user1` file. The live one's header points at itself (the word at +0x08 is its address minus
+  0xc, the word at +0x24 that plus 0x34); the other two have blank headers.
+  1. **Search:** the port lays out guest memory as the console and Cemu do (MEM2 at 0x1080_0000, MEM1 at 0xf400_0000, the
+     foreground bucket at 0xe000_0000; big-endian). All three are searched for both signs the companion uses: the self-pointing
+     header, and the hunters' names (read from `user1`-`user3` in the game's save folder) at +0x2b, with the zero after them.
+  2. **Check:** the candidates are copied at a frame and chosen: a self-pointing header first, else a block with a hunter's name
+     and a header that is not blank.
+  3. **Follow:** the block chosen is followed from the snapshot of each frame.
+  4. **Retry:** a search that finds nothing, or a save that goes away (the hunter unloaded), is tried again after 5, 10, 20, 40,
+     then every 60 seconds.
+
+  Each reason is logged once (`[overlay] no live save: …`, listing the candidates' header words if there were any), and the overlay
+  shows it with the time to the next try.
 - **The game data** (`mh3u-mods/src/data.rs`): item and equipment names (the English text archive) and the forging and upgrade
   recipes (the executable's data section), read from the dump's base game on a background thread at start.
 
@@ -63,9 +74,10 @@ copy can become a git dependency (the repository is private, so cargo would fetc
 
 ## Not verified yet
 
-- **Finding the live save in the port.** The header rule comes from Cemu, where guest memory is the same, so it should hold. But the
-  search has only been tested on a planted header, not on the game. Watch for `[overlay] the live save is at 0x…` after loading a
-  hunter.
+- **Finding the live save in the port.** Run 25 (PR #11's first test) never found it, with only MEM2 searched, for the header alone,
+  and the search on the game thread made the game stutter and the sound drop. Since the fix it is tested on fake memory with the
+  three copies, not on the game. Watch for `[overlay] the live save is at 0x… (why): <hunter>`, or the one `no live save: …` line
+  saying what was seen.
 - **The game data**, read from a real dump. The test that does it runs only with `MH3U_GAME_DIR` set, and there is no dump where
   this was written. Watch for `[overlay] game data: N items, N recipes, N upgrades` at start.
 - **How it looks and feels**, and fullscreen on a real monitor: the tests run egui and the draw path on a no-op GPU, and the window

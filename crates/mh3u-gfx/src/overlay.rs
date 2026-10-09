@@ -51,15 +51,28 @@ pub fn push_input(raw: egui::RawInput) {
 const NOTICE: Duration = Duration::from_secs(6);
 /// How often the save is looked at while closed, in frames, and how long after a failed search the next starts.
 const LOOK_EVERY: u64 = 15;
-const SEARCH_AGAIN: Duration = Duration::from_secs(10);
 
+/// Following the live save: wait (with a reason, after a failed search), search, check the candidates from a snapshot, follow.
 enum Save {
-    /// Not looked for yet, or looked for and not there (since when).
-    Unknown(Option<Instant>),
-    Searching,
-    /// Found at this address, and its latest contents (none while the hunter is not loaded).
-    At(u32, Option<Box<mh3u_mods::companion::save::Save>>),
+    Waiting {
+        until: Instant,
+        reason: String,
+    },
+    Searching {
+        names: Vec<String>,
+    },
+    /// The candidates are being copied at a frame (asked for at frame `asked`).
+    Checking {
+        names: Vec<String>,
+        candidates: Vec<u32>,
+        asked: u64,
+    },
+    /// Found at this address (with the name it carries, to follow it when its header is not the expected one), and its latest contents.
+    At(u32, String, Option<Box<mh3u_mods::companion::save::Save>>),
 }
+
+/// The waits between searches that find nothing: longer each time, up to a minute.
+const BACKOFF: [u64; 5] = [5, 10, 20, 40, 60];
 
 pub struct Overlay {
     renderer: Option<egui_wgpu::Renderer>,
@@ -68,6 +81,10 @@ pub struct Overlay {
     wishlist: Wishlist,
     path: PathBuf,
     save: Save,
+    save_dir: PathBuf,
+    failures: usize,
+    /// The last reason logged (each is logged once, not at every try).
+    logged: String,
     craftable: Craftable,
     notices: Vec<(String, Instant)>,
     frame: u64,
@@ -79,7 +96,7 @@ pub struct Overlay {
 impl Overlay {
     /// The overlay with the game's data read from the dump's base folder (on a thread of its own: it takes a moment) and the wishlist
     /// kept in `dir`.
-    pub fn new(dump_base: PathBuf, dir: PathBuf) -> Overlay {
+    pub fn new(dump_base: PathBuf, dir: PathBuf, save_dir: PathBuf) -> Overlay {
         let data = Arc::new(Mutex::new(None));
         let slot = data.clone();
         std::thread::spawn(move || {
@@ -108,7 +125,13 @@ impl Overlay {
             data,
             wishlist,
             path,
-            save: Save::Unknown(None),
+            save: Save::Waiting {
+                until: Instant::now(),
+                reason: String::new(),
+            },
+            save_dir,
+            failures: 0,
+            logged: String::new(),
             craftable: Craftable::default(),
             notices: Vec::new(),
             frame: 0,
@@ -146,44 +169,97 @@ impl Overlay {
         self.draw(device, queue, enc, view, format, size);
     }
 
-    /// Finds the live save (a search through the game's memory, a slice a frame) and reads it from the snapshot of each frame.
+    /// Finds the live save (the search runs on its own thread; its candidates are checked from a snapshot taken at a frame) and reads
+    /// it from the snapshot of each frame.
     fn follow_save(&mut self) {
         match &mut self.save {
-            Save::Unknown(since) => {
-                if since.is_none_or(|t| t.elapsed() > SEARCH_AGAIN) {
-                    mods::search(live::SEARCH_FROM, live::SEARCH_TO, live::is_live_block);
-                    self.save = Save::Searching;
+            Save::Waiting { until, .. } => {
+                if Instant::now() >= *until {
+                    let names = live::hunter_names(&self.save_dir);
+                    let patterns = live::name_patterns(&names);
+                    mods::search(
+                        live::RANGES.to_vec(),
+                        Arc::new(move |piece: &[u8], base: u32, out: &mut Vec<u32>| live::find_candidates(piece, base, &patterns, out)),
+                    );
+                    self.save = Save::Searching { names };
                 }
             }
-            Save::Searching => match mods::searching() {
-                Searching::Found(at) => {
-                    eprintln!("[overlay] the live save is at {at:#x}");
-                    mods::watch(&[(at, live::LEN)]);
-                    self.save = Save::At(at, None);
+            Save::Searching { names } => {
+                if let Searching::Done(candidates) = mods::searching() {
+                    let names = std::mem::take(names);
+                    // as many as fit in what can be watched
+                    let candidates: Vec<u32> = candidates.into_iter().take((mods::MOST_WATCHED / live::LEN) as usize).collect();
+                    mods::watch(&candidates.iter().map(|&c| (c, live::LEN)).collect::<Vec<_>>());
+                    let asked = mh3u_rt::FRAMES.load(Relaxed);
+                    self.save = Save::Checking { names, candidates, asked };
                 }
-                Searching::NotFound | Searching::Idle => self.save = Save::Unknown(Some(Instant::now())),
-                Searching::Running { .. } => {}
-            },
-            Save::At(at, save) => {
-                let at = *at;
+            }
+            Save::Checking { names, candidates, asked } => {
                 let snap = mods::latest();
-                let parsed = snap.bytes(at, live::LEN as usize).and_then(|b| live::parse(b, at));
-                if parsed.is_none() && snap.bytes(at, 4).is_some() {
-                    // it was there and is not now: the hunter was unloaded (or it was never the save); look again
-                    mods::watch(&[]);
-                    self.craftable.forget();
-                    self.save = Save::Unknown(Some(Instant::now()));
+                if snap.frame <= *asked && !candidates.is_empty() {
                     return;
                 }
-                *save = parsed.map(Box::new);
-                self.check_craftable();
+                let blocks: Vec<(u32, &[u8])> = candidates
+                    .iter()
+                    .filter_map(|&c| Some((c, snap.bytes(c, live::LEN as usize)?)))
+                    .collect();
+                match live::choose(&blocks, names) {
+                    Ok((at, why)) => {
+                        let name = blocks
+                            .iter()
+                            .find(|b| b.0 == at)
+                            .and_then(|b| live::parse(b.1, at, None).or_else(|| mh3u_mods::companion::save::Save::parse(b.1).ok()))
+                            .map(|s| s.hunter_name)
+                            .unwrap_or_default();
+                        eprintln!("[overlay] the live save is at {at:#x} ({why}): {name}");
+                        mods::watch(&[(at, live::LEN)]);
+                        self.failures = 0;
+                        self.logged.clear();
+                        self.save = Save::At(at, name, None);
+                    }
+                    Err(reason) => {
+                        mods::watch(&[]);
+                        self.wait(reason);
+                    }
+                }
+            }
+            Save::At(at, name, save) => {
+                let at = *at;
+                let snap = mods::latest();
+                let Some(bytes) = snap.bytes(at, live::LEN as usize) else { return };
+                match live::parse(bytes, at, Some(name)) {
+                    Some(parsed) => {
+                        *save = Some(Box::new(parsed));
+                        self.check_craftable();
+                    }
+                    None => {
+                        // the hunter was unloaded (or the block moved): look again
+                        mods::watch(&[]);
+                        self.craftable.forget();
+                        self.wait("the save that was found is not there any more (hunter unloaded?)".into());
+                    }
+                }
             }
         }
     }
 
+    /// No live save for now: says why (once per reason) and waits longer each time before searching again.
+    fn wait(&mut self, reason: String) {
+        let secs = BACKOFF[self.failures.min(BACKOFF.len() - 1)];
+        self.failures += 1;
+        if reason != self.logged {
+            eprintln!("[overlay] no live save: {reason}; searching again in {secs} s, then less often");
+            self.logged = reason.clone();
+        }
+        self.save = Save::Waiting {
+            until: Instant::now() + Duration::from_secs(secs),
+            reason,
+        };
+    }
+
     /// Notices for the pieces that just became craftable.
     fn check_craftable(&mut self) {
-        let Save::At(_, Some(save)) = &self.save else { return };
+        let Save::At(_, _, Some(save)) = &self.save else { return };
         let shared = self.data.clone();
         let guard = shared.lock().unwrap_or_else(|e| e.into_inner());
         let Some(Ok(data)) = guard.as_ref() else { return };
@@ -323,25 +399,28 @@ impl Overlay {
                     Some(Ok(d)) => d,
                 };
                 let save = match &self.save {
-                    Save::At(at, Some(s)) => {
+                    Save::At(at, _, Some(s)) => {
                         ui.label(format!("Hunter: {} (live save at {at:#x})", s.hunter_name));
                         Some(s)
                     }
-                    Save::At(..) => {
-                        ui.label("The live save is not readable just now (no hunter loaded?)");
+                    Save::At(..) | Save::Checking { .. } => {
+                        ui.label("Checking what the search found…");
                         None
                     }
-                    Save::Searching => {
+                    Save::Searching { .. } => {
                         if let Searching::Running { done, of } = mods::searching() {
-                            ui.label(format!(
-                                "Looking for the live save in memory… {}%",
-                                u64::from(done) * 100 / u64::from(of.max(1))
-                            ));
+                            ui.label(format!("Looking for the live save in memory… {}%", done * 100 / of.max(1)));
                         }
                         None
                     }
-                    Save::Unknown(_) => {
-                        ui.label("No live save found yet: load a hunter (it is looked for again every few seconds)");
+                    Save::Waiting { until, reason } => {
+                        if !reason.is_empty() {
+                            ui.colored_label(egui::Color32::LIGHT_RED, format!("No live save: {reason}"));
+                            let left = until.saturating_duration_since(Instant::now()).as_secs();
+                            ui.label(format!(
+                                "Looking again in {left} s (sooner after loading a hunter? reopening does not hurry it)"
+                            ));
+                        }
                         None
                     }
                 };
@@ -482,7 +561,7 @@ mod tests {
         let d = crate::Display::noop();
         let dir = std::env::temp_dir().join(format!("mh3u-overlay-{}", std::process::id()));
         // no dump here: the overlay says so instead of the wishlist
-        let mut o = Overlay::new(dir.join("no-dump"), dir.clone());
+        let mut o = Overlay::new(dir.join("no-dump"), dir.clone(), dir.join("save"));
         let target = d.device.create_texture(&wgpu::TextureDescriptor {
             label: None,
             size: wgpu::Extent3d {

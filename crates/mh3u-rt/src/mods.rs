@@ -2,17 +2,17 @@
 //!
 //! A mod never reads guest memory itself. It says which ranges it wants (`watch`), and at each of the game's buffer swaps the game
 //! thread, which holds the baton (so no game code runs meanwhile), copies them into a `Snapshot` that the mod reads whenever it likes.
-//! A mod can also have a range of memory searched for something (`search`): the game thread looks through a slice of it at each swap,
-//! so a search of a gigabyte takes a few seconds and never stalls a frame. With nothing watched or searched this costs one atomic load
+//! A mod can also have memory searched for something (`search`): a thread of its own reads it while the game runs (tolerantly: what it
+//! finds is to be checked again from a snapshot), so a search never holds up the game or its audio. With nothing watched or searched this costs one atomic load
 //! a frame. All values in guest memory are big-endian.
 
 use crate::guest::Guest;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering::Relaxed};
 use std::sync::{Arc, Mutex};
 
 /// The most bytes watched at once (copied every frame).
 pub const MOST_WATCHED: u32 = 1 << 20;
-/// How much of a search is done per frame.
+/// How much the search reads between short rests.
 const SEARCH_PER_FRAME: u32 = 8 << 20;
 /// The pieces a search reads at once; also the unit of the untouched-page check (Windows commits 64 KiB at a time).
 const SEARCH_PIECE: u32 = 64 << 10;
@@ -43,46 +43,41 @@ impl Snapshot {
     }
 }
 
-/// What a search looks for: called for each 4-byte aligned address with a reader of the big-endian words near it (none outside the
-/// piece being searched), it says whether this is the place.
-pub type Test = fn(read: &dyn Fn(u32) -> Option<u32>, at: u32) -> bool;
+/// What a search looks for: given a piece of memory and the guest address it was read at, it adds the places that may be it.
+pub type Finder = Arc<dyn Fn(&[u8], u32, &mut Vec<u32>) + Send + Sync>;
 
-/// How far a test may read past the address it is given (the pieces overlap by this much, so nothing is missed at their edges).
+/// How far past a piece a finder may need to see (the pieces overlap by this much, so nothing is missed at their edges).
 pub const SEARCH_REACH: u32 = 0x100;
+/// The most candidates a search gives.
+const MOST_CANDIDATES: usize = 256;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Searching {
     Idle,
-    Running { done: u32, of: u32 },
-    Found(u32),
-    NotFound,
-}
-
-struct Search {
-    next: u32,
-    from: u32,
-    to: u32,
-    test: Test,
+    Running {
+        done: u64,
+        of: u64,
+    },
+    /// The candidates found (sorted, each once).
+    Done(Vec<u32>),
 }
 
 #[derive(Default)]
 struct State {
     watched: Vec<(u32, u32)>,
     latest: Arc<Snapshot>,
-    search: Option<Search>,
-    result: Option<Option<u32>>,
 }
 
 static ACTIVE: AtomicBool = AtomicBool::new(false);
 static STATE: std::sync::LazyLock<Mutex<State>> = std::sync::LazyLock::new(Default::default);
-static SNAPSHOTS: AtomicU64 = AtomicU64::new(0);
+static SEARCH: Mutex<Searching> = Mutex::new(Searching::Idle);
+/// Which search is the current one (a newer one stops the older).
+static GENERATION: AtomicU64 = AtomicU64::new(0);
+/// Where guest memory is in the host (set at the first frame), for the search thread.
+static GUEST_BASE: AtomicUsize = AtomicUsize::new(0);
 
 fn state() -> std::sync::MutexGuard<'static, State> {
     STATE.lock().unwrap_or_else(|e| e.into_inner())
-}
-
-fn update_active(s: &State) {
-    ACTIVE.store(!s.watched.is_empty() || s.search.is_some(), Relaxed);
 }
 
 /// The ranges (start, length) copied at every frame from now on, replacing the ones before; ranges beyond `MOST_WATCHED` bytes in
@@ -101,8 +96,8 @@ pub fn watch(ranges: &[(u32, u32)]) {
         })
         .collect();
     let mut s = state();
+    ACTIVE.store(!kept.is_empty(), Relaxed);
     s.watched = kept;
-    update_active(&s);
 }
 
 /// The latest copies of the watched ranges.
@@ -110,92 +105,108 @@ pub fn latest() -> Arc<Snapshot> {
     state().latest.clone()
 }
 
-/// Starts looking through `from..to` for the place `test` accepts (replacing a search under way).
-pub fn search(from: u32, to: u32, test: Test) {
-    let mut s = state();
-    s.search = Some(Search {
-        next: from & !3,
-        from,
-        to,
-        test,
+/// Looks through `ranges` for what `finder` finds, on a thread of its own (replacing a search under way). The game's memory is read
+/// while the game runs: a value may be torn or stale, so the candidates are only that, and are to be checked from a snapshot.
+pub fn search(ranges: Vec<(u32, u32)>, finder: Finder) {
+    let generation = GENERATION.fetch_add(1, Relaxed) + 1;
+    let of = ranges.iter().map(|r| u64::from(r.1)).sum();
+    *SEARCH.lock().unwrap_or_else(|e| e.into_inner()) = Searching::Running { done: 0, of };
+    let _ = std::thread::Builder::new().name("mods search".into()).spawn(move || {
+        let current = || GENERATION.load(Relaxed) == generation;
+        // the guest's memory is known once the game has drawn a frame
+        let base = loop {
+            match GUEST_BASE.load(Relaxed) {
+                0 if current() => std::thread::sleep(std::time::Duration::from_millis(50)),
+                0 => return,
+                b => break b,
+            }
+        };
+        let mut found = Vec::new();
+        let mut done = 0u64;
+        let mut buf = vec![0u8; (SEARCH_PIECE + SEARCH_REACH) as usize];
+        let mut since_rest = 0u32;
+        for (from, len) in ranges {
+            let to = from.saturating_add(len);
+            let mut at = from & !3;
+            while at < to {
+                if !current() {
+                    return;
+                }
+                let n = SEARCH_PIECE.min(to - at);
+                if crate::memory::touched((base + at as usize) as *const u8) {
+                    let reach_ok = at.checked_add(n + SEARCH_REACH).is_some_and(|e| e <= to)
+                        && crate::memory::touched((base + (at + n) as usize) as *const u8);
+                    let len = (n + if reach_ok { SEARCH_REACH } else { 0 }) as usize;
+                    read_tolerant(base, at, &mut buf[..len]);
+                    finder(&buf[..len], at, &mut found);
+                    found.truncate(MOST_CANDIDATES * 4);
+                }
+                at = at.saturating_add(n);
+                done += u64::from(n);
+                since_rest += n;
+                // a moment's rest every 8 MiB: the search is in no hurry, the game's threads are
+                if since_rest >= SEARCH_PER_FRAME {
+                    since_rest = 0;
+                    if let Ok(mut s) = SEARCH.lock()
+                        && current()
+                    {
+                        *s = Searching::Running { done, of };
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+            }
+        }
+        found.sort_unstable();
+        found.dedup();
+        found.truncate(MOST_CANDIDATES);
+        if current() {
+            *SEARCH.lock().unwrap_or_else(|e| e.into_inner()) = Searching::Done(found);
+        }
     });
-    s.result = None;
-    update_active(&s);
+}
+
+/// Reads guest memory while the game may be writing it: word by word with atomic loads, so a value can be stale or mixed but the read
+/// itself is sound. `at` is 4-aligned and the range touched (see `memory::touched`).
+fn read_tolerant(base: usize, at: u32, out: &mut [u8]) {
+    for (k, w) in out.as_chunks_mut::<4>().0.iter_mut().enumerate() {
+        let p = (base + at as usize + 4 * k) as *const u32;
+        // SAFETY: inside the guest's reserved range, aligned to 4 and committed (the caller checked `touched`); an atomic load does
+        // not tear and is sound alongside the game's writes
+        let v = unsafe { std::sync::atomic::AtomicU32::from_ptr(p.cast_mut()) }.load(Relaxed);
+        w.copy_from_slice(&v.to_ne_bytes());
+    }
 }
 
 pub fn searching() -> Searching {
-    let s = state();
-    match (&s.search, s.result) {
-        (Some(x), _) => Searching::Running {
-            done: x.next - x.from,
-            of: x.to - x.from,
-        },
-        (None, Some(Some(at))) => Searching::Found(at),
-        (None, Some(None)) => Searching::NotFound,
-        (None, None) => Searching::Idle,
-    }
+    SEARCH.lock().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
+/// Stops a search under way.
+pub fn stop_search() {
+    GENERATION.fetch_add(1, Relaxed);
+    *SEARCH.lock().unwrap_or_else(|e| e.into_inner()) = Searching::Idle;
 }
 
 /// Called by the game thread at each buffer swap (with the baton): copies the watched ranges and goes on with the search.
 pub(crate) fn on_frame(g: &Guest) {
+    GUEST_BASE.store(g.base_addr(), Relaxed);
     if !ACTIVE.load(Relaxed) {
         return;
     }
     let mut s = state();
-    if !s.watched.is_empty() {
-        let ranges = s
-            .watched
-            .iter()
-            .map(|&(at, len)| {
-                let mut data = vec![0; len as usize];
-                g.read(at, &mut data);
-                (at, data)
-            })
-            .collect();
-        s.latest = Arc::new(Snapshot {
-            frame: crate::FRAMES.load(Relaxed),
-            ranges,
-        });
-        SNAPSHOTS.fetch_add(1, Relaxed);
-    }
-    if let Some(search) = s.search.as_mut() {
-        let found = search_slice(g, search);
-        if let Some(found) = found {
-            s.result = Some(found);
-            s.search = None;
-            update_active(&s);
-        }
-    }
-}
-
-/// One frame's slice of a search: `Some(result)` when it ends.
-fn search_slice(g: &Guest, x: &mut Search) -> Option<Option<u32>> {
-    let end = x.to.min(x.next.saturating_add(SEARCH_PER_FRAME));
-    while x.next < end {
-        let piece = x.next;
-        let len = SEARCH_PIECE.min(x.to - piece);
-        x.next = piece.saturating_add(len);
-        if !g.touched(piece) {
-            continue;
-        }
-        // the piece and the reach after it (when touched), read in place
-        let reach = if piece.checked_add(len + SEARCH_REACH).is_some_and(|e| e <= x.to && g.touched(e - 1)) {
-            SEARCH_REACH
-        } else {
-            0
-        };
-        let hit = g.with_bytes(piece, (len + reach) as usize, |bytes| {
-            let read = |at: u32| -> Option<u32> {
-                let o = at.checked_sub(piece)? as usize;
-                Some(u32::from_be_bytes(bytes.get(o..o + 4)?.try_into().ok()?))
-            };
-            (0..len / 4).map(|k| piece + 4 * k).find(|&at| (x.test)(&read, at))
-        });
-        if hit.is_some() {
-            return Some(hit);
-        }
-    }
-    (x.next >= x.to).then_some(None)
+    let ranges = s
+        .watched
+        .iter()
+        .map(|&(at, len)| {
+            let mut data = vec![0; len as usize];
+            g.read(at, &mut data);
+            (at, data)
+        })
+        .collect();
+    s.latest = Arc::new(Snapshot {
+        frame: crate::FRAMES.load(Relaxed),
+        ranges,
+    });
 }
 
 #[cfg(test)]
@@ -204,7 +215,7 @@ mod tests {
 
     /// The tests share the one state, so they run as one.
     #[test]
-    fn watched_ranges_are_copied_at_a_frame_and_a_search_finds_its_place_across_frames() {
+    fn watched_ranges_are_copied_at_a_frame_and_a_search_thread_finds_its_place() {
         let mut memory = crate::memory::GuestMemory::reserve().expect("guest memory");
         let g = Guest::new(memory.as_mut_ptr());
         // nothing asked: nothing copied
@@ -229,22 +240,40 @@ mod tests {
         assert_eq!(latest().u32(0x1000_0000), Some(1));
         watch(&[]);
 
-        // a place whose word at +8 points 0xc before it and whose word at +0x24 is that plus 0x34 (the live save's header), placed
-        // across two pieces' edge and two frames' slices into the search
-        let at = 0x1100_0000 + SEARCH_PER_FRAME + SEARCH_PIECE - 0x10;
+        // a place whose header points at itself, across two pieces' edge, found by the search thread while "the game" writes
+        // elsewhere
+        let at = 0x1100_0000 + 3 * SEARCH_PIECE - 0x10;
         g.put_u32(at + 8, at - 0xc);
         g.put_u32(at + 0x24, at - 0xc + 0x34);
-        fn test(read: &dyn Fn(u32) -> Option<u32>, at: u32) -> bool {
-            read(at + 8) == Some(at.wrapping_sub(0xc)) && read(at + 0x24) == Some(at.wrapping_add(0x28))
-        }
-        search(0x1100_0000, 0x1100_0000 + 4 * SEARCH_PER_FRAME, test);
-        on_frame(&g);
-        assert!(matches!(searching(), Searching::Running { .. }));
-        on_frame(&g);
-        assert_eq!(searching(), Searching::Found(at));
-        // and one that is not there ends as not found
-        search(0x1200_0000, 0x1200_0000 + SEARCH_PER_FRAME, test);
-        on_frame(&g);
-        assert_eq!(searching(), Searching::NotFound);
+        let finder: Finder = Arc::new(|piece: &[u8], base: u32, out: &mut Vec<u32>| {
+            for k in (0..piece.len().saturating_sub(0x28)).step_by(4) {
+                let w = |o: usize| u32::from_be_bytes(piece[o..o + 4].try_into().unwrap());
+                let a = base + k as u32;
+                if w(k + 8) == a.wrapping_sub(0xc) && w(k + 0x24) == a.wrapping_add(0x28) {
+                    out.push(a);
+                }
+            }
+        });
+        let wait = || {
+            let t = std::time::Instant::now();
+            loop {
+                if let Searching::Done(v) = searching() {
+                    return v;
+                }
+                assert!(t.elapsed() < std::time::Duration::from_secs(20), "the search did not end");
+                g.put_u32(0x1200_0000, t.elapsed().as_nanos() as u32);
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+        };
+        search(
+            vec![(0x1100_0000, 4 * SEARCH_PER_FRAME), (0x1300_0000, SEARCH_PIECE)],
+            finder.clone(),
+        );
+        assert_eq!(wait(), [at]);
+        // an empty search ends with nothing
+        search(vec![(0x1400_0000, SEARCH_PER_FRAME)], finder);
+        assert_eq!(wait(), Vec::<u32>::new());
+        stop_search();
+        assert_eq!(searching(), Searching::Idle);
     }
 }
