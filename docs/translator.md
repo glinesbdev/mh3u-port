@@ -213,12 +213,24 @@ with their text and the cloth background, upright, in the right places (the hunt
 - **What a draw costs on the CPU** (about 50 microseconds by `MH3U_GFX_TIMES` before these changes, ~125 draws a frame in the village): nothing per draw is found by a
   formatted string or a hash of the whole program any more.
   - *Shaders*: a translation is found by a front cache (`shader_cache.rs`) keyed by what is cheap to read: the shader's address, its
-    program's address and size, the fetch shader's version (a new shared slice per `GX2InitFetchShaderEx`), half z, and for pixel
-    shaders a hash of the input words and the texture kinds. The program bytes still decide: each entry keeps their hash, the first
-    draw of every frame that uses it hashes them again, and `GX2Invalidate` with the shader (8) or CPU (0x40) bit drops the entries
-    whose programs it overlaps. The assumption: a program rewritten in place without `GX2Invalidate` may be drawn as it was for the
-    rest of that frame (the console's GPU reads programs through its own cache too). Geometry pipelines are found the same way (their
-    key also has half z and the ring sizes, which the translation uses).
+    program's address and size, the fetch shader's contents (`GX2InitFetchShaderEx` makes one shared slice per distinct attribute
+    description, so its address names the contents: the game makes some fetch shaders again every frame, and with a new slice each
+    time every draw with them missed and left an entry behind), half z, and for pixel shaders a hash of the input words and the
+    texture kinds. The program bytes still decide: each entry keeps their hash, the first draw of every frame that uses it hashes
+    them again, and `GX2Invalidate` with the shader (8) or CPU (0x40) bit drops the entries whose programs it overlaps. The entries
+    are indexed by where their programs start, so an invalidate looks only at the programs near the memory it names (the game
+    invalidates about a thousand times a frame); entries not drawn with for 600 frames go, and past 16384 the least recently used. The
+    assumption: a program rewritten in place without `GX2Invalidate` may be drawn as it was for the rest of that frame (the console's
+    GPU reads programs through its own cache too). Geometry pipelines are found the same way (their key also has half z and the ring
+    sizes, which the translation uses).
+  - *Render pipelines* (`pipelines.rs`): found by the shaders' translations and the state the pipeline holds; a new one is made on a
+    worker thread and its draw is not drawn until it is there (usually a frame or two; `MH3U_GFX_ASYNC_PIPELINES=off` makes the draw
+    wait instead, as before). Each one made is written down under `<out>/cache/pipelines/<key>/` (its shaders' WGSL in `shaders/`,
+    its state as a line of `pipelines.txt`; the key is a hash of the build and the adapter and driver, written in `about.txt`), and all
+    of them are made again on the workers at the next start, found then by a hash of the WGSL whatever addresses the shaders have.
+    `MH3U_GFX_PIPELINE_CACHE=off` turns the disk cache off, `MH3U_GFX_CACHE_DIR` puts it elsewhere; deleting the folder is always
+    safe. `wgpu::PipelineCache` (Vulkan's own cache of compiled pipelines) is not used: making one is an `unsafe` call, and only
+    `mh3u-rt` may have `unsafe` code.
   - *Uploads*: what a batch's draws read (uniform blocks, indices, geometry parameters) is written into a copy of the arena in memory
     and uploaded with one write per arena when the batch is flushed. The vertex streams' start table lives with the cached streams,
     and the geometry draws use the stream cache too.
@@ -232,7 +244,10 @@ with their text and the cloth background, upright, in the right places (the hunt
     at a time. A draw's index list (made relative to its lowest vertex, fans and quads made into triangles) is kept by the draw and an
     XXH3 hash of its index bytes, which are also compared: the first time it goes into the arena, the second time it gets a buffer of
     its own that later frames use as it is, so a mesh drawn every frame builds and uploads its list once. Lists not drawn again
-    within two frames are forgotten.
+    within two frames are forgotten. Decoded vertex streams follow the same rule: one not drawn with in a later frame than the one
+    it was made in (vertex data the game rewrites every frame) goes at the next prune, and any stream goes after 120 frames unused.
+    Each stream is two GPU buffers, and wgpu's per-pass and per-submit bookkeeping grows with the most buffers ever alive (run 12:
+    31,000 streams kept, the replay three times slower at the same draws; see `docs/performance.md`, open concern 3).
   - *Textures*: a texture already made is found by the five header words of its key in one look-up. `GX2Invalidate` over its memory
     no longer throws it away: it is marked, and at its next use the header words and the bytes of its image and smaller levels are
     hashed and compared with what it was decoded from; it is decoded again only if they differ (a hash pass instead of untiling every
@@ -243,6 +258,13 @@ with their text and the cloth background, upright, in the right places (the hunt
     of the target is not kept.
   - *System calls*: the report's counters are arrays indexed by import number, `MH3U_TRACE_FROM` is read once, and the timing report
     allocates nothing per call.
+
+  With `MH3U_GFX_TIMES=1` (or `MH3U_FPS=1`), every window also has `[gfx frames]` (the slowest frame and how many took over 33 and
+  50 ms), `[gfx caches]` (the size of every cache: one that only grows shows here), `[gfx pipelines]` (made with the draw waiting,
+  handed to workers, made by them and their time, draws not drawn while theirs was made, found made) and `[gfx invalidates]` (how many
+  `GX2Invalidate`, how many reached the shader caches and how many index entries each looked at, and their time a frame); and a frame
+  that makes eight or more new pipelines or shader translations prints `[gfx] area change at frame N: ...`, then, 180 frames later,
+  how those frames went (the slowest, the mean, how many took over 50 ms, the pipelines made).
 
   The reports: `MH3U_GFX_TIMES=1` gives each line as a total, a count, and both per frame (`[gfx times]` per graphics call, `[draw
   times]` per part of a draw, where "geometry pass" counts only the draws with a geometry shader), and `[draw counts]`: hits, checks
@@ -272,7 +294,7 @@ with their text and the cloth background, upright, in the right places (the hunt
   (`gilrs`, on a thread of their own), combined in one shared state. Keys are named by position: WASD is the left stick, the arrow keys the
   right stick, Enter A, Backspace B, X, C the X and Y buttons, I/J/K/L the D-pad, Q/E L and R, 1/3 ZL and ZR, P plus, O minus, Left
   and Right Shift the stick clicks. A pushed stick also
-  sets the stick's direction buttons (the menus read those). Gamepad face buttons go by label (the Xbox A is the GamePad's A); `MH3U_PAD_LAYOUT=position` puts them where the GamePad's are. The gamepad thread takes the pending events without waiting and sleeps 4 ms when there are none (it used to wait in
+  sets the stick's direction buttons (the menus read those). Gamepad face buttons: by default the button gilrs names East is the GamePad's A, South B, North X, West Y. With the user's Xbox pad on Windows, this makes the Xbox A the game's A; the earlier mapping (South A, East B, West X, North Y) had the Xbox A acting as the game's B. `MH3U_PAD_LAYOUT=nintendo` brings the earlier mapping back (`position`, the old setting, now means the default). The log says which layout is on (`gamepad buttons: …`), and the first press of each face button what it was taken as (`[gamepad] South is the GamePad's B`). The gamepad thread takes the pending events without waiting and sleeps 4 ms when there are none (it used to wait in
   gilrs's blocking call; a Windows profile seemed to put a whole core there, but the time was the baton's, see Threads above); `MH3U_GAMEPADS=0` turns gamepads off entirely (no thread,
   no backend), for comparing. The mouse is the touch panel (the picture is the TV's, so it only matters once
   the GamePad's screen is shown). `VPADGetTPCalibratedPoint` scales the raw touch values (0 to 4095) to 1280 x 720 (a guess). The Wii
@@ -395,4 +417,4 @@ from a given call site), `MH3U_PROFILE=<s>` (a sampling profile of the translate
 PowerPC (`mh3u_ppc::format`). More: `MH3U_TRACE_FROM=<s>` (trace only after that long), `MH3U_TRACE_DYNAMIC=1` (calls of functions found
 at run time, with arguments and return address), `MH3U_TRACE_PAD=1` (what `VPADRead` returns), `MH3U_TRACE_AX=1` (voice positions),
 `MH3U_PRESS_DUTY=<percent>` (how long of its period `MH3U_PRESS` holds), `MH3U_PRESS_SWEEP=<s>` and `MH3U_TOUCH_SWEEP=<s>` (press every
-button, or touch a grid of points, in turn from then on), `MH3U_PAD_LAYOUT=position` (gamepad face buttons by position instead of label).
+button, or touch a grid of points, in turn from then on), `MH3U_PAD_LAYOUT=nintendo` (gamepad face buttons with A and B, and X and Y, swapped back to the earlier mapping).

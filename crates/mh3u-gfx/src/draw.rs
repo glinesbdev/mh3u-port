@@ -117,6 +117,21 @@ pub(crate) fn vertex_attributes(semantics: &Option<Vec<u32>>, fetch: &[AttribStr
 pub struct Compiled {
     pub module: wgpu::ShaderModule,
     pub interface: Interface,
+    /// The WGSL it was made from (for the pipeline cache on disk) and a hash of it (which names it there).
+    pub wgsl: Arc<str>,
+    pub id: u64,
+}
+
+impl Compiled {
+    pub(crate) fn new(module: wgpu::ShaderModule, interface: Interface, wgsl: String) -> Compiled {
+        let id = xxhash_rust::xxh3::xxh3_64(wgsl.as_bytes());
+        Compiled {
+            module,
+            interface,
+            wgsl: wgsl.into(),
+            id,
+        }
+    }
 }
 
 /// A geometry pipeline: the three translated stages, how many vertices the geometry shader may emit, and the compute pipelines of the
@@ -135,7 +150,7 @@ pub struct GeometryEntry {
 
 /// A fetch shader's streams, shared (see `Gx2::fetch_shaders`).
 pub type Fetch = Arc<[AttribStream]>;
-/// The front key of a vertex shader: (shader, program, size, fetch shader version, half z).
+/// The front key of a vertex shader: (shader, program, size, fetch shader contents (the address of its interned slice), half z).
 pub type VertexFront = (u32, u32, u32, usize, bool);
 /// What else a pixel shader's translation depends on: the kinds and component selectors of the textures it reads, and the alpha test.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -214,21 +229,7 @@ pub struct PipelineEntry {
 pub(crate) struct PipelineKey {
     vs: usize,
     ps: usize,
-    topology: wgpu::PrimitiveTopology,
-    target_format: wgpu::TextureFormat,
-    blend: crate::state::Blend,
-    depth_format: Option<wgpu::TextureFormat>,
-    blend_on: u32,
-    masks: u32,
-    depth_test: bool,
-    depth_write: bool,
-    depth_func: u32,
-    cull: u8,
-    front_face: u32,
-    /// The stencil test when it is on (and the depth buffer has stencil): the faces' settings and the read and write masks.
-    stencil: Option<([u32; 4], [u32; 4], u32, u32)>,
-    /// The depth bias: constant, and the bits of the slope scale and the clamp.
-    bias: (i32, u32, u32),
+    state: crate::pipelines::PipelineState,
 }
 
 /// A depth buffer the game draws with, and its views (made once): the whole of it for drawing, its depth for sampling.
@@ -261,7 +262,7 @@ const BIND_GROUP_LIMIT: usize = 16384;
 pub struct DrawCaches {
     pub vertex: HashMap<(u32, u32, u64), Option<Arc<Compiled>>>,
     pub pixel: HashMap<(u32, u64), Option<Arc<Compiled>>>,
-    /// The fronts of the two (see `shader_cache`): by (shader, program, size, fetch shader version, half z), and by (shader, program,
+    /// The fronts of the two (see `shader_cache`): by (shader, program, size, fetch shader contents, half z), and by (shader, program,
     /// size, hash of the inputs' words, texture kinds).
     pub vertex_front: FrontCache<VertexFront, (Option<Arc<Compiled>>, Fetch)>,
     pub pixel_front: FrontCache<PixelFront, Option<Arc<Compiled>>>,
@@ -304,6 +305,8 @@ pub struct DrawCaches {
     /// Decoded vertex streams kept on the GPU, by what they were decoded from (the layout and a hash of the bytes).
     pub streams: HashMap<(u64, u64), StreamEntry>,
     pub stream_bytes: u64,
+    /// Shaders translated and textures decoded so far (for the area-change lines, `perf.rs`).
+    pub work: crate::perf::Work,
 }
 
 /// The uploads of one uniform block in the current batch (`batch`, see `Batch::generation`), newest last: its guest bytes and where they
@@ -374,6 +377,20 @@ pub struct StreamEntry {
     meta: wgpu::Buffer,
     size: u64,
     used: u32,
+    /// Drawn with in a later frame than the one it was made in (vertex data that changes every frame makes entries that never are).
+    reused: bool,
+}
+
+/// How long a decoded vertex stream is kept without being drawn with, in frames; one never drawn with after the frame it was made in
+/// goes at the next prune (see `keep_stream`).
+const STREAM_AGE: u32 = 120;
+
+/// Whether a vertex stream last drawn with in `used` is kept at `swaps`: not drawn with for `STREAM_AGE` frames, it goes; one made from
+/// bytes that were never drawn again (vertex data the game rewrites every frame) goes once its frame is over. Every stream is two GPU
+/// buffers, and wgpu's per-pass and per-submit bookkeeping grows with how many buffers there are (run 12: 31,000 streams, the replay
+/// three times slower at the same draws).
+pub(crate) fn keep_stream(used: u32, reused: bool, swaps: u32) -> bool {
+    used.saturating_add(STREAM_AGE) >= swaps && (reused || used.saturating_add(2) >= swaps)
 }
 
 /// A quick hash of bytes (eight at a time), for telling whether vertex data is what it was.
@@ -614,7 +631,7 @@ fn attribute_size(format: u32) -> u32 {
     attribute_layout(format).map_or(4, |(sizes, _)| sizes.iter().sum::<u32>().div_ceil(8))
 }
 
-fn blend_factor(f: u32) -> wgpu::BlendFactor {
+pub(crate) fn blend_factor(f: u32) -> wgpu::BlendFactor {
     use wgpu::BlendFactor as B;
     match f {
         0 => B::Zero,
@@ -634,7 +651,7 @@ fn blend_factor(f: u32) -> wgpu::BlendFactor {
     }
 }
 
-fn blend_op(op: u32) -> wgpu::BlendOperation {
+pub(crate) fn blend_op(op: u32) -> wgpu::BlendOperation {
     use wgpu::BlendOperation as O;
     match op {
         0 => O::Add,
@@ -661,7 +678,7 @@ fn stencil_op(f: u32) -> wgpu::StencilOperation {
 }
 
 /// One face's stencil settings: (comparison, fail, depth fail, pass).
-fn stencil_face(f: [u32; 4]) -> wgpu::StencilFaceState {
+pub(crate) fn stencil_face(f: [u32; 4]) -> wgpu::StencilFaceState {
     wgpu::StencilFaceState {
         compare: compare(f[0]),
         fail_op: stencil_op(f[1]),
@@ -746,7 +763,7 @@ fn depth_copy_pipeline(device: &wgpu::Device) -> (wgpu::RenderPipeline, wgpu::Bi
 
 /// Whether the colour hardware blends into a buffer of this format: not one of 32-bit float components (the shadow pass draws its
 /// r32f map with the blending of the draws before it still on, and the value it writes, z/w, is also its alpha), so it writes over.
-fn blends(format: wgpu::TextureFormat) -> bool {
+pub(crate) fn blends(format: wgpu::TextureFormat) -> bool {
     use wgpu::TextureFormat as F;
     !matches!(format, F::R32Float | F::Rg32Float | F::Rgba32Float)
 }
@@ -756,7 +773,7 @@ fn compare_sampler_function(f: u32) -> wgpu::CompareFunction {
     if f > 7 { wgpu::CompareFunction::LessEqual } else { compare(f) }
 }
 
-fn compare(f: u32) -> wgpu::CompareFunction {
+pub(crate) fn compare(f: u32) -> wgpu::CompareFunction {
     use wgpu::CompareFunction as C;
     match f {
         0 => C::Never,
@@ -861,6 +878,7 @@ impl Gx2 {
         if let Some(c) = self.caches.vertex.get(&key) {
             return c.clone();
         }
+        self.caches.work.translated += 1;
         let result = (|| {
             let decoded = decode(&code).map_err(|e| e.to_string())?;
             let attributes = vertex_attributes(&vertex_semantics(g, vs), fetch);
@@ -886,10 +904,7 @@ impl Gx2 {
         let compiled = match result {
             Ok(t) => {
                 let module = self.compile("vertex shader", &t.wgsl);
-                Some(Arc::new(Compiled {
-                    module,
-                    interface: t.interface,
-                }))
+                Some(Arc::new(Compiled::new(module, t.interface, t.wgsl)))
             }
             Err(e) => {
                 self.diag.untranslated(format!("vertex shader {vs:#x}"), &e);
@@ -958,6 +973,7 @@ impl Gx2 {
         if let Some(c) = self.caches.pixel.get(&key) {
             return c.clone();
         }
+        self.caches.work.translated += 1;
         let PixelVariant { kinds, selects, alpha } = *variant;
         let constants = loop_constants(g, g.u32(ps + 0xc8), g.u32(ps + 0xcc));
         let result = (|| {
@@ -986,10 +1002,7 @@ impl Gx2 {
                         .replace("    return o;\n}", "    o.c0 = vec4<f32>(1.0, 0.0, 0.0, 1.0);\n    return o;\n}");
                 }
                 let module = self.compile("pixel shader", &t.wgsl);
-                Some(Arc::new(Compiled {
-                    module,
-                    interface: t.interface,
-                }))
+                Some(Arc::new(Compiled::new(module, t.interface, t.wgsl)))
             }
             Err(e) => {
                 self.diag.untranslated(format!("pixel shader {ps:#x}"), &e);
@@ -1147,6 +1160,7 @@ impl Gx2 {
                     );
                     lap.mark("texture upload and hash (in texture views)");
                     Lap::count("texture decodes", 1);
+                    self.caches.work.decoded += 1;
                     Lap::count("texture bytes decoded", u64::from(h.image_size) + u64::from(h.mip_size));
                     Some(())
                 }
@@ -1163,10 +1177,40 @@ impl Gx2 {
     }
 
     /// `GX2Invalidate` of shader memory: the translations made from programs there are looked up by their bytes again.
-    pub(crate) fn invalidate_shaders(&mut self, address: u32, size: u32) {
+    /// Returns how many index entries of the front caches it looked at.
+    pub(crate) fn invalidate_shaders(&mut self, address: u32, size: u32) -> usize {
         self.caches.vertex_front.invalidate(address, size);
         self.caches.pixel_front.invalidate(address, size);
         self.caches.geometry_front.invalidate(address, size);
+        self.caches.vertex_front.examined + self.caches.pixel_front.examined + self.caches.geometry_front.examined
+    }
+
+    /// How big each cache is, for `[gfx caches]` (a cache that only grows shows here).
+    pub(crate) fn cache_sizes(&self) -> String {
+        let c = &self.caches;
+        let (made, being_made) = self.pipes.sizes();
+        format!(
+            "shader fronts: vertex {}, pixel {}, geometry {}; translations: vertex {}, pixel {}, geometry {}; pipelines: {} by shader \
+             address, {} made, {} being made, {} left from the disk; fetch shaders {} distinct; bind groups {}; textures {}; vertex \
+             streams {} ({:.1} MB); index lists {}; uniform blocks {}",
+            c.vertex_front.len(),
+            c.pixel_front.len(),
+            c.geometry_front.len(),
+            c.vertex.len(),
+            c.pixel.len(),
+            c.geometry.len(),
+            c.pipelines.len(),
+            made,
+            being_made,
+            self.pipes.prebuilding,
+            self.fetch_interned.values().map(Vec::len).sum::<usize>(),
+            c.bind_groups.len(),
+            c.textures.len(),
+            c.streams.len(),
+            c.stream_bytes as f64 / 1e6,
+            c.indices.len(),
+            c.uniforms.len()
+        )
     }
 
     /// `GX2Invalidate` of texture memory: the textures it overlaps are checked against their bytes at their next use.
@@ -1546,6 +1590,9 @@ impl Gx2 {
         lap.mark("stream hash");
         if let Some(e) = self.caches.streams.get_mut(&key) {
             lap.mark("stream hit");
+            if e.used != swaps {
+                e.reused = true;
+            }
             e.used = swaps;
             let (buffer, meta) = (e.buffer.clone(), e.meta.clone());
             let size = e.size;
@@ -1587,7 +1634,7 @@ impl Gx2 {
         self.caches.stream_bytes += size;
         if self.caches.stream_bytes > (1 << 30) {
             let before = self.caches.stream_bytes;
-            self.caches.streams.retain(|_, e| e.used + 120 >= swaps);
+            self.caches.streams.retain(|_, e| keep_stream(e.used, e.reused, swaps));
             self.caches.stream_bytes = self.caches.streams.values().map(|e| e.size).sum::<u64>() + size;
             if self.caches.stream_bytes > before / 2 && self.caches.stream_bytes > (1 << 30) {
                 self.caches.streams.clear();
@@ -1601,6 +1648,7 @@ impl Gx2 {
                 meta: meta_buffer.clone(),
                 size,
                 used: swaps,
+                reused: false,
             },
         );
         (
@@ -1853,6 +1901,15 @@ impl Gx2 {
                 .sum();
             // an invalidated texture is kept in case its bytes did not change; one not drawn since goes as it did before
             self.caches.textures.retain(|_, t| !t.dirty || t.used + 60 >= swaps);
+            // shader fronts not drawn with for a while, and the least recently used past their cap
+            let aged =
+                self.caches.vertex_front.sweep(swaps) + self.caches.pixel_front.sweep(swaps) + self.caches.geometry_front.sweep(swaps);
+            Lap::count("shader front entries aged out", aged as u64);
+            // vertex streams not drawn with for a while, and the ones made from bytes that were drawn once
+            let before = self.caches.streams.len();
+            self.caches.streams.retain(|_, e| keep_stream(e.used, e.reused, swaps));
+            self.caches.stream_bytes = self.caches.streams.values().map(|e| e.size).sum();
+            Lap::count("vertex streams aged out", (before - self.caches.streams.len()) as u64);
         }
     }
 
@@ -2011,124 +2068,38 @@ impl Gx2 {
             _ => (0, 0, 0),
         };
         let bias = if use_depth.is_some() && depth_bias_on() { bias } else { (0, 0, 0) };
-        let strip = matches!(
-            topology,
-            wgpu::PrimitiveTopology::TriangleStrip | wgpu::PrimitiveTopology::LineStrip
-        );
         let key = PipelineKey {
             vs: Arc::as_ptr(&vs) as usize,
             ps: Arc::as_ptr(&ps) as usize,
-            topology,
-            target_format,
-            blend: st.blend[0].clone(),
-            depth_format: use_depth.map(|d| d.1),
-            blend_on: st.colour_control[1] & 1,
-            masks: st.target_masks & 0xf,
-            depth_test: st.depth_test,
-            depth_write: st.depth_write,
-            depth_func: st.depth_func,
-            cull: st.cull_front as u8 * 2 + st.cull_back as u8,
-            front_face: st.front_face,
-            stencil,
-            bias,
+            state: crate::pipelines::PipelineState {
+                topology,
+                target_format,
+                blend: st.blend[0].clone(),
+                depth_format: use_depth.map(|d| d.1),
+                blend_on: st.colour_control[1] & 1,
+                masks: st.target_masks & 0xf,
+                depth_test: st.depth_test,
+                depth_write: st.depth_write,
+                depth_func: st.depth_func,
+                cull: st.cull_front as u8 * 2 + st.cull_back as u8,
+                front_face: st.front_face,
+                stencil,
+                bias,
+            },
         };
         let entry = match self.caches.pipelines.get(&key) {
             Some(e) => e.clone(),
             None => {
-                let blend_on = st.colour_control[1] & 1 != 0 && blends(target_format);
-                let b = &st.blend[0];
-                let blend = blend_on.then(|| wgpu::BlendState {
-                    color: wgpu::BlendComponent {
-                        src_factor: blend_factor(b.colour_src),
-                        dst_factor: blend_factor(b.colour_dst),
-                        operation: blend_op(b.colour_op),
-                    },
-                    alpha: if b.separate_alpha {
-                        wgpu::BlendComponent {
-                            src_factor: blend_factor(b.alpha_src),
-                            dst_factor: blend_factor(b.alpha_dst),
-                            operation: blend_op(b.alpha_op),
-                        }
-                    } else {
-                        wgpu::BlendComponent {
-                            src_factor: blend_factor(b.colour_src),
-                            dst_factor: blend_factor(b.colour_dst),
-                            operation: blend_op(b.colour_op),
-                        }
-                    },
-                });
-                let mask = wgpu::ColorWrites::from_bits_truncate(st.target_masks & 0xf);
-                let colour_targets: Vec<Option<wgpu::ColorTargetState>> = ps
-                    .interface
-                    .colour_outputs
-                    .iter()
-                    .map(|_| {
-                        Some(wgpu::ColorTargetState {
-                            format: target_format,
-                            blend,
-                            write_mask: mask,
-                        })
-                    })
-                    .collect();
-                let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                    label: Some("game pipeline"),
-                    layout: None,
-                    vertex: wgpu::VertexState {
-                        module: &vs.module,
-                        entry_point: Some("main"),
-                        compilation_options: Default::default(),
-                        buffers: &[],
-                    },
-                    fragment: Some(wgpu::FragmentState {
-                        module: &ps.module,
-                        entry_point: Some("main"),
-                        compilation_options: Default::default(),
-                        targets: &colour_targets,
-                    }),
-                    primitive: wgpu::PrimitiveState {
-                        topology,
-                        strip_index_format: strip.then_some(wgpu::IndexFormat::Uint32),
-                        front_face: if st.front_face == 0 {
-                            wgpu::FrontFace::Ccw
-                        } else {
-                            wgpu::FrontFace::Cw
-                        },
-                        cull_mode: match (st.cull_front, st.cull_back) {
-                            (false, false) => None,
-                            (true, false) => Some(wgpu::Face::Front),
-                            (false, true) => Some(wgpu::Face::Back),
-                            (true, true) => Some(wgpu::Face::Back),
-                        },
-                        ..Default::default()
-                    },
-                    depth_stencil: use_depth.map(|(_, format)| wgpu::DepthStencilState {
-                        format,
-                        depth_write_enabled: Some(st.depth_write),
-                        depth_compare: Some(if st.depth_test {
-                            compare(st.depth_func)
-                        } else {
-                            wgpu::CompareFunction::Always
-                        }),
-                        stencil: stencil.map_or_else(Default::default, |(front, back, read, write)| wgpu::StencilState {
-                            front: stencil_face(front),
-                            back: stencil_face(back),
-                            read_mask: read,
-                            write_mask: write,
-                        }),
-                        bias: wgpu::DepthBiasState {
-                            constant: bias.0,
-                            slope_scale: f32::from_bits(bias.1),
-                            clamp: f32::from_bits(bias.2),
-                        },
-                    }),
-                    multisample: wgpu::MultisampleState::default(),
-                    multiview_mask: None,
-                    cache: None,
-                });
-                let layouts = std::array::from_fn(|n| pipeline.get_bind_group_layout(n as u32));
+                // made already for these shaders' WGSL (from the disk cache, or for the same shaders at other addresses), made now, or
+                // handed to a worker: then this draw is not drawn, and the ones after it are once the pipeline is there
+                let Some(built) = self.pipes.get(&vs, &ps, &key.state) else {
+                    *self.caches.skipped.entry("pipeline being made").or_default() += 1;
+                    lap.mark("pipeline");
+                    return;
+                };
                 let e = Arc::new(PipelineEntry {
-                    pipeline,
-                    layouts,
+                    pipeline: built.pipeline,
+                    layouts: built.layouts,
                     _shaders: (vs.clone(), ps.clone()),
                 });
                 self.caches.pipelines.insert(key, e.clone());
@@ -2489,7 +2460,12 @@ impl Gx2 {
 
     /// Ends the render pass the draws are recorded into (the command buffer stays open).
     pub(crate) fn end_pass(&mut self) {
-        self.batch.pass = None;
+        if self.batch.pass.is_some() {
+            // wgpu checks and records the whole pass when it ends, so this is where its cost shows
+            let mut lap = Lap::new();
+            self.batch.pass = None;
+            lap.mark("render pass end");
+        }
         self.batch.key = None;
     }
 
@@ -2497,6 +2473,7 @@ impl Gx2 {
     /// calls this first.
     pub(crate) fn flush_draws(&mut self) {
         self.end_pass();
+        let mut lap = Lap::new();
         // what the draws read, written into the arenas' copies, goes up first, one write per arena (the queue keeps writes before the
         // commands submitted after them)
         for a in &mut self.batch.arenas[Role::Read as usize] {
@@ -2517,8 +2494,10 @@ impl Gx2 {
         if let Some(enc) = self.batch.enc.take() {
             work.push(enc.finish());
         }
+        lap.mark("arena uploads");
         if !work.is_empty() {
             self.d.queue.submit(work);
+            lap.mark("submit");
         }
         for a in self.batch.arenas.iter_mut().flatten() {
             a.used = 0;
@@ -3196,6 +3175,70 @@ mod tests {
             uniform_as_before(&g, &small, 16)
         );
         assert_eq!(gx2.batch.slots_used, 0);
+    }
+
+    #[test]
+    fn a_stream_drawn_once_or_long_ago_is_let_go() {
+        // drawn again in a later frame: kept until not drawn for STREAM_AGE frames
+        assert!(keep_stream(100, true, 100 + STREAM_AGE));
+        assert!(!keep_stream(100, true, 101 + STREAM_AGE));
+        // made and never drawn after its frame: gone two frames later
+        assert!(keep_stream(100, false, 102));
+        assert!(!keep_stream(100, false, 103));
+        assert!(keep_stream(u32::MAX - 1, false, u32::MAX));
+    }
+
+    #[test]
+    fn vertex_data_rewritten_every_frame_does_not_pile_up_streams() {
+        // run 12: standing still in the field, 12 to 15 streams a frame were made from bytes never seen again and kept (31,000 after a
+        // minute, two buffers each), and the replay slowed down with them
+        let mut gx2 = Gx2::new(crate::Display::noop());
+        let mut m = vec![0u8; 0x1_0000];
+        let g = Guest::new(m.as_mut_ptr());
+        let fetch = [AttribStream {
+            location: 0,
+            buffer: 0,
+            offset: 0,
+            format: 0x811,
+            per_instance: false,
+            divisor: 0,
+            select: [0, 1, 2, 3],
+            endian: 0,
+        }];
+        let mut st = State::default();
+        st.attrib_buffers[0] = crate::state::AttribBuffer {
+            address: 0x1000,
+            size: 12 * 64,
+            stride: 12,
+        };
+        let mut most = 0;
+        for frame in 0..1000u32 {
+            gx2.swaps = frame;
+            // the same static mesh every frame, and a mesh whose bytes change every frame
+            st.attrib_buffers[0].address = 0x1000;
+            gx2.cached_streams(&g, &st, &fetch, 0, 64, 1);
+            g.put_u32(0x4000, frame);
+            st.attrib_buffers[0].address = 0x4000;
+            gx2.cached_streams(&g, &st, &fetch, 0, 64, 1);
+            gx2.prune();
+            most = most.max(gx2.caches.streams.len());
+        }
+        assert!(
+            most <= 64,
+            "at most a prune's worth of one-frame streams, not one per frame: {most}"
+        );
+        // the static mesh is still the one made first
+        let (a, _) = {
+            st.attrib_buffers[0].address = 0x1000;
+            gx2.cached_streams(&g, &st, &fetch, 0, 64, 1)
+        };
+        let (b, _) = gx2.cached_streams(&g, &st, &fetch, 0, 64, 1);
+        assert!(a.buffer == b.buffer);
+        let kept: u64 = gx2.caches.streams.values().map(|e| e.size).sum();
+        gx2.swaps += 60 - gx2.swaps % 60;
+        gx2.prune();
+        assert_eq!(gx2.caches.stream_bytes, gx2.caches.streams.values().map(|e| e.size).sum::<u64>());
+        assert!(gx2.caches.stream_bytes <= kept);
     }
 
     #[test]

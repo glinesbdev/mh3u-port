@@ -129,13 +129,20 @@ pub struct Gx2 {
     pub(crate) caches: crate::draw::DrawCaches,
     pub(crate) last_tv_source: u32,
     save_every: u32,
-    /// The fetch shaders by address. A shared slice: a new one for each `GX2InitFetchShaderEx`, so its address tells versions apart in the
-    /// shader caches' keys (which keep it alive).
+    /// The fetch shaders by address: shared slices, one for each distinct description (`fetch_interned`), so the address of the slice
+    /// names the contents in the shader caches' keys. The game makes some fetch shaders again every frame; with a new slice each time,
+    /// every draw with them missed the caches and left an entry behind (run 11: the field slowing from 56 to 31 FPS).
     pub(crate) fetch_shaders: HashMap<u32, std::sync::Arc<[crate::draw::AttribStream]>>,
+    /// Every distinct fetch shader description made, by a hash of it.
+    pub(crate) fetch_interned: HashMap<u64, Vec<std::sync::Arc<[crate::draw::AttribStream]>>>,
     /// With MH3U_FPS set: when the frame rate was last printed, and the swap count then.
     fps: Option<(Instant, u32)>,
     /// MH3U_GFX_REPORT and MH3U_GFX_DUMP_FRAME.
     pub(crate) diag: crate::report::Diagnostics,
+    /// The render pipelines, their workers and the disk cache (`pipelines.rs`).
+    pub(crate) pipes: crate::pipelines::Pipelines,
+    /// Frame times, cache sizes and area changes for the log (`perf.rs`).
+    pub(crate) perf: crate::perf::Perf,
 }
 
 /// The texture format of a `GX2SurfaceFormat` of a colour buffer.
@@ -172,6 +179,7 @@ struct Out { @builtin(position) position: vec4<f32>, @location(0) uv: vec2<f32> 
 impl Gx2 {
     pub fn new(d: Display) -> Gx2 {
         eprintln!("[gfx] build {}", crate::BUILD);
+        let pipes = crate::pipelines::Pipelines::new(d.device.clone());
         let size = d
             .window
             .as_ref()
@@ -279,8 +287,11 @@ impl Gx2 {
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(120),
             fetch_shaders: HashMap::new(),
+            fetch_interned: HashMap::new(),
             fps: std::env::var_os("MH3U_FPS").map(|_| (Instant::now(), 0)),
             diag: crate::report::Diagnostics::from_env(),
+            pipes,
+            perf: crate::perf::Perf::from_env(),
         }
     }
 
@@ -706,6 +717,45 @@ pub(crate) fn init_fetch_shader(
 }
 
 impl Gx2 {
+    /// Keeps the pipelines made under `root` (`<out>/cache` for a run; MH3U_GFX_CACHE_DIR puts it elsewhere, MH3U_GFX_PIPELINE_CACHE=off
+    /// turns it off), and starts making again, on the workers, those a run before made (see `pipelines.rs`).
+    pub fn use_cache_dir(&mut self, root: &std::path::Path) {
+        let off = std::env::var("MH3U_GFX_PIPELINE_CACHE")
+            .is_ok_and(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "0" | "off" | "no" | "false"));
+        if off {
+            eprintln!("[gfx] pipeline cache off (MH3U_GFX_PIPELINE_CACHE)");
+            return;
+        }
+        let root = std::env::var_os("MH3U_GFX_CACHE_DIR").map_or_else(|| root.to_path_buf(), std::path::PathBuf::from);
+        let info = self.d.adapter.get_info();
+        match self.pipes.open_disk(&root, &info) {
+            Ok((dir, n)) => eprintln!(
+                "[gfx] pipeline cache {}: {n} pipelines to make again; pipelines made {}",
+                dir.display(),
+                if self.pipes.asynchronous {
+                    "on worker threads (MH3U_GFX_ASYNC_PIPELINES=off to wait for them)"
+                } else {
+                    "with the draw waiting (MH3U_GFX_ASYNC_PIPELINES is off)"
+                }
+            ),
+            Err(e) => eprintln!("[gfx] pipeline cache under {} not opened: {e}", root.display()),
+        }
+    }
+
+    /// The shared slice for a fetch shader description: the one made before for the same attributes, or this one.
+    pub(crate) fn intern_fetch(
+        &mut self,
+        streams: std::sync::Arc<[crate::draw::AttribStream]>,
+    ) -> std::sync::Arc<[crate::draw::AttribStream]> {
+        let same = self.fetch_interned.entry(crate::draw::hash_of(&streams)).or_default();
+        if let Some(s) = same.iter().find(|s| s[..] == streams[..]) {
+            crate::draw::Lap::count("fetch shaders made again", 1);
+            return s.clone();
+        }
+        same.push(streams.clone());
+        streams
+    }
+
     fn state(&mut self) -> &mut State {
         self.contexts.entry(self.current).or_default()
     }
@@ -878,6 +928,7 @@ impl Gx2 {
             // are kept and the draw reads them
             Call::InitFetchShaderEx => {
                 let (fs, streams) = init_fetch_shader(g, c.r[3], c.r[4], c.r[5], c.r[6]);
+                let streams = self.intern_fetch(streams);
                 self.fetch_shaders.insert(fs, streams);
             }
             Call::CopySurface => self.copy_surface(g, c.r[3], c.r[6]),
@@ -885,11 +936,13 @@ impl Gx2 {
             // next time
             Call::Invalidate => {
                 let (mode, address, size) = (a(0), a(1), a(2));
+                let started = self.perf.on.then(Instant::now);
                 if mode & 2 != 0 || mode & 0x40 != 0 {
                     self.invalidate_textures(address, size);
                 }
-                if crate::shader_cache::invalidates_shaders(mode) {
-                    self.invalidate_shaders(address, size);
+                let examined = crate::shader_cache::invalidates_shaders(mode).then(|| self.invalidate_shaders(address, size));
+                if let Some(t) = started {
+                    self.perf.invalidate(t.elapsed(), examined);
                 }
             }
             Call::InitSampler => {
@@ -935,6 +988,17 @@ impl Gx2 {
                 self.swaps += 1;
                 mh3u_rt::FRAMES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 self.prune();
+                self.pipes.collect();
+                if self.perf.on {
+                    let (pipes, work) = (self.pipes.counts, self.caches.work);
+                    // taken out for the call, so the caches can be measured while it runs
+                    let mut perf = std::mem::replace(&mut self.perf, crate::perf::Perf::idle());
+                    let lines = perf.swap(self.swaps - 1, pipes, work, || self.cache_sizes());
+                    self.perf = perf;
+                    for line in lines {
+                        eprintln!("{line}");
+                    }
+                }
                 self.diag.maybe_print(&self.caches.skipped);
                 if self.diag.swapped(self.swaps) {
                     // the frame written out is on the TV now
@@ -1315,6 +1379,32 @@ mod tests {
             "playing the list does not make it again"
         );
         assert_eq!(gx2.state().fetch_shader, 0x100);
+    }
+
+    /// A fetch shader made again with the same attributes (the game does this every frame for some) is the same shared slice, so the
+    /// shader caches keyed by it keep hitting; other attributes get their own.
+    #[test]
+    fn a_fetch_shader_made_again_is_the_same_slice() {
+        let mut gx2 = Gx2::new(crate::Display::noop());
+        let mut m = vec![0u8; 0x1_0000];
+        let g = Guest::new(m.as_mut_ptr());
+        let mut c = blank_ctx();
+        let make = |gx2: &mut Gx2, c: &mut Ctx, fs: u32, format: u32| {
+            for (k, v) in [0u32, 0, 0, format, 0, 0, 0x0001_0203, 3].iter().enumerate() {
+                g.put_u32(0x200 + 4 * k as u32, *v);
+            }
+            (c.r[3], c.r[4], c.r[5], c.r[6]) = (fs, 0x400, 1, 0x200);
+            gx2.run(Call::InitFetchShaderEx, c, &g);
+            gx2.fetch_shaders[&fs].clone()
+        };
+        let first = make(&mut gx2, &mut c, 0x100, 0x811);
+        let again = make(&mut gx2, &mut c, 0x100, 0x811);
+        let elsewhere = make(&mut gx2, &mut c, 0x140, 0x811);
+        let other = make(&mut gx2, &mut c, 0x100, 0x80d);
+        assert!(std::sync::Arc::ptr_eq(&first, &again));
+        assert!(std::sync::Arc::ptr_eq(&first, &elsewhere), "the contents decide, not the address");
+        assert!(!std::sync::Arc::ptr_eq(&first, &other));
+        assert_eq!(gx2.fetch_interned.values().map(Vec::len).sum::<usize>(), 2);
     }
 
     /// The shadow pass turns the polygon offset on with `GX2SetPolygonControl`; the scene's materials set their culling with

@@ -925,9 +925,13 @@ fn run_game(dump: &Dump, c_dir: &Path, max_imports: u64, save: PathBuf, window: 
     }
     // the window belongs to this thread; the game runs on another one, drawing into it
     mh3u_rt::input::start_gamepads();
+    // the pipelines made are kept with the build, in its cache folder
+    let cache = c_dir.join("cache");
     mh3u_gfx::run(move |display| {
         let mut options = options;
-        options.backend = Some(Box::new(mh3u_gfx::Gx2::new(display)));
+        let mut gx2 = mh3u_gfx::Gx2::new(display);
+        gx2.use_cache_dir(&cache);
+        options.backend = Some(Box::new(gx2));
         if let Err(e) = finish(options) {
             eprintln!("{e:#}");
         }

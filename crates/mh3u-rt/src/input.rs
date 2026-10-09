@@ -197,6 +197,66 @@ pub fn key_axis(code: &str) -> Option<(usize, f32)> {
 const PAD_IDLE: std::time::Duration = std::time::Duration::from_millis(4);
 
 /// Reads gamepads on a thread of their own, as long as the program runs. MH3U_GAMEPADS=0 turns them off (no thread, no backend).
+/// Which gamepad face button is which of the GamePad's.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PadLayout {
+    /// The default: the button gilrs names East is the GamePad's A, South B, North X, West Y. With an Xbox pad on Windows this made
+    /// the Xbox A the game's A (with the other layout, the user's run found the Xbox A acting as the game's B).
+    Xbox,
+    /// `MH3U_PAD_LAYOUT=nintendo`, the layout before: South is A, East B, West X, North Y.
+    Nintendo,
+}
+
+impl PadLayout {
+    /// From `MH3U_PAD_LAYOUT` (`nintendo`, or anything else or nothing for the default). `position`, the old name of what is now the
+    /// default, is the default too.
+    pub fn from_setting(value: Option<&str>) -> PadLayout {
+        match value.map(|v| v.trim().to_ascii_lowercase()) {
+            Some(v) if v == "nintendo" => PadLayout::Nintendo,
+            _ => PadLayout::Xbox,
+        }
+    }
+}
+
+/// The GamePad button a gamepad button is, or `None` for one the GamePad does not have.
+pub fn pad_button(b: gilrs::Button, layout: PadLayout) -> Option<u32> {
+    use gilrs::Button;
+    let nintendo = layout == PadLayout::Nintendo;
+    Some(match b {
+        Button::South if nintendo => button::A,
+        Button::East if nintendo => button::B,
+        Button::West if nintendo => button::X,
+        Button::North if nintendo => button::Y,
+        Button::East => button::A,
+        Button::South => button::B,
+        Button::North => button::X,
+        Button::West => button::Y,
+        Button::DPadUp => button::UP,
+        Button::DPadDown => button::DOWN,
+        Button::DPadLeft => button::LEFT,
+        Button::DPadRight => button::RIGHT,
+        Button::LeftTrigger => button::L,
+        Button::RightTrigger => button::R,
+        Button::LeftTrigger2 => button::ZL,
+        Button::RightTrigger2 => button::ZR,
+        Button::Start => button::PLUS,
+        Button::Select => button::MINUS,
+        Button::Mode => button::HOME,
+        Button::LeftThumb => button::STICK_L,
+        Button::RightThumb => button::STICK_R,
+        _ => return None,
+    })
+}
+
+fn face_name(mask: u32) -> &'static str {
+    match mask {
+        button::A => "A",
+        button::B => "B",
+        button::X => "X",
+        _ => "Y",
+    }
+}
+
 pub fn start_gamepads() {
     if std::env::var("MH3U_GAMEPADS").is_ok_and(|v| v.trim() == "0") {
         eprintln!("gamepads off (MH3U_GAMEPADS=0)");
@@ -210,11 +270,20 @@ pub fn start_gamepads() {
                 return;
             }
         };
-        let by_position = std::env::var("MH3U_PAD_LAYOUT").is_ok_and(|v| v == "position");
+        let layout = PadLayout::from_setting(std::env::var("MH3U_PAD_LAYOUT").ok().as_deref());
+        eprintln!(
+            "{}",
+            match layout {
+                PadLayout::Xbox => "gamepad buttons: xbox layout (MH3U_PAD_LAYOUT=nintendo swaps A with B and X with Y)",
+                PadLayout::Nintendo => "gamepad buttons: nintendo layout (MH3U_PAD_LAYOUT=nintendo; unset it for the xbox layout)",
+            }
+        );
+        // the first press of each face button says what it was taken as, so a swapped layout shows in the log
+        let mut told = [false; 4];
         for (_, pad) in gilrs.gamepads() {
             eprintln!("gamepad: {}", pad.name());
         }
-        use gilrs::{Axis, Button, EventType};
+        use gilrs::{Axis, EventType};
         let trace = std::env::var_os("MH3U_TRACE_PAD").is_some();
         // The pending events are taken without waiting, and the thread sleeps a little when there are none. It does not wait in
         // gilrs's blocking call (`next_event_blocking` with a timeout), which was where a Windows profile found this thread taking
@@ -230,32 +299,15 @@ pub fn start_gamepads() {
             match event.event {
                 EventType::ButtonPressed(b, _) | EventType::ButtonReleased(b, _) => {
                     let down = matches!(event.event, EventType::ButtonPressed(..));
-                    // by default the buttons go by their labels (the Xbox A is the GamePad's A); MH3U_PAD_LAYOUT=position puts
-                    // them where the GamePad's are (the right-hand one is A)
-                    let mask = match b {
-                        Button::East if by_position => button::A,
-                        Button::South if by_position => button::B,
-                        Button::North if by_position => button::X,
-                        Button::West if by_position => button::Y,
-                        Button::South => button::A,
-                        Button::East => button::B,
-                        Button::West => button::X,
-                        Button::North => button::Y,
-                        Button::DPadUp => button::UP,
-                        Button::DPadDown => button::DOWN,
-                        Button::DPadLeft => button::LEFT,
-                        Button::DPadRight => button::RIGHT,
-                        Button::LeftTrigger => button::L,
-                        Button::RightTrigger => button::R,
-                        Button::LeftTrigger2 => button::ZL,
-                        Button::RightTrigger2 => button::ZR,
-                        Button::Start => button::PLUS,
-                        Button::Select => button::MINUS,
-                        Button::Mode => button::HOME,
-                        Button::LeftThumb => button::STICK_L,
-                        Button::RightThumb => button::STICK_R,
-                        _ => continue,
-                    };
+                    let Some(mask) = pad_button(b, layout) else { continue };
+                    let face = [button::A, button::B, button::X, button::Y].iter().position(|m| *m == mask);
+                    if let Some(k) = face
+                        && down
+                        && !told[k]
+                    {
+                        told[k] = true;
+                        eprintln!("[gamepad] {b:?} is the GamePad's {}", face_name(mask));
+                    }
                     INPUT.set_pad_button(mask, down);
                 }
                 EventType::Connected => eprintln!("gamepad connected: {}", gilrs.gamepad(event.id).name()),
@@ -291,5 +343,38 @@ mod tests {
         assert_eq!(i.sticks()[0], 0.8);
         i.set_keyboard_button(button::A, false);
         assert_eq!(i.hold() & button::A, 0);
+    }
+
+    #[test]
+    fn face_buttons_follow_the_layout() {
+        use gilrs::Button;
+        let faces = [Button::South, Button::East, Button::West, Button::North];
+        let map = |layout| faces.map(|b| pad_button(b, layout));
+        // the default: East A, South B, North X, West Y
+        assert_eq!(
+            map(PadLayout::Xbox),
+            [Some(button::B), Some(button::A), Some(button::Y), Some(button::X)]
+        );
+        // MH3U_PAD_LAYOUT=nintendo: the layout before, A with B and X with Y swapped
+        assert_eq!(
+            map(PadLayout::Nintendo),
+            [Some(button::A), Some(button::B), Some(button::X), Some(button::Y)]
+        );
+        // the rest are the same in both
+        for layout in [PadLayout::Xbox, PadLayout::Nintendo] {
+            assert_eq!(pad_button(Button::Start, layout), Some(button::PLUS));
+            assert_eq!(pad_button(Button::LeftTrigger2, layout), Some(button::ZL));
+            assert_eq!(pad_button(Button::DPadLeft, layout), Some(button::LEFT));
+            assert_eq!(pad_button(Button::C, layout), None);
+        }
+    }
+
+    #[test]
+    fn the_layout_setting() {
+        assert_eq!(PadLayout::from_setting(None), PadLayout::Xbox);
+        assert_eq!(PadLayout::from_setting(Some("nintendo")), PadLayout::Nintendo);
+        assert_eq!(PadLayout::from_setting(Some(" Nintendo ")), PadLayout::Nintendo);
+        assert_eq!(PadLayout::from_setting(Some("position")), PadLayout::Xbox);
+        assert_eq!(PadLayout::from_setting(Some("xbox")), PadLayout::Xbox);
     }
 }

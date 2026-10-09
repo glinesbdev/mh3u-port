@@ -88,7 +88,9 @@ $out   = "$env:LOCALAPPDATA\mh3u\c"       # anywhere outside the repository
 (`$env:MH3U_CC = 'C:\llvm-mingw\bin\clang.exe'`) and `MH3U_CFLAGS` adds flags to every compile and the link. Saves go to `$out\save`
 unless `--save-dir` says otherwise. `run` stops after `--max-imports` system calls (100,000 by default, for exploring), hence the big
 number to play. The variables of `translator.md` work the same in PowerShell: `$env:MH3U_GFX_LOG = '1'`, and
-`Remove-Item Env:MH3U_GFX_LOG` to turn one off again.
+`Remove-Item Env:MH3U_GFX_LOG` to turn one off again. An Xbox pad's A, B, X and Y are the game's A, B, X and Y; if they come out
+swapped, `$env:MH3U_PAD_LAYOUT = 'nintendo'` swaps A with B and X with Y (the log's `[gamepad] … is the GamePad's …` lines say what each
+face button was taken as).
 
 ## Comparing builds (frame rate)
 
@@ -112,6 +114,15 @@ $env:MH3U_GFX_TIMES = '1'
 $env:MH3U_TIMES_WINDOW = '10'
 & $tools run $games $out --window --max-imports 1000000000000
 ```
+
+The same report has `[gfx frames]` (the slowest frame of the window), `[gfx caches]` (each cache's size: steady while standing
+still, or something grows), `[gfx pipelines]`, `[gfx invalidates]`, and an `[gfx] area change` line when entering an area, with how
+the 180 frames after it went (`translator.md`). Pipelines are made on worker threads and kept in `$out\cache\pipelines`, so a second
+visit to an area, or a second run, does not hitch; `$env:MH3U_GFX_ASYNC_PIPELINES = 'off'` makes each draw wait for its pipeline
+instead (the old behaviour, for comparing), `$env:MH3U_GFX_PIPELINE_CACHE = 'off'` leaves the disk out, and deleting
+`$out\cache` is always safe. `[draw times]` also has `render pass end`, `arena uploads` and `submit` (wgpu's own work, which used to be the untimed part of
+`GX2DirectCallDisplayList`). `[gfx caches]` shows `vertex streams N (X MB)`, which should stay roughly flat while standing still.
+Leave `MH3U_GFX_DUMP_FRAME` unset when timing: writing the frame takes about 0.6 s and shows as the window's slowest frame.
 
 **Sampling profilers and the Rust side.** A `-gnullvm` build's PDB (`-C link-arg=-Wl,--pdb=`) holds only the public symbols
 (about 12 thousand): the Rust code's own functions are local symbols, which lld does not put in it, so Visual Studio's profiler
