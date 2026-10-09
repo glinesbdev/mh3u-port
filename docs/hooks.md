@@ -5,7 +5,9 @@ Mods so far only read memory (`overlay.md`). Hooks let a mod run native code whe
 
 ## Design
 
-- **The list:** `mods/hooks.txt` in the repo, one hook per line (`0x02123456 name`; `#` starts a comment). It holds addresses
+- **The list:** `mods/hooks.txt` in the repo, one hook per line (`0x02123456 name`; the address is hex and the `0x` is optional; `#` starts a comment). The translated
+  functions are named `f_XXXXXXXX` in the build's `game.h` and `part_*.c` (`f_02123456` is `0x02123456`), which is where to
+  look for addresses. It holds addresses
   and names only, nothing from the game. `mh3u-tools translate` reads it and copies it to the build (`<c dir>/hooks.txt`), so the
   runtime knows the names.
 - **The translator** (`mh3u-recomp`) emits `rt_hook(c, 0xADDR);` at the entry of each listed function, after `ENTER` and before
@@ -35,6 +37,13 @@ HR), not the code. Hooks need the functions that change that data. Find them by 
 | a quest starts / ends | watch the quest number and the clear count in the save |
 | money and points paid | watch the zenny field |
 
+## Run 28 (user, after PR #13)
+
+Hooks work end to end. Five hooks (0x02000020, 0x02000084, 0x020000e4, 0x0200017c, 0x020001f0) were listed, translated, and
+installed (`[hooks] 5 hooks installed`). Each fired with sensible arguments. For example, `0x020000e4` was called over and over
+from one lr (`0x3122638`), with r3 stepping through `0x108001xx`–`0x108002xx`, which looks like a constructor walking a table.
+No change to speed was noticed.
+
 ## Plan
 
 1. Write this doc. **(done)**
@@ -49,8 +58,5 @@ HR), not the code. Hooks need the functions that change that data. Find them by 
 
 See the bottom of this file. It is updated with each commit of PR #13.
 
-- Status: steps 1–4 are done (draft PR #13), which is milestone 1. The translator emits `rt_hook` at the entries listed in
-  `mods/hooks.txt` (none listed yet). The runtime registry runs callbacks, and `MH3U_HOOK_LOG=1` logs every hook. Tests and
-  check.sh pass.
-- Next: step 5. Find a real address (item add): run a watch build on an item slot of the live save, and take the writing
-  function from the `[watch]` line's lr. Until then, any function address from an `[enter]` line shows the mechanism working.
+- Status: milestone 1 is merged (PR #13) and proven in run 28.
+- Next: step 5, finding real gameplay addresses (PR #14, branch `mods/hook-points`).
