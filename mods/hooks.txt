@@ -21,5 +21,8 @@ in:0x02172ca4 quest_end          # f_0217242c, confirmed run 32 on abandon and o
 # in:0x021794c8 quest_fee_back   # run 32 only (+200 before quest_end); did not fire in run 33's quest: off for now
 in:0x0217f12c quest_reward       # f_0217ef68, confirmed run 33: twice on the reward screen (r5 = 1, then 5), then +1000
 # in:0x0217f5b0 quest_reward_items # run 32 only (10 small payments); not in run 33: off for now
+# The callers of item_gain, by where the item goes (run 33's lr rule; not confirmed as hooks yet, and maybe shared code):
+in:0x0219950c item_to_box
+in:0x0219b080 item_to_pouch
 # Rejected (thousands of calls a minute, queries, not actions): 0x0219acec (pouch item lookup, r4 = item id),
 # 0x02199408 (box item lookup, r4 = item id), 0x02198770 (field getter, r5 = 7/8), 0x0216afd4 (per-frame, another object).

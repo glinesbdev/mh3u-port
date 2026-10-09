@@ -183,8 +183,8 @@ abandoned; `quest_fee_back` and `quest_reward` mean completed.
 - `0x2199574`: the box (the box slot write in run 30);
 - `0x219950c`: the box (the quest's reward items).
 
-The confidence is medium; a callback can switch on `h.ctx.lr`. Hooking the callers (`in:0x219b080` and so on) would give
-separate hooks, if those functions are not shared.
+The confidence is medium; a callback can switch on `h.ctx.lr`. `mods/hooks.txt` now hooks the callers as `item_to_pouch`
+(`in:0x219b080`) and `item_to_box` (`in:0x219950c`). They are not confirmed yet; if they fire on other frames, they are shared.
 
 ## Plan
 
@@ -200,7 +200,13 @@ separate hooks, if those functions are not shared.
 
 See the bottom of this file. It is updated with each commit of PR #13.
 
-- Status: runs 32–33 confirmed the craft, upgrade and quest hooks (craft_jewel, craft_equipment, upgrade_equipment,
-  quest_accept, quest_end, quest_reward) and `item_gain`'s destination by lr. PR #15 is ready.
-- Next: step 7, an overlay feature driven by hooks (refresh the wishlist on `item_gain` and `money_add`, a toast on
-  `quest_reward`), or step 6 (exit hooks).
+- Status: PR #15 is merged. Confirmed hooks: money_add, item_gain (destination by lr), craft_jewel, craft_equipment,
+  upgrade_equipment, quest_accept, quest_end, quest_reward. `item_to_box` and `item_to_pouch` are added, not yet confirmed.
+- Next:
+  1. Confirm `item_to_box` and `item_to_pouch` (pick up an item in the field; get quest reward items).
+  2. Item use (consume): use a potion with `MH3U_HOOK_LOG=1`. If no hook fires, run `MH3U_WATCH=live` on that pouch slot;
+     the writer (or its lr) gives the hook.
+  3. Menu open: `MH3U_PROFILE` with a menu open versus closed, or `MH3U_ENTER_LR` around the menu sound's call; no save
+     field marks it.
+  4. Overlay: drive the wishlist from hooks (refresh and toast on `item_gain` and `money_add`, instead of polling the save
+     every frame).
