@@ -135,6 +135,50 @@ pub fn is_fullscreen_toggle(code: winit::keyboard::KeyCode, alt: bool) -> bool {
     code == KeyCode::F11 || (alt && matches!(code, KeyCode::Enter | KeyCode::NumpadEnter))
 }
 
+/// Where a window event goes: to egui (which hears everything but the overlay's key, so that it knows the window's size and scale
+/// before it opens), to the game (not the keyboard and mouse while the overlay is open, nor the overlay's key), and whether it toggles
+/// the overlay (`f1`: whether this is the F1 key, and then whether a first press: a key held down repeats, and its release also comes).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Route {
+    pub to_egui: bool,
+    pub to_game: bool,
+    pub toggle: bool,
+}
+
+pub fn route_event(overlay: bool, open: bool, f1: Option<bool>, input: bool) -> Route {
+    match (overlay, f1) {
+        (false, _) => Route {
+            to_egui: false,
+            to_game: true,
+            toggle: false,
+        },
+        (true, Some(first_press)) => Route {
+            to_egui: false,
+            to_game: false,
+            toggle: first_press,
+        },
+        (true, None) => Route {
+            to_egui: true,
+            to_game: !(open && input),
+            toggle: false,
+        },
+    }
+}
+
+/// Whether an event is the player's keyboard or mouse (what the overlay takes while open).
+fn is_input(event: &WindowEvent) -> bool {
+    matches!(
+        event,
+        WindowEvent::KeyboardInput { .. }
+            | WindowEvent::Ime(_)
+            | WindowEvent::ModifiersChanged(_)
+            | WindowEvent::CursorMoved { .. }
+            | WindowEvent::MouseInput { .. }
+            | WindowEvent::MouseWheel { .. }
+            | WindowEvent::Touch(_)
+    )
+}
+
 /// The cursor shows in a window, and in fullscreen only while the overlay is open (for its mouse).
 pub fn cursor_visible(fullscreen: bool, overlay_open: bool) -> bool {
     !fullscreen || overlay_open
@@ -261,26 +305,30 @@ impl<F: FnOnce(Display) + Send + 'static> ApplicationHandler for App<F> {
             // the surface follows the new size at the next present; the picture keeps its proportions (bars at the sides or top)
             return;
         }
-        if let WindowEvent::KeyboardInput { event: k, .. } = &event
-            && k.physical_key == PhysicalKey::Code(winit::keyboard::KeyCode::F1)
-            && k.state == ElementState::Pressed
-            && !k.repeat
-            && self.overlay.is_some()
+        let open = mh3u_rt::input::OVERLAY_OPEN.load(std::sync::atomic::Ordering::Relaxed);
+        let f1 = match &event {
+            WindowEvent::KeyboardInput { event: k, .. } if k.physical_key == PhysicalKey::Code(winit::keyboard::KeyCode::F1) => {
+                Some(k.state == ElementState::Pressed && !k.repeat)
+            }
+            _ => None,
+        };
+        let route = route_event(self.overlay.is_some(), open, f1, is_input(&event));
+        if let (Some(state), Some(w)) = (self.overlay.as_mut(), self.window.as_ref())
+            && route.to_egui
         {
+            // egui hears every event but the toggle key (size, scale and focus too while closed, so they are right when it opens)
+            let _ = state.on_window_event(w, &event);
+            overlay::push_input(state.take_egui_input(w));
+        }
+        if route.toggle {
             mh3u_rt::input::OVERLAY_TOGGLE.store(true, std::sync::atomic::Ordering::Relaxed);
             // what the game held is let go, so nothing stays pressed while the overlay is open
             self.keys.clear();
             self.mouse_down = false;
             self.keys_changed();
             self.touch_changed();
-            return;
         }
-        if mh3u_rt::input::OVERLAY_OPEN.load(std::sync::atomic::Ordering::Relaxed)
-            && let (Some(state), Some(w)) = (self.overlay.as_mut(), self.window.as_ref())
-        {
-            // the overlay takes the keyboard and the mouse
-            let _ = state.on_window_event(w, &event);
-            overlay::push_input(state.take_egui_input(w));
+        if !route.to_game {
             match event {
                 WindowEvent::CloseRequested => event_loop.exit(),
                 WindowEvent::Resized(size) => self.size = (size.width as f32, size.height as f32),
@@ -367,6 +415,45 @@ mod window_tests {
         assert!(!is_fullscreen_toggle(KeyCode::Enter, false), "Enter alone is the game's");
         assert!(!is_fullscreen_toggle(KeyCode::F1, false), "F1 is the overlay's");
         assert!(!is_fullscreen_toggle(KeyCode::F1, true));
+    }
+
+    #[test]
+    fn f1_toggles_on_its_first_press_only_and_the_open_overlay_takes_the_keyboard_and_mouse() {
+        let r = |open, f1, input| route_event(true, open, f1, input);
+        // F1: pressed once toggles; held (repeats) and let go do nothing; never to the game or egui
+        assert!(r(false, Some(true), true).toggle);
+        assert!(r(true, Some(true), true).toggle);
+        assert!(!r(true, Some(false), true).toggle);
+        assert!(!r(false, Some(true), true).to_game && !r(false, Some(true), true).to_egui);
+        // open: typing goes to egui only
+        assert_eq!(
+            r(true, None, true),
+            Route {
+                to_egui: true,
+                to_game: false,
+                toggle: false
+            }
+        );
+        // closed: input goes to the game, and egui still hears it (for the size, scale and focus)
+        assert_eq!(
+            r(false, None, true),
+            Route {
+                to_egui: true,
+                to_game: true,
+                toggle: false
+            }
+        );
+        // a resize while open reaches both (the game's surface follows the window)
+        assert!(r(true, None, false).to_game);
+        // no overlay: all to the game, F1 included
+        assert_eq!(
+            route_event(false, false, Some(true), true),
+            Route {
+                to_egui: false,
+                to_game: true,
+                toggle: false
+            }
+        );
     }
 
     #[test]

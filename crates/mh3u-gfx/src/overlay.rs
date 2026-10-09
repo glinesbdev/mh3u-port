@@ -47,6 +47,23 @@ pub fn push_input(raw: egui::RawInput) {
     }
 }
 
+/// The input for one egui frame: what the window's thread gathered (`pending`), or, on a frame with no window events, the last
+/// input without its events. The window's size, scale and focus have to be there every frame: an input made from nothing has a scale
+/// of 1, and frames alternating between that and the real scale moved everything at every frame (the overlay flickered and a text
+/// box could not keep the focus).
+pub fn next_input(pending: Option<egui::RawInput>, last: &mut egui::RawInput) -> egui::RawInput {
+    match pending {
+        Some(raw) => {
+            *last = raw.clone();
+            last.events.clear();
+            last.dropped_files.clear();
+            last.hovered_files.clear();
+            raw
+        }
+        None => last.clone(),
+    }
+}
+
 /// How long a notice stays.
 const NOTICE: Duration = Duration::from_secs(6);
 /// How often the save is looked at while closed, in frames, and how long after a failed search the next starts.
@@ -91,6 +108,8 @@ pub struct Overlay {
     /// The picker: the kind shown and the filter typed.
     kind: u8,
     filter: String,
+    /// The last input (see `next_input`).
+    last_input: egui::RawInput,
 }
 
 impl Overlay {
@@ -137,6 +156,7 @@ impl Overlay {
             frame: 0,
             kind: 5,
             filter: String::new(),
+            last_input: egui::RawInput::default(),
         }
     }
 
@@ -162,8 +182,9 @@ impl Overlay {
         }
         self.notices.retain(|(_, t)| t.elapsed() < NOTICE);
         if !self.open && self.notices.is_empty() {
-            // nothing to draw; the input gathered meanwhile is not wanted
-            INPUT.lock().unwrap_or_else(|e| e.into_inner()).take();
+            // nothing to draw: the window's size and scale are kept, its events are not wanted
+            let pending = INPUT.lock().unwrap_or_else(|e| e.into_inner()).take();
+            next_input(pending, &mut self.last_input);
             return;
         }
         self.draw(device, queue, enc, view, format, size);
@@ -288,7 +309,8 @@ impl Overlay {
         size: (u32, u32),
     ) {
         let ctx = CONTEXT.clone();
-        let mut raw = INPUT.lock().unwrap_or_else(|e| e.into_inner()).take().unwrap_or_default();
+        let pending = INPUT.lock().unwrap_or_else(|e| e.into_inner()).take();
+        let mut raw = next_input(pending, &mut self.last_input);
         if !self.open {
             // the notices only: no input for them
             raw.events.clear();
@@ -554,6 +576,24 @@ mod tests {
         let raw = INPUT.lock().unwrap().take().unwrap();
         assert_eq!(raw.events, [ev("a"), ev("b")]);
         assert_eq!(raw.time, Some(2.0));
+    }
+
+    #[test]
+    fn a_frame_without_window_events_keeps_the_scale_and_focus_of_the_last() {
+        let mut last = egui::RawInput::default();
+        let mut raw = egui::RawInput {
+            focused: true,
+            events: vec![egui::Event::Text("a".into())],
+            ..Default::default()
+        };
+        raw.viewports.entry(raw.viewport_id).or_default().native_pixels_per_point = Some(1.5);
+        let got = next_input(Some(raw), &mut last);
+        assert_eq!(got.events.len(), 1);
+        // the next frame, no events: the same scale, no events again
+        let quiet = next_input(None, &mut last);
+        assert!(quiet.events.is_empty());
+        assert_eq!(quiet.viewports[&quiet.viewport_id].native_pixels_per_point, Some(1.5));
+        assert!(quiet.focused);
     }
 
     #[test]

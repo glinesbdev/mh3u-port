@@ -119,8 +119,10 @@ impl Input {
 
     pub fn set_pad_button(&self, mask: u32, down: bool) {
         if down {
-            let held = self.pad.fetch_or(mask, Relaxed) | mask;
-            if OVERLAY_ENABLED.load(Relaxed) && held & OVERLAY_COMBO == OVERLAY_COMBO && mask & OVERLAY_COMBO != 0 {
+            let before = self.pad.fetch_or(mask, Relaxed);
+            let held = before | mask;
+            // only the press that completes the combination toggles (a repeated press of a held button does not)
+            if OVERLAY_ENABLED.load(Relaxed) && before & OVERLAY_COMBO != OVERLAY_COMBO && held & OVERLAY_COMBO == OVERLAY_COMBO {
                 OVERLAY_TOGGLE.store(true, Relaxed);
                 SWALLOWED.fetch_or(OVERLAY_COMBO, Relaxed);
             } else if OVERLAY_OPEN.load(Relaxed) {
@@ -371,6 +373,10 @@ mod tests {
         input.set_pad_button(button::R, true);
         assert!(OVERLAY_TOGGLE.swap(false, Relaxed));
         assert_eq!(input.hold(), 0, "the combination's buttons are the overlay's");
+        // a press event repeated for a button already held (some backends send them) does not toggle again
+        input.set_pad_button(button::R, true);
+        input.set_pad_button(button::MINUS, true);
+        assert!(!OVERLAY_TOGGLE.load(Relaxed));
         input.set_pad_button(button::R, false);
         assert_eq!(input.hold(), 0, "Back stays kept until it is let go");
         input.set_pad_button(button::MINUS, false);

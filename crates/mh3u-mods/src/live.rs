@@ -23,6 +23,11 @@ fn word(bytes: &[u8], o: usize) -> Option<u32> {
     Some(u32::from_be_bytes(bytes.get(o..o + 4)?.try_into().ok()?))
 }
 
+/// The second half of the live header alone: the word at +0x24 is the block's address plus 0x28.
+fn half_header(at: u32, b: &[u8]) -> bool {
+    word(b, 0x24) == Some(at.wrapping_add(0x28))
+}
+
 /// The search patterns for hunter names: the name and the zero after it (the three bytes before it differ between hunters).
 pub fn name_patterns(names: &[String]) -> Vec<Vec<u8>> {
     names
@@ -47,7 +52,10 @@ pub fn find_candidates(piece: &[u8], base: u32, names: &[Vec<u8>], out: &mut Vec
     }
     for name in names {
         for o in memchr::memmem::find_iter(piece, name) {
-            if let Some(at) = (base + o as u32).checked_sub(NAME_OFFSET) {
+            // a save block starts at a word
+            if let Some(at) = (base + o as u32).checked_sub(NAME_OFFSET)
+                && at.is_multiple_of(4)
+            {
                 out.push(at);
             }
         }
@@ -65,6 +73,10 @@ pub fn choose(blocks: &[(u32, &[u8])], names: &[String]) -> Result<(u32, &'stati
         return Ok((at, "its header points at itself"));
     }
     let named = |b: &[u8]| Save::parse(b).is_ok_and(|s| names.contains(&s.hunter_name));
+    // in the port the word at +0x08 can be 0 where Cemu has the pointer (run 26), but the one at +0x24 still points at itself
+    if let Some(&(at, _)) = blocks.iter().find(|(at, b)| b.len() >= SAVE_LEN && half_header(*at, b) && named(b)) {
+        return Ok((at, "a hunter's name, and the word at +0x24 points at itself"));
+    }
     if let Some(&(at, _)) = blocks
         .iter()
         .find(|(_, b)| b.len() >= SAVE_LEN && named(b) && b[..0x0b].iter().any(|&x| x != 0))
@@ -100,7 +112,7 @@ pub fn parse(block: &[u8], at: u32, name: Option<&str>) -> Option<Save> {
     if block.len() < SAVE_LEN {
         return None;
     }
-    let live = is_live_block(&|a| word(block, a.checked_sub(at)? as usize), at);
+    let live = is_live_block(&|a| word(block, a.checked_sub(at)? as usize), at) || half_header(at, block);
     let save = Save::parse(block).ok()?;
     (live || name.is_some_and(|n| n == save.hunter_name)).then_some(save)
 }
@@ -193,6 +205,26 @@ pub(crate) mod tests {
         // and it is followed by its name
         assert!(parse(&b, at, Some("Ann")).is_some());
         assert!(parse(&b, at, Some("Bob")).is_none());
+    }
+
+    #[test]
+    fn the_port_s_live_save_has_only_the_second_self_pointer_and_beats_a_named_copy() {
+        // run 26: a named block with a non-blank header that went away, and the live one, whose +0x08 is 0 and +0x24 is itself + 0x28
+        let names = vec!["Shamus".to_string()];
+        let mut transient = block(0x3001_cb4c, "Shamus", false, &[]);
+        transient[3] = 7;
+        let mut live = block(0x2e68_6b00, "Shamus", false, &[(100, 2)]);
+        live[0x24..0x28].copy_from_slice(&(0x2e68_6b00u32 + 0x28).to_be_bytes());
+        let (at, why) = choose(&[(0x2e68_6b00, &live), (0x3001_cb4c, &transient)], &names).unwrap();
+        assert_eq!(at, 0x2e68_6b00);
+        assert!(why.contains("+0x24"));
+        assert_eq!(parse(&live, at, None).unwrap().item_count(100), 2);
+        // a name hit that is not at a word is no block
+        let mut mem = vec![0u8; 0x100];
+        mem[0x2c..0x33].copy_from_slice(b"Shamus\0");
+        let mut found = Vec::new();
+        find_candidates(&mem, 0x1000_0000, &name_patterns(&names), &mut found);
+        assert!(found.is_empty(), "{found:x?}");
     }
 
     #[test]

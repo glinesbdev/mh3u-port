@@ -24,6 +24,13 @@ and a blacksmith wishlist built on the companion app's reverse engineering.
 - **When a wished piece becomes craftable**, a notice shows at the top right for six seconds, whether the overlay is open or not, and
   `[overlay] craftable now: …` is logged.
 
+**Run 26:** the overlay flickered, and its filter box could not be typed in. On frames when the window had sent no events, the game
+thread made egui's input from nothing, with a scale of 1. On a scaled Windows display that alternated with the real scale, so
+everything moved every frame and the text box could not keep focus. Now a frame with no events reuses the last input (scale, size,
+focus) without its events. egui also hears every window event while closed, so it knows the window's size and scale before it first
+opens. F1 toggles on its first press only (not on repeats or the release). The gamepad combination toggles only on the press that
+completes it.
+
 ## Fullscreen
 
 `--fullscreen` on `mh3u-tools run` (`-Fullscreen` in `win-run.ps1`, `--fullscreen` in `run.sh`), or `MH3U_FULLSCREEN=1`, starts in
@@ -52,8 +59,13 @@ borderless fullscreen on the window's monitor.
   1. **Search:** the port lays out guest memory as the console and Cemu do (MEM2 at 0x1080_0000, MEM1 at 0xf400_0000, the
      foreground bucket at 0xe000_0000; big-endian). All three are searched for both signs the companion uses: the self-pointing
      header, and the hunters' names (read from `user1`-`user3` in the game's save folder) at +0x2b, with the zero after them.
-  2. **Check:** the candidates are copied at a frame and chosen: a self-pointing header first, else a block with a hunter's name
-     and a header that is not blank.
+  2. **Check:** the candidates are copied at a frame and chosen, in this order:
+     1. a header that points at itself;
+     2. a hunter's name with the word at +0x24 pointing at itself. Run 26 showed the port's live block with +0x08 zero where Cemu has
+        the pointer; the +0x24 word still pointed at itself.
+     3. a hunter's name and a non-blank header. Run 26's first pick by this rule went away, a temporary copy.
+
+     Name hits that are not at a word boundary are dropped.
   3. **Follow:** the block chosen is followed from the snapshot of each frame.
   4. **Retry:** a search that finds nothing, or a save that goes away (the hunter unloaded), is tried again after 5, 10, 20, 40,
      then every 60 seconds.
