@@ -117,7 +117,7 @@ pub struct Gx2 {
     pub(crate) current: u32,
     /// Display lists: recorded calls by the address of their buffer, and the list being recorded.
     lists: HashMap<u32, std::sync::Arc<[Recorded]>>,
-    recording: Option<(u32, Vec<Recorded>)>,
+    recording: Option<Recording>,
     pub(crate) draws: u64,
     dumped: std::collections::HashSet<u32>,
     null_draws: u64,
@@ -589,6 +589,45 @@ impl Recorded {
     }
 }
 
+/// A display list being recorded.
+struct Recording {
+    address: u32,
+    calls: Vec<Recorded>,
+    /// The calls made into it, the ones left out as redundant too (the size the game is told counts them, as before).
+    made: u32,
+    seen: Seen,
+}
+
+/// The texture and sampler each pixel unit was last set to in the list being recorded, since its last change of context: setting a unit
+/// to what it already is changes nothing, so such a call is not recorded (the game sets every unit for every draw).
+#[derive(Default)]
+struct Seen {
+    textures: [Option<u32>; 18],
+    samplers: [Option<u32>; 18],
+}
+
+impl Seen {
+    /// Whether the call (with r3, r4) would change nothing when played back right after the calls recorded so far.
+    fn redundant(&mut self, call: Call, r3: u32, r4: u32) -> bool {
+        let slots = match call {
+            // the state the units are in is another context's (or a fresh one) from here on
+            Call::SetupContextStateEx | Call::SetContextState => {
+                *self = Seen::default();
+                return false;
+            }
+            Call::SetPixelTexture => &mut self.textures,
+            Call::SetPixelSampler => &mut self.samplers,
+            _ => return false,
+        };
+        let Some(slot) = slots.get_mut(r4 as usize) else { return false };
+        if *slot == Some(r3) {
+            return true;
+        }
+        *slot = Some(r3);
+        false
+    }
+}
+
 /// The calls that are never part of a display list (they are about the display, not the GPU's command stream).
 fn is_immediate(call: Call) -> bool {
     matches!(
@@ -870,7 +909,11 @@ impl Gx2 {
 
     /// Writes the shader's structure and program to the folder named by MH3U_GFX_DUMP (once per shader), for looking at offline.
     fn dump_shader(&mut self, g: &Guest, address: u32, vertex: bool) {
-        let Some(dir) = std::env::var_os("MH3U_GFX_DUMP") else { return };
+        // read once: this runs for every draw
+        static DIR: std::sync::OnceLock<Option<std::ffi::OsString>> = std::sync::OnceLock::new();
+        let Some(dir) = DIR.get_or_init(|| std::env::var_os("MH3U_GFX_DUMP")).as_ref() else {
+            return;
+        };
         if address == 0 || !self.dumped.insert(address) {
             return;
         }
@@ -1009,11 +1052,19 @@ impl Gx2 {
     /// A call from the game: the display list ones here, the others recorded into the list being made or run now.
     fn run(&mut self, call: Call, c: &mut Ctx, g: &Guest) {
         match call {
-            Call::BeginDisplayListEx => self.recording = Some((c.r[3], Vec::new())),
+            Call::BeginDisplayListEx => {
+                self.recording = Some(Recording {
+                    address: c.r[3],
+                    calls: Vec::new(),
+                    made: 0,
+                    seen: Seen::default(),
+                });
+            }
             Call::EndDisplayList => {
-                if let Some((address, calls)) = self.recording.take() {
-                    c.r[3] = 0x20 + 0x10 * calls.len() as u32;
-                    self.lists.insert(address, calls.into());
+                if let Some(r) = self.recording.take() {
+                    c.r[3] = 0x20 + 0x10 * r.made;
+                    crate::draw::Lap::count("display list calls left out", u64::from(r.made) - r.calls.len() as u64);
+                    self.lists.insert(r.address, r.calls.into());
                 }
             }
             Call::DirectCallDisplayList => {
@@ -1028,8 +1079,11 @@ impl Gx2 {
                 }
             }
             _ => {
-                if let Some((_, calls)) = self.recording.as_mut().filter(|_| !is_immediate(call)) {
-                    calls.push(Recorded::new(call, c, g));
+                if let Some(r) = self.recording.as_mut().filter(|_| !is_immediate(call)) {
+                    r.made += 1;
+                    if !r.seen.redundant(call, c.r[3], c.r[4]) {
+                        r.calls.push(Recorded::new(call, c, g));
+                    }
                 } else {
                     self.exec(call, c, g, None);
                 }
@@ -1104,6 +1158,31 @@ mod tests {
             tb: 0,
             mem: std::ptr::null_mut(),
         }
+    }
+
+    #[test]
+    fn redundant_unit_settings_are_left_out() {
+        let mut s = Seen::default();
+        assert!(!s.redundant(Call::SetPixelTexture, 0x100, 0));
+        assert!(s.redundant(Call::SetPixelTexture, 0x100, 0));
+        // another unit, another texture, or a sampler of the same unit are changes
+        assert!(!s.redundant(Call::SetPixelTexture, 0x100, 1));
+        assert!(!s.redundant(Call::SetPixelTexture, 0x200, 0));
+        assert!(!s.redundant(Call::SetPixelSampler, 0x200, 0));
+        assert!(s.redundant(Call::SetPixelSampler, 0x200, 0));
+        assert!(s.redundant(Call::SetPixelTexture, 0x200, 0));
+        // other calls in between change nothing about the units
+        assert!(!s.redundant(Call::DrawEx, 0, 0));
+        assert!(!s.redundant(Call::SetVertexShader, 0x100, 0));
+        assert!(s.redundant(Call::SetPixelTexture, 0x200, 0));
+        // a change of context forgets everything
+        assert!(!s.redundant(Call::SetContextState, 0x5000, 0));
+        assert!(!s.redundant(Call::SetPixelTexture, 0x200, 0));
+        assert!(!s.redundant(Call::SetupContextStateEx, 0x5000, 0));
+        assert!(!s.redundant(Call::SetPixelSampler, 0x200, 0));
+        // units past the last are never left out (the call does nothing either way)
+        assert!(!s.redundant(Call::SetPixelTexture, 0x100, 18));
+        assert!(!s.redundant(Call::SetPixelTexture, 0x100, 18));
     }
 
     #[test]
