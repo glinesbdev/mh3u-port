@@ -114,3 +114,6 @@ When the build has the hooks from `mods/hooks.txt` (`docs/hooks.md`), the overla
   - The wishlist lists these as "Counted, not in the save yet (+N this quest)".
   - It assumes 1 per gain (the count argument isn't known), and the quest pouch itself isn't read.
 - **Arrows:** the event text uses `->`, because egui's default font has no `→`.
+
+**Confirmed (user, after PR #16 was merged):** quest pickups are counted at once during the quest, and the counts are right and
+stay so after the quest ends (no double counting after the merge).
