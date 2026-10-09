@@ -91,7 +91,8 @@ fn block_text(g: &Guest, stage: &str, index: usize, b: &crate::state::UniformBlo
         b.address, b.size
     );
     for k in 0..vec4s {
-        let w: Vec<u32> = (0..4).map(|c| g.u32(b.address + 16 * k + 4 * c)).collect();
+        // as the GPU reads them: little-endian words
+        let w: Vec<u32> = (0..4).map(|c| g.u32(b.address + 16 * k + 4 * c).swap_bytes()).collect();
         let f: Vec<String> = w.iter().map(|&x| format!("{:.4}", f32::from_bits(x))).collect();
         let _ = writeln!(
             t,
@@ -853,8 +854,9 @@ mod tests {
         assert_eq!(list_text(&[]), "");
         let mut m = vec![0u8; 0x400];
         let g = Guest::new(m.as_mut_ptr());
-        g.put_u32(0x100, 1.0f32.to_bits());
-        g.put_u32(0x10c, 0xff80_4020);
+        // uniform blocks hold little-endian words (the GPU reads them so)
+        g.write(0x100, &1.0f32.to_le_bytes());
+        g.write(0x10c, &0xff80_4020u32.to_le_bytes());
         let b = crate::state::UniformBlock {
             address: 0x100,
             size: 0x1000,

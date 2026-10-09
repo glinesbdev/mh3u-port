@@ -210,6 +210,22 @@ shader `0x1d526d50`: locations 0, 1, 4, 5, 6, 7, 8, 9, 10, 11, 2, 3) reads bone 
 end of the block, which reads zero rows) and those vertices went to (0, 0, 0). The builds now print their commit (`[gfx] build
 <hash>` at start, and the first line of `draws.txt`), so a run can be matched to its code.
 
+**3k. Run 8 (63c0c75): lit and textured; red shadows, black figures.** The stamp reads `build 63c0c75`, the scenery shows `vertex
+semantic table Some([0, 2, 3])` (257 draws) and the skinned characters `Some([0, 1, 2, 3, 4, 5, 7, 8, 9, 10, 11])` (92), as
+predicted, and the streaks are gone. *Red smears*: they are the shadows. `ps-17101480` (and the characters' shaders) take a shadow
+colour from block 1's `KC0[0].y`, red from its low byte (`AND_INT 0xff`), green `>> 8`, blue `>> 16`, and add the lit fraction of
+four `SAMPLE_C` taps. The village's value is `4c 4c 4c ff` in memory (grey, alpha last; every packed word of block 1 ends in `ff`);
+with every uniform word turned around it reached the shader as red `ff`, green and blue `4c`, so shade kept the red. The GPU
+reads uniform blocks as little-endian words with no swap of its own; the game's floats look right turned around only because
+`DMAECopyMem` ignored its endian argument, the 8-in-32 swap the game asks for. The copy now does the swap and the blocks go up as
+they are. *Black figures*: every one of the 46 skinned colour draws has its depth-only twin earlier in the frame (same indices,
+same matrices in the dumped rows), but the polygon offsets differ for some objects: the first object of each pass keeps the bias
+of the pass before (depth-only draws 54-58 -192, their colour draws 222-226 -32), and draws 78-98 have -384 against -224 for
+their colour draws 308-324 (also 118-135 -160 against -96, 138-160 -224 against -160). Where the colour draw is biased less, it
+is farther than the depth it wrote itself and loses a less-or-equal test, leaving what the target held (black); this matches
+the figures. Why the offsets differ is not settled (the units, 2^-24 for a 24-bit buffer, are the hardware's);
+`MH3U_GFX_DEPTH_BIAS=off` tests the explanation.
+
 ## 4. Does the generated code compile in a reasonable time? (done: as C yes, as one Rust crate no)
 
 `mh3u-tools codegen-bench <dump> <out> --lang rust|c --functions N` translates an even sample of the game's functions (found as the

@@ -247,10 +247,8 @@ fn simple(name: &str) -> Option<SimpleHandler> {
         },
         // the DMA engine copies memory (the game uses it to fill the GPU's constant buffers); it is finished when the call returns
         "dmae.rpl:DMAECopyMem" => |_, g, c| {
-            let (dst, src, words) = (c.r[3], c.r[4], c.r[5]);
-            if words > 0 && u64::from(dst) + u64::from(words) * 4 <= 1 << 32 && u64::from(src) + u64::from(words) * 4 <= 1 << 32 {
-                g.copy(src, dst, words * 4);
-            }
+            let (dst, src, words, endian) = (c.r[3], c.r[4], c.r[5], c.r[6]);
+            dma_copy(g, dst, src, words, endian);
             c.r[3] = 0;
         },
         "dmae.rpl:DMAEWaitDone" => |_, _, c| c.r[3] = 1,
@@ -597,9 +595,59 @@ impl Os {
     }
 }
 
+/// `DMAECopyMem(dst, src, words, endian)`: copies `words` 32-bit words, turning the bytes around as `endian` says (0 as they are, 1 in
+/// every 16 bits, 2 in every 32 bits). The game sends its uniform blocks this way with 2: the GPU reads them as little-endian words.
+pub(crate) fn dma_copy(g: &Guest, dst: u32, src: u32, words: u32, endian: u32) {
+    static TOLD: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let bit = 1 << endian.min(3);
+    if TOLD.fetch_or(bit, std::sync::atomic::Ordering::Relaxed) & bit == 0 {
+        eprintln!("[dmae] first copy with endian mode {endian}: {words} words {src:#x} -> {dst:#x}");
+    }
+    let len = u64::from(words) * 4;
+    if words == 0 || u64::from(dst) + len > 1 << 32 || u64::from(src) + len > 1 << 32 {
+        return;
+    }
+    match endian {
+        1 | 2 => {
+            let mut bytes = vec![0; len as usize];
+            g.read(src, &mut bytes);
+            if endian == 1 {
+                bytes.as_chunks_mut::<2>().0.iter_mut().for_each(|h| h.reverse());
+            } else {
+                bytes.as_chunks_mut::<4>().0.iter_mut().for_each(|w| w.reverse());
+            }
+            g.write(dst, &bytes);
+        }
+        _ => g.copy(src, dst, words * 4),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_dma_engine_turns_the_bytes_around_as_asked() {
+        let mut m = vec![0u8; 0x100];
+        let g = Guest::new(m.as_mut_ptr());
+        g.write(0x10, &[1, 2, 3, 4, 5, 6, 7, 8]);
+        for (endian, want) in [
+            (0, [1, 2, 3, 4, 5, 6, 7, 8]),
+            (1, [2, 1, 4, 3, 6, 5, 8, 7]),
+            (2, [4, 3, 2, 1, 8, 7, 6, 5]),
+        ] {
+            dma_copy(&g, 0x40, 0x10, 2, endian);
+            let mut got = [0; 8];
+            g.read(0x40, &mut got);
+            assert_eq!(got, want, "endian {endian}");
+        }
+        // a big-endian float sent with 8-in-32 is the little-endian float the GPU reads
+        g.put_u32(0x20, 0.5f32.to_bits());
+        dma_copy(&g, 0x60, 0x20, 1, 2);
+        let mut le = [0; 4];
+        g.read(0x60, &mut le);
+        assert_eq!(f32::from_le_bytes(le), 0.5);
+    }
 
     fn heap() -> ExpHeap {
         ExpHeap {

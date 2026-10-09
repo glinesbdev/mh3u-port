@@ -182,7 +182,7 @@ with their text and the cloth background, upright, in the right places (the hunt
   when the game is loaded (`Gx2Backend::resolve`) and dispatched by it.
 - **A draw** (`draw.rs`): the vertex and pixel shaders are read from the guest, translated (cached by address and a hash of the
   program), the vertex attributes are decoded on the CPU into one stream of `vec4` per fetch-shader element (the fetch shader is not
-  run: `GX2InitFetchShaderEx` keeps the attribute descriptions), the uniform blocks are copied with their words swapped, a pipeline is
+  run: `GX2InitFetchShaderEx` keeps the attribute descriptions), the uniform blocks are copied as they are (little-endian words), a pipeline is
   made from the state (blend, depth, cull, formats) and cached, and the draw is issued with generated indices (fans, quads and strips
   that `wgpu` lacks are expanded). A vertex shader's outputs reach the pixel shader through the semantic numbers in the shaders'
   headers (a pixel input takes the vertex output with the same semantic). A pass that samples the target it draws into gets a copy.
@@ -191,7 +191,11 @@ with their text and the cloth background, upright, in the right places (the hunt
   per vertex) and geometry shader (reading it, writing a ring of 11 `vec4` per emitted vertex, and `EMIT_VERTEX`) are translated into
   compute shaders; the geometry shader also writes the triangles its strips make; the copy shader (a vertex shader that reads the
   second ring) draws them with the pixel shader. Only point inputs are done.
-- **The DMA engine** (`DMAECopyMem`) is how the game fills the GPU's constant buffers: without it every uniform block was zero.
+- **The DMA engine** (`DMAECopyMem`) is how the game fills the GPU's constant buffers: without it every uniform block was zero. Its
+  last argument turns the bytes around (0 none, 1 in every 16 bits, 2 in every 32 bits); the game's float blocks must come with 2 (copied
+  without the swap they were big-endian in memory, which the GPU could not read), and the GPU reads uniform blocks as little-endian words with no swap of its own (packed colours the game writes as bytes, red first,
+  are read with red in the low byte). The first copy of each mode is logged (`[dmae] first copy with endian mode N`). An indexed
+  uniform fetch (`VFETCH` on resource 128 + n) honours its own `ENDIAN_SWAP`.
 - `GX2CopySurface` copies between render targets (same size and format only); `GX2ClearColor`, `GX2ClearDepthStencilEx`.
 
 - **Speed** (the village scene went from 3.7 to about 13 frames a second): the draws of a frame are recorded into one command buffer and
@@ -301,9 +305,11 @@ with their text and the cloth background, upright, in the right places (the hunt
     `shaders/vs-*.txt` and `ps-*.txt` (listing and WGSL, or why not translated), `textures/*.png` and `tv.png`. Each draw also lists
     its sampler's settings, marks a texture that is a buffer drawn earlier in the frame (`[the colour buffer of draws a-b of this
     frame]`), and shows its uniform blocks (the pixel shader's first 32 vec4s, the vertex shader's first 16, as floats and as hex
-    words); `targets.txt` is the frame's render-target chain (each image drawn into, by which draws, and which draws sampled it).
+    words, both as the GPU reads them: little-endian); `targets.txt` is the frame's render-target chain (each image drawn into, by which draws, and which draws sampled it).
   - **Build stamp**: the log's `[gfx] build <commit>` line and the first line of each `draws.txt` name the commit the binary was
     built from (`+changes` when the working tree differed).
+  - **Depth bias off**: `MH3U_GFX_DEPTH_BIAS=off` drops the bias `GX2SetPolygonOffset` asks for, to check whether a draw loses to
+    the depth its own depth-only pass wrote with a larger bias.
   - **Pixel shader override**: `MH3U_GFX_DEBUG_PS=<mode>` replaces what pixel shaders put out (after the program, with no alpha test),
     to tell apart where a wrong picture comes from; `MH3U_GFX_DEBUG_PS_ONLY=<hex addresses>` limits it to those shaders. Modes:
     `white` (the geometry: what is covered), `alpha1` (the program's colour made opaque: a picture that appears means the alpha was

@@ -218,6 +218,15 @@ fn cube_face(v: vec3<f32>) -> vec4<f32> {
     if (v.z >= 0.0) { return vec4<f32>(-v.y, v.x, 2.0 * a.z, 4.0); }
     return vec4<f32>(-v.y, -v.x, 2.0 * a.z, 5.0);
 }
+fn swap8in16(v: vec4<f32>) -> vec4<f32> {
+    let u = bitcast<vec4<u32>>(v);
+    return bitcast<vec4<f32>>(((u & vec4<u32>(0x00ff00ffu)) << vec4<u32>(8u)) | ((u >> vec4<u32>(8u)) & vec4<u32>(0x00ff00ffu)));
+}
+fn swap8in32(v: vec4<f32>) -> vec4<f32> {
+    let u = swap8in16(v);
+    let w = bitcast<vec4<u32>>(u);
+    return bitcast<vec4<f32>>((w << vec4<u32>(16u)) | (w >> vec4<u32>(16u)));
+}
 fn mul_dx9(a: f32, b: f32) -> f32 { if (a == 0.0 || b == 0.0) { return 0.0; } return a * b; }
 fn set_f(c: bool) -> f32 { return select(0.0, 1.0, c); }
 fn set_i(c: bool) -> f32 { return fu(select(0u, 0xffffffffu, c)); }
@@ -1282,7 +1291,13 @@ impl Gen<'_> {
             let bank = f.resource - 128;
             let entry = self.iface.banks.entry(bank).or_default();
             *entry = DYNAMIC_BANK;
-            format!("cb{bank}[min(iu({index}), {}u)]", DYNAMIC_BANK - 1)
+            let element = format!("cb{bank}[min(iu({index}), {}u)]", DYNAMIC_BANK - 1);
+            // the block is read as little-endian words; the fetch may ask for the bytes to be turned around
+            match f.endian {
+                1 => format!("swap8in16({element})"),
+                2 => format!("swap8in32({element})"),
+                _ => element,
+            }
         };
         let dst = self.fetch_gpr(f.dst_gpr, f.dst_relative);
         self.line(1, "{");
@@ -1668,6 +1683,41 @@ mod tests {
         assert_eq!(DebugPs::parse("nonsense"), DebugPs::Off);
         assert_eq!(DebugPs::parse(" TEX "), DebugPs::Tex);
         assert_eq!(DebugPs::parse("normal3"), DebugPs::Input { n: 3, signed: true });
+    }
+
+    /// A pixel shader that reads element r1.x of uniform block 1 (resource 129) into r0 with a vertex-style fetch whose bytes are turned
+    /// around as `endian` says, and exports r0 as colour 0.
+    fn indexed_uniform(endian: u32) -> Vec<u8> {
+        words(&[
+            2,
+            1 << 23,
+            0,
+            (0x28 << 23) | (1 << 21) | (3 << 9) | (2 << 6) | (1 << 3),
+            (129 << 8) | (1 << 16),
+            (1 << 12) | (2 << 15) | (3 << 18),
+            endian << 16,
+            0,
+        ])
+    }
+
+    #[test]
+    fn an_indexed_uniform_fetch_turns_the_bytes_around_only_when_asked() {
+        let ctx = Context::new(&|_| TexKind::D2);
+        let inputs = PixelInputs {
+            count: 2,
+            flat: vec![],
+            locations: vec![],
+        };
+        for (endian, wanted) in [
+            (0, "let e = cb1[min(iu(r1.x)"),
+            (2, "let e = swap8in32(cb1[min(iu(r1.x)"),
+            (1, "swap8in16(cb1["),
+        ] {
+            let d = decode(&indexed_uniform(endian)).unwrap();
+            let t = translate_pixel(&d, &inputs, &ctx).unwrap();
+            valid(&t.wgsl);
+            assert!(t.wgsl.contains(wanted), "endian {endian}: {}", t.wgsl);
+        }
     }
 
     #[test]

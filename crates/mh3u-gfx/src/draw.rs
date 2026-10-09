@@ -58,6 +58,20 @@ fn debug_ps(ps: u32) -> mh3u_latte::translate::DebugPs {
     }
 }
 
+/// Whether draws get the depth bias `GX2SetPolygonOffset` asks for: `MH3U_GFX_DEPTH_BIAS=off` (or `0`) leaves it out, to see whether a
+/// draw lost to the depth its own depth-only pass wrote with a larger bias.
+fn depth_bias_on() -> bool {
+    static SETTING: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *SETTING.get_or_init(|| bias_setting(std::env::var("MH3U_GFX_DEPTH_BIAS").ok().as_deref()))
+}
+
+pub(crate) fn bias_setting(v: Option<&str>) -> bool {
+    !matches!(
+        v.map(|v| v.trim().to_ascii_lowercase()).as_deref(),
+        Some("off" | "0" | "no" | "false")
+    )
+}
+
 /// Addresses written in hex (with or without `0x`), separated by commas or spaces; what does not read as one is left out.
 pub(crate) fn parse_addresses(text: &str) -> Vec<u32> {
     text.split([',', ' ', ';'])
@@ -302,15 +316,14 @@ pub struct UniformVersions {
     swap: u32,
 }
 
-/// The words of the `have` bytes of a uniform block at `address`, in the order the shader reads them, into `out` (a word cut short by
-/// the block's size is completed with zeros, as the rest of the block is).
+/// The `have` bytes of a uniform block at `address` into `out`, as they are (a word cut short by the block's size is completed with
+/// zeros, as the rest of the block is). The GPU reads uniform blocks as little-endian words with no swap (the block's buffer resource
+/// asks for none), so the game sends them already turned around: its floats come through `DMAECopyMem` with the 8-in-32 swap, and
+/// packed colours it writes as bytes (red first) are read with red in the low byte.
 pub(crate) fn uniform_words(g: &Guest, address: u32, have: usize, out: &mut Vec<u8>) {
     out.clear();
     g.with_bytes(address, have, |b| out.extend_from_slice(b));
     out.resize(have.next_multiple_of(4), 0);
-    for w in out.as_chunks_mut::<4>().0 {
-        w.reverse();
-    }
 }
 
 /// How many uploads of one block a batch remembers (a block rewritten more often than this between flushes is uploaded each time).
@@ -1990,7 +2003,7 @@ impl Gx2 {
             (false, true) => (back_offset.round() as i32, back_scale.to_bits(), bias_clamp.to_bits()),
             _ => (0, 0, 0),
         };
-        let bias = if use_depth.is_some() { bias } else { (0, 0, 0) };
+        let bias = if use_depth.is_some() && depth_bias_on() { bias } else { (0, 0, 0) };
         let strip = matches!(
             topology,
             wgpu::PrimitiveTopology::TriangleStrip | wgpu::PrimitiveTopology::LineStrip
@@ -2894,19 +2907,43 @@ mod tests {
         texture_source_hash(&g, 0x100, &h)
     }
 
-    /// What a uniform upload held before the uploads were made cheaper: the whole block (`vec4s` of them) with the guest's bytes in front,
-    /// every word turned around.
+    /// What a uniform upload held before the uploads were made cheaper: the whole block (`vec4s` of them) with the guest's bytes in front
+    /// (as they are: the GPU reads little-endian words).
     fn uniform_as_before(g: &Guest, block: &crate::state::UniformBlock, vec4s: u32) -> Vec<u8> {
         let size = vec4s.max(1) as usize * 16;
         let mut bytes = vec![0u8; size];
         let have = (block.size as usize).min(size);
         if block.address != 0 && have > 0 {
             g.read(block.address, &mut bytes[..have]);
-            for w in bytes.as_chunks_mut::<4>().0 {
-                w.reverse();
-            }
         }
         bytes
+    }
+
+    #[test]
+    fn the_depth_bias_is_on_unless_turned_off() {
+        assert!(bias_setting(None));
+        assert!(bias_setting(Some("on")));
+        for off in ["off", " OFF ", "0", "no", "false"] {
+            assert!(!bias_setting(Some(off)), "{off}");
+        }
+    }
+
+    /// Uniform blocks go up as they are: the GPU reads little-endian words. The game's floats arrive turned around already (through the
+    /// DMA engine's 8-in-32 swap), and a colour it packs as bytes (red first, alpha last) is read with red in the low byte, which is
+    /// where its shaders take red from (`AND_INT 0xff`, then `>> 8`, `>> 16` for green and blue): the village's shadow colour
+    /// `4c 4c 4c ff` is grey, not the red `ff 4c 4c` the words turned around gave.
+    #[test]
+    fn uniform_blocks_go_up_as_the_little_endian_words_the_gpu_reads() {
+        let mut m = vec![0u8; 0x200];
+        let g = Guest::new(m.as_mut_ptr());
+        g.write(0x100, &0.5f32.to_le_bytes());
+        g.write(0x104, &[0x4c, 0x4c, 0x4c, 0xff]);
+        let mut out = Vec::new();
+        uniform_words(&g, 0x100, 8, &mut out);
+        assert_eq!(f32::from_le_bytes(out[0..4].try_into().unwrap()), 0.5);
+        let colour = u32::from_le_bytes(out[4..8].try_into().unwrap());
+        let (r, gr, b, a) = (colour & 0xff, (colour >> 8) & 0xff, (colour >> 16) & 0xff, colour >> 24);
+        assert_eq!((r, gr, b, a), (0x4c, 0x4c, 0x4c, 0xff));
     }
 
     #[test]
@@ -3057,7 +3094,7 @@ mod tests {
         let mut gx2 = Gx2::new(crate::Display::noop());
         let mut m = vec![0u8; 0x2_0000];
         let g = Guest::new(m.as_mut_ptr());
-        g.put_u32(0x1000 + 16 * 10, 0.5f32.to_bits());
+        g.write(0x1000 + 16 * 10, &0.5f32.to_le_bytes());
         let block = crate::state::UniformBlock {
             address: 0x1000,
             size: 0x80,
