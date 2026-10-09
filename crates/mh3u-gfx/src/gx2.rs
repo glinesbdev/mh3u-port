@@ -1016,9 +1016,16 @@ impl Gx2 {
                     // taken out for the call, so the caches can be measured while it runs
                     let mut perf = std::mem::replace(&mut self.perf, crate::perf::Perf::idle());
                     let lines = perf.swap(self.swaps - 1, pipes, work, || self.cache_sizes());
+                    let (ms, gfx) = perf.last;
                     self.perf = perf;
                     for line in lines {
                         eprintln!("{line}");
+                    }
+                    if crate::draw::Lap::enabled() {
+                        let laps = crate::draw::Lap::take_frame();
+                        if ms >= slow_frame_ms() {
+                            eprintln!("{}", crate::draw::slow_frame_text(self.swaps - 1, ms, gfx, &laps));
+                        }
                     }
                 }
                 self.diag.maybe_print(&self.caches.skipped);
@@ -1229,6 +1236,17 @@ impl Gx2 {
     }
 }
 
+/// A frame at least this long prints `[gfx slow frame]` (`MH3U_GFX_SLOW_MS`, 25 by default).
+fn slow_frame_ms() -> f64 {
+    static MS: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+    *MS.get_or_init(|| {
+        std::env::var("MH3U_GFX_SLOW_MS")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(25.0)
+    })
+}
+
 impl Gx2Backend for Gx2 {
     fn implements(&self, name: &str) -> bool {
         let known = Call::from_name(name).is_some();
@@ -1262,8 +1280,23 @@ impl Gx2Backend for Gx2 {
 }
 
 impl Gx2 {
-    /// A call from the game: the display list ones here, the others recorded into the list being made or run now.
+    /// A call from the game. With `MH3U_GFX_TIMES`, the calls other than the draws (which have their own steps) and the display list
+    /// ones are timed for the frame's `[gfx slow frame]` line.
     fn run(&mut self, call: Call, c: &mut Ctx, g: &Guest) {
+        let timed = crate::draw::Lap::enabled()
+            && !matches!(
+                call,
+                Call::DirectCallDisplayList | Call::DrawEx | Call::DrawIndexedEx | Call::BeginDisplayListEx | Call::EndDisplayList
+            );
+        let started = timed.then(Instant::now);
+        self.run_call(call, c, g);
+        if let Some(t) = started {
+            crate::draw::Lap::frame_time(call.name(), t.elapsed());
+        }
+    }
+
+    /// The display list ones here, the others recorded into the list being made or run now.
+    fn run_call(&mut self, call: Call, c: &mut Ctx, g: &Guest) {
         match call {
             Call::BeginDisplayListEx => {
                 self.recording = Some(Recording {

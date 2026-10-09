@@ -123,7 +123,8 @@ instead (the old behaviour, for comparing), `$env:MH3U_GFX_PIPELINE_CACHE = 'off
 `$out\cache` is always safe. Translated shaders are kept in `$out\cache\translations` (`[gfx] shader cache …: N translations kept`
 at the start). `$env:MH3U_GFX_SHADER_CACHE = 'off'` leaves them out, and `$env:MH3U_GFX_SHADER_BUDGET_MS` sets how long translating
 may take in one frame (5 ms by default, `0` for no limit). The `[gfx] area change` lines show where an area entry's time went:
-translating, making shader modules, decoding textures, and the game. `[draw times]` also has `render pass end`, `arena uploads` and `submit` (wgpu's own work, which used to be the untimed part of
+translating, making shader modules, decoding textures, and the game. `[gfx slow frame]` lines break down any frame of 25 ms or more
+(`$env:MH3U_GFX_SLOW_MS` changes that) by its longest steps. `[draw times]` also has `render pass end`, `arena uploads` and `submit` (wgpu's own work, which used to be the untimed part of
 `GX2DirectCallDisplayList`). `[gfx caches]` shows `vertex streams N (X MB)`, which should stay roughly flat while standing still.
 Leave `MH3U_GFX_DUMP_FRAME` unset when timing: writing the frame takes about 0.6 s and shows as the window's slowest frame.
 

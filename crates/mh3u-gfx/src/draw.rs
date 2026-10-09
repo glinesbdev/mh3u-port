@@ -1727,6 +1727,7 @@ impl Gx2 {
             );
         }
         let size = data.len() as u64;
+        Lap::count("vertex stream bytes made", size);
         let buffer = self.d.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("vertex streams"),
             size,
@@ -1742,6 +1743,7 @@ impl Gx2 {
         });
         let meta_bytes: Vec<u8> = meta.iter().flatten().flat_map(|v| v.to_le_bytes()).collect();
         self.d.queue.write_buffer(&meta_buffer, 0, &meta_bytes);
+        lap.mark("stream miss: buffers and upload");
         // forget what has not been used for a while, or what is too much
         self.caches.stream_bytes += size;
         if self.caches.stream_bytes > (1 << 30) {
@@ -1976,11 +1978,13 @@ impl Gx2 {
                 },
             })
             .collect();
+        let mut lap = Lap::new();
         let group = self.d.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: None,
             layout,
             entries: &list,
         });
+        lap.mark("bind group made (in groups)");
         if keep {
             Lap::count("bind group misses", 1);
             if self.caches.bind_groups.len() >= BIND_GROUP_LIMIT {
@@ -2604,6 +2608,8 @@ impl Gx2 {
                     a.shadow.resize(used, 0);
                 }
                 self.d.queue.write_buffer(&a.buffer, 0, &a.shadow[..used]);
+                Lap::count("arena bytes uploaded", used as u64);
+                Lap::count("arena uploads", 1);
             }
         }
         self.batch.generation += 1;
@@ -2784,13 +2790,47 @@ struct LapTable {
     since: Option<(std::time::Instant, u64)>,
     times: std::collections::BTreeMap<&'static str, (std::time::Duration, u64)>,
     counts: std::collections::BTreeMap<&'static str, u64>,
+    /// The same for the frame being drawn (with the non-draw graphics calls' own times too), for `[gfx slow frame]`.
+    frame: std::collections::BTreeMap<&'static str, (std::time::Duration, u64)>,
+    frame_counts: std::collections::BTreeMap<&'static str, u64>,
 }
 
 static LAPS: std::sync::Mutex<LapTable> = std::sync::Mutex::new(LapTable {
     since: None,
     times: std::collections::BTreeMap::new(),
     counts: std::collections::BTreeMap::new(),
+    frame: std::collections::BTreeMap::new(),
+    frame_counts: std::collections::BTreeMap::new(),
 });
+
+/// What one frame's time went to, by step (see `Lap::take_frame`).
+pub(crate) struct FrameLaps {
+    pub times: Vec<(&'static str, std::time::Duration, u64)>,
+    pub counts: Vec<(&'static str, u64)>,
+}
+
+/// The `[gfx slow frame]` line of a frame that took `ms` (`gfx` of it in graphics calls): its steps by time (the twelve longest)
+/// and its counts. Steps nest (a draw's "decode streams" holds its "stream hash"), so they do not add up to the total.
+pub(crate) fn slow_frame_text(frame: u32, ms: f64, gfx: f64, laps: &FrameLaps) -> String {
+    let mut times = laps.times.clone();
+    times.sort_by_key(|t| std::cmp::Reverse(t.1));
+    let steps: Vec<String> = times
+        .iter()
+        .take(12)
+        .map(|(name, d, n)| format!("{name} {:.2} ms/{n}", d.as_secs_f64() * 1000.0))
+        .collect();
+    let counts: Vec<String> = laps
+        .counts
+        .iter()
+        .filter(|c| c.1 > 0)
+        .map(|(name, n)| format!("{name} {n}"))
+        .collect();
+    format!(
+        "[gfx slow frame] frame {frame}: {ms:.1} ms ({gfx:.1} ms in graphics calls); steps: {}; counts: {}",
+        steps.join(", "),
+        counts.join(", ")
+    )
+}
 
 impl Lap {
     pub(crate) fn enabled() -> bool {
@@ -2813,9 +2853,13 @@ impl Lap {
         }
         let now = std::time::Instant::now();
         let mut l = LAPS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let d = now - self.at;
         let e = l.times.entry(what).or_default();
-        e.0 += now - self.at;
+        e.0 += d;
         e.1 += 1;
+        let f = l.frame.entry(what).or_default();
+        f.0 += d;
+        f.1 += 1;
         self.at = now;
         Lap::maybe_print(&mut l, now);
     }
@@ -2827,6 +2871,27 @@ impl Lap {
         }
         let mut l = LAPS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         *l.counts.entry(what).or_default() += n;
+        *l.frame_counts.entry(what).or_default() += n;
+    }
+
+    /// Adds `d` to `what` for this frame only (the non-draw graphics calls, which `[gfx times]` already has per window).
+    pub(crate) fn frame_time(what: &'static str, d: std::time::Duration) {
+        if !Lap::enabled() {
+            return;
+        }
+        let mut l = LAPS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let f = l.frame.entry(what).or_default();
+        f.0 += d;
+        f.1 += 1;
+    }
+
+    /// The frame's steps and counts, emptied for the next frame.
+    pub(crate) fn take_frame() -> FrameLaps {
+        let mut l = LAPS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        FrameLaps {
+            times: std::mem::take(&mut l.frame).into_iter().map(|(k, (d, n))| (k, d, n)).collect(),
+            counts: std::mem::take(&mut l.frame_counts).into_iter().collect(),
+        }
     }
 
     fn maybe_print(l: &mut LapTable, now: std::time::Instant) {
@@ -3371,6 +3436,33 @@ mod tests {
         assert!(gx2.pixel_shader(&g, 0x1100, 0x3000, &plain_variant()).is_some());
         assert_eq!(gx2.caches.work.translated, 2);
         assert!(!gx2.caches.deferred);
+    }
+
+    #[test]
+    fn a_slow_frame_lists_its_longest_steps_first() {
+        let ms = std::time::Duration::from_millis;
+        let laps = FrameLaps {
+            times: (0..15u64)
+                .map(|k| {
+                    (
+                        ["a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l", "m", "n", "o"][k as usize],
+                        ms(k),
+                        k,
+                    )
+                })
+                .collect(),
+            counts: vec![("texture decodes", 3), ("bind group misses", 0)],
+        };
+        let line = slow_frame_text(1561, 39.4, 34.0, &laps);
+        assert!(
+            line.starts_with("[gfx slow frame] frame 1561: 39.4 ms (34.0 ms in graphics calls); steps: o 14.00 ms/14, n 13.00 ms/13"),
+            "{line}"
+        );
+        assert!(
+            line.contains("d 3.00 ms/3") && !line.contains("c 2.00"),
+            "the twelve longest: {line}"
+        );
+        assert!(line.ends_with("counts: texture decodes 3"), "{line}");
     }
 
     #[test]

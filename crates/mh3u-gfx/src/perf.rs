@@ -118,6 +118,8 @@ pub(crate) struct Perf {
     window_pipes: PipelineCounts,
     /// Time in graphics calls since the last swap (the rest of a frame is the game's, or waiting for the GPU in the swap).
     pub frame_gfx: Duration,
+    /// The frame that ended at the last swap: its milliseconds, and how many of them were in graphics calls.
+    pub last: (f64, f64),
 }
 
 fn minus(a: PipelineCounts, b: PipelineCounts) -> PipelineCounts {
@@ -174,6 +176,7 @@ impl Perf {
             quiet: 0,
             window_pipes: PipelineCounts::default(),
             frame_gfx: Duration::ZERO,
+            last: (0.0, 0.0),
         }
     }
 
@@ -209,6 +212,7 @@ impl Perf {
         self.last_pipes = pipes;
         self.last_work = work;
         let gfx = std::mem::take(&mut self.frame_gfx).as_secs_f64() * 1000.0;
+        self.last = (ms, gfx);
         let new = this_pipes.queued + this_pipes.made_here + this_work.translated + this_work.from_disk + this_work.decoded;
         if let Some(a) = &mut self.area {
             a.frames += 1;

@@ -288,7 +288,12 @@ with their text and the cloth background, upright, in the right places (the hunt
   on disk, <n> modules made (<ms>) and <n> found made, <n> draws left for a later frame; textures: <n> decoded (<ms>)`. 180 frames
   later it prints how those frames went: the slowest (with its time in graphics calls), the mean, how many took over 50 ms, the
   pipelines, and the same shader and texture counts. `[gfx caches]` also shows the translations on disk and how many were found or
-  not.
+  not. With `MH3U_GFX_TIMES=1`, a frame of 25 ms or more (`MH3U_GFX_SLOW_MS`) prints `[gfx slow frame] frame N: <ms> (<ms> in
+  graphics calls); steps: ...; counts: ...`. Its steps are that frame's twelve longest draw steps and graphics calls, each with its
+  time and count. The non-draw calls (copies, clears, `GX2Invalidate`, ...) are timed one by one for this; the swap's own call counts
+  in the next frame. Steps nest, so they do not add up. Its counts are that frame's `[draw counts]`. `[draw times]` also has
+  `stream miss: buffers and upload` (a new vertex stream's two buffers and their writes) and `bind group made (in groups)`.
+  `[draw counts]` adds `vertex stream bytes made`, `arena uploads` and `arena bytes uploaded`.
 
   The reports: `MH3U_GFX_TIMES=1` gives each line as a total, a count, and both per frame (`[gfx times]` per graphics call, `[draw
   times]` per part of a draw, where "geometry pass" counts only the draws with a geometry shader), and `[draw counts]`: hits, checks
