@@ -115,6 +115,32 @@ confirm run:
 From that log, the functions that wrote each field go into `mods/hooks.txt`. Menu-open and quest hooks need a second pass:
 `MH3U_ENTER_LR` on the callers found here, or watching a menu or quest field once one is known.
 
+### Run 31 (user): confirm run
+
+The user logged each action with the hook lines it produced (`MH3U_HOOK_LOG=1`). In every hook, `r3 = 0x2e686af0`: the hunter's
+data, 0x10 before the save block (except `0x0216afd4`).
+
+| Hook | Function | Verdict | Arguments | Seen on |
+|---|---|---|---|---|
+| `money_add` | `f_0219c720` | **confirmed** | r4 = signed zenny change, r5 = &money (+0x48) | craft fees -200/-300, meal -50, quest fee -310, refund +310 on abandon |
+| `item_gain` | `f_02199438` | likely (20 calls in all) | r5 = item id (0xb4 on a pickup), r4 = &save | pickup; after box -> pouch |
+| `pouch_remove_slot` | `f_0219ae84` | likely (1 call) | r4 = r5 = the pouch | putting a pouch item into the box |
+| `equip_records` | `f_02198d40` | likely, for crafting armour | r5 = record kind 0x10..0x19 | crafting the Piscine Mask; earlier around the quest |
+| (was `pouch_set_slot`) | `f_0219acec` | rejected: a pouch item lookup, thousands of calls | r4 = item id, r5 = the pouch | everywhere |
+| (was `box_set_count`) | `f_02199408` | rejected: a box lookup | r4 = item id | everywhere |
+| (was `box_take`) | `f_02198770` | rejected: a field getter, ~200k calls | r5 = field 7/8 | every frame |
+| (was `money_set_quest`) | `f_0216afd4` | rejected: per frame, another object (r3 0x2e66af50) | – | every frame |
+
+Still missing, with the cheapest next step for each:
+- **Craft (decorations, weapons):** the craft's money change (`money_add` from lr `0x22087d4`, or `0x220715c` for armour) is
+  inside the craft code. Hook the functions containing those lrs (look them up in `game.h`: the nearest `f_` at or below the
+  address) and confirm.
+- **Quest start / end:** the same way: the callers of `money_add`, at lr `0x21e3724` (quest fee) and `0x2172ca4` (abandon
+  refund). For a finished quest, the reward is likely another `money_add` caller.
+- **Item used:** use an item with `MH3U_HOOK_LOG=1` and watch `item_gain` and `pouch_remove_slot`. If neither fires, run the
+  live watch again on that pouch slot.
+- **Menu open:** no data field is known. `MH3U_PROFILE` with the menu open versus closed would show the menu's functions.
+
 ## Plan
 
 1. Write this doc. **(done)**
@@ -129,6 +155,6 @@ From that log, the functions that wrote each field go into `mods/hooks.txt`. Men
 
 See the bottom of this file. It is updated with each commit of PR #13.
 
-- Status: the run 30 candidates are in `mods/hooks.txt` and the table (PR #14).
-- Next: a confirm run with a normal build and `MH3U_HOOK_LOG=1` (steps in the PR #14 report), to tie each hook to its action.
-  Craft and quest need a second pass.
+- Status: step 5 is done for money and item gain (run 31). Four hooks are kept, four are rejected (PR #14, ready for review).
+- Next: craft and quest hooks through the callers of `money_add` (the lrs above); then step 6 (exit hooks), or step 7 (a hook
+  that drives the overlay: refresh the wishlist on `item_gain` and `money_add`).
