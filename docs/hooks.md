@@ -169,6 +169,23 @@ prints which `f_` each one is.
 `quest_end`'s r4 does not tell an abandon from a completion. What follows does: a `money_add` from lr `0x2172ca4` means
 abandoned; `quest_fee_back` and `quest_reward` mean completed.
 
+### Run 33 (user): upgrade and quest reward
+
+| Hook | Function | Verdict | Arguments | Seen on |
+|---|---|---|---|---|
+| `upgrade_equipment` | `f_0220b93c` | **confirmed** | r4 = 5, r3 = the smithy | a weapon upgrade, then `money_add` -4000 |
+| `quest_reward` | `f_0217ef68` | **confirmed** | r3/r4 = the reward screen; r5 = 1, then 5 (a step?) | twice after `quest_end`, then `money_add` +1000 (lr `0x217f12c`) |
+| `quest_fee_back` | containing lr `0x21794c8` | not seen in run 33: off (commented out) | – | run 32 only |
+| `quest_reward_items` | containing lr `0x217f5b0` | not seen in run 33: off | – | run 32 only (maybe a sale of commodities) |
+
+**Where `item_gain` puts the item:** r3 and r4 never change, and r5 is the item id. Only the lr tells where it goes:
+- `0x219b080`: the pouch (pickups in the field, and box -> pouch in run 31);
+- `0x2199574`: the box (the box slot write in run 30);
+- `0x219950c`: the box (the quest's reward items).
+
+The confidence is medium; a callback can switch on `h.ctx.lr`. Hooking the callers (`in:0x219b080` and so on) would give
+separate hooks, if those functions are not shared.
+
 ## Plan
 
 1. Write this doc. **(done)**
@@ -183,7 +200,7 @@ abandoned; `quest_fee_back` and `quest_reward` mean completed.
 
 See the bottom of this file. It is updated with each commit of PR #13.
 
-- Status: run 32 confirmed craft_jewel, craft_equipment, quest_accept and quest_end. The upgrade and quest-reward hooks are
-  new and not confirmed yet (PR #15).
-- Next: a short run to confirm `upgrade_equipment`, `quest_fee_back`, `quest_reward` and `quest_reward_items` (upgrade a
-  weapon, complete a quest).
+- Status: runs 32–33 confirmed the craft, upgrade and quest hooks (craft_jewel, craft_equipment, upgrade_equipment,
+  quest_accept, quest_end, quest_reward) and `item_gain`'s destination by lr. PR #15 is ready.
+- Next: step 7, an overlay feature driven by hooks (refresh the wishlist on `item_gain` and `money_add`, a toast on
+  `quest_reward`), or step 6 (exit hooks).
