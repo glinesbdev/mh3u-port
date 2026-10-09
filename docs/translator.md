@@ -165,7 +165,11 @@ for the next frame) blocks there, with the other guest threads waiting.
 with their text and the cloth background, upright, in the right places (the hunter's clothing still shows white speckles: not understood yet). The pieces:
 
 - **State**: every `GX2Set*` call is recorded into the state of the current context (`GX2SetContextState`/`GX2SetupContextStateEx`
-  switch between them); display lists (`GX2BeginDisplayListEx`...) are recorded and replayed with their arguments.
+  switch between them); display lists (`GX2BeginDisplayListEx`...) are recorded and replayed with their arguments. A recorded call is
+  a fixed-size record (which call, as a number, and the argument registers and stack words it reads), a list is a shared slice played
+  back without copying, and a `GX2SetPixelTexture`/`GX2SetPixelSampler` that sets a unit to what the list already set it to since its
+  last change of context is left out (the size `GX2EndDisplayList` returns still counts it). Graphics imports are given a number
+  when the game is loaded (`Gx2Backend::resolve`) and dispatched by it.
 - **A draw** (`draw.rs`): the vertex and pixel shaders are read from the guest, translated (cached by address and a hash of the
   program), the vertex attributes are decoded on the CPU into one stream of `vec4` per fetch-shader element (the fetch shader is not
   run: `GX2InitFetchShaderEx` keeps the attribute descriptions), the uniform blocks are copied with their words swapped, a pipeline is
@@ -189,6 +193,31 @@ with their text and the cloth background, upright, in the right places (the hunt
   index (`GX2SetPrimitiveRestartIndex`, 0xffff here) becomes the API's restart value: before that, strips drew a vertex 65535 away
   and decoded all 64 thousand vertices before it for every such draw. `MH3U_GFX_TIMES=1` prints where the time goes (every ten seconds:
   per graphics call, and per part of a draw).
+- **What a draw costs on the CPU** (about 50 microseconds by `MH3U_GFX_TIMES` before these changes, ~125 draws a frame in the village): nothing per draw is found by a
+  formatted string or a hash of the whole program any more.
+  - *Shaders*: a translation is found by a front cache (`shader_cache.rs`) keyed by what is cheap to read: the shader's address, its
+    program's address and size, the fetch shader's version (a new shared slice per `GX2InitFetchShaderEx`), half z, and for pixel
+    shaders a hash of the input words and the texture kinds. The program bytes still decide: each entry keeps their hash, the first
+    draw of every frame that uses it hashes them again, and `GX2Invalidate` with the shader (8) or CPU (0x40) bit drops the entries
+    whose programs it overlaps. The assumption: a program rewritten in place without `GX2Invalidate` may be drawn as it was for the
+    rest of that frame (the console's GPU reads programs through its own cache too). Geometry pipelines are found the same way (their
+    key also has half z and the ring sizes, which the translation uses).
+  - *Uploads*: what a batch's draws read (uniform blocks, indices, geometry parameters) is written into a copy of the arena in memory
+    and uploaded with one write per arena when the batch is flushed; a uniform block whose contents were already uploaded in the batch
+    reuses those bytes (compared, not only hashed). The vertex streams' start table lives with the cached streams, and the geometry
+    draws use the stream cache too.
+  - *Bind groups*: cached by layout and the resources bound (`wgpu` handles compare by identity), pruned of what a second of frames did
+    not use; pipelines keep their bind group layouts; texture, target and depth views are made once with their textures; samplers are
+    keyed by the three `GX2Sampler` words, and the default and compare samplers are made once. A bind group with a per-draw snapshot
+    of the target is not kept.
+  - *System calls*: the report's counters are arrays indexed by import number, `MH3U_TRACE_FROM` is read once, and the timing report
+    allocates nothing per call.
+
+  The reports: `MH3U_GFX_TIMES=1` gives each line as a total, a count, and both per frame (`[gfx times]` per graphics call, `[draw
+  times]` per part of a draw, where "geometry pass" counts only the draws with a geometry shader), and `[draw counts]`: hits, checks
+  and misses of the shader caches, bind groups, texture views and uniform uploads, and the display list calls replayed and left out.
+  `MH3U_TIMES_WINDOW=<seconds>` sets how long each report covers (10 by default); the per-frame numbers are the ones to compare
+  between builds and scenes.
 - **Textures** (`texture.rs`): a `GX2Texture` is read from the guest, untiled texel by texel (`tiling::address`) and uploaded in the
   format the GPU takes (the block-compressed ones as they are stored: the blocks are not byte-swapped; the packed ones are converted).
   The layout is `tiling::surface_info`, the same calculation the game's size call used. The tiling code is a restatement of the part of

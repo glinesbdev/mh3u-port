@@ -103,6 +103,16 @@ $env:MH3U_FPS = '1'
 & $tools build-game $out --native --lto     # also -flto=thin: optimised across files at the link, which takes longer
 ```
 
+Where the time of a frame goes: `MH3U_GFX_TIMES` prints, every `MH3U_TIMES_WINDOW` seconds (10 by default), the graphics calls and
+the parts of a draw that took the most, as totals and per frame, and the cache hit and miss counts (`translator.md`, "What a draw
+costs on the CPU"). Stand in the same place for a whole window and compare the per-frame columns:
+
+```powershell
+$env:MH3U_GFX_TIMES = '1'
+$env:MH3U_TIMES_WINDOW = '10'
+& $tools run $games $out --window --max-imports 1000000000000
+```
+
 `--lto` needs clang with lld, which llvm-mingw and MSYS2's CLANG64 both are. To compare with the code before a change of the
 translator, translate with each version of the tools into its own folder (the C differs, not only the flags).
 
