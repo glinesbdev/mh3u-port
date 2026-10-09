@@ -117,6 +117,8 @@ pub struct Overlay {
     feed: std::collections::VecDeque<String>,
     /// Gains the save does not have yet (a quest's pickups).
     provisional: crate::events::Provisional,
+    /// F10 presses seen (see `follow_save`).
+    f10: u32,
 }
 
 /// How many events the feed shows.
@@ -170,6 +172,7 @@ impl Overlay {
             refresh: crate::events::Refresh::new(),
             feed: Default::default(),
             provisional: Default::default(),
+            f10: 0,
         }
     }
 
@@ -277,6 +280,24 @@ impl Overlay {
             }
             Save::At(at, name, save) => {
                 let at = *at;
+                // F10 (MH3U_WATCH=live): look for copies of the pouch as it is now (on a quest: the quest pouch) and watch one
+                let f10 = mods::KEY_F10.load(std::sync::atomic::Ordering::Relaxed);
+                if f10 != self.f10 {
+                    self.f10 = f10;
+                    const POUCH: i64 = 0xd0;
+                    let (lo, hi) = live::WATCH_SPAN;
+                    eprintln!("[watch-live] F10: searching for copies of the pouch");
+                    mods::watch_copies(
+                        at + POUCH as u32,
+                        24 * 4,
+                        live::RANGES.to_vec(),
+                        (i64::from(lo) - POUCH, i64::from(hi) - POUCH),
+                        Arc::new(|d: i64| match u32::try_from(d + POUCH) {
+                            Ok(o) => live::field(o),
+                            Err(_) => format!("pouch {d}"),
+                        }),
+                    );
+                }
                 let events = crate::events::drain();
                 if !events.is_empty() {
                     let data = self.data.lock().unwrap_or_else(|e| e.into_inner());

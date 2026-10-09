@@ -672,6 +672,50 @@ pub fn run(library: &Path, pieces: &[Piece], options: Options) -> Result<Report>
             Err(_) => eprintln!("MH3U_ENTER is set but the library was not built with --watch"),
         }
     }
+    if std::env::var("MH3U_CALLDIFF").is_ok_and(|v| v.trim() == "1") {
+        // the call diff (docs/hooks.md): samples the most recently entered function every millisecond; each F9 closes a window and
+        // the last two are compared (needs a --watch build)
+        // SAFETY: the symbol exists only in a library built with the watch, with this signature
+        match unsafe { lib.get::<unsafe extern "C" fn() -> u32>(b"game_last_function\0") } {
+            Ok(f) => {
+                let f = *f;
+                eprintln!("[calldiff] on: press F9 to close a window (e.g. menu closed), do the thing, F9 again");
+                std::thread::spawn(move || {
+                    use std::sync::atomic::Ordering::Relaxed;
+                    let mut cur: std::collections::HashMap<u32, u32> = Default::default();
+                    let mut prev: Option<std::collections::HashMap<u32, u32>> = None;
+                    let mut seen = crate::mods::KEY_F9.load(Relaxed);
+                    let mut window = 0;
+                    loop {
+                        std::thread::sleep(std::time::Duration::from_millis(1));
+                        // SAFETY: a plain read of a global
+                        *cur.entry(unsafe { f() }).or_default() += 1;
+                        let k = crate::mods::KEY_F9.load(Relaxed);
+                        if k == seen {
+                            continue;
+                        }
+                        seen = k;
+                        window += 1;
+                        let done = std::mem::take(&mut cur);
+                        eprintln!("[calldiff] window {window} closed ({} samples)", done.values().sum::<u32>());
+                        if let Some(p) = &prev {
+                            let d = crate::mods::call_diff(p, &done);
+                            eprintln!(
+                                "[calldiff] window {window} vs {}: {} functions far more frequent",
+                                window - 1,
+                                d.len()
+                            );
+                            for (func, a, b) in d.iter().take(25) {
+                                eprintln!("[calldiff]   f_{func:08x}  {a} -> {b}");
+                            }
+                        }
+                        prev = Some(done);
+                    }
+                });
+            }
+            Err(_) => eprintln!("MH3U_CALLDIFF is set but the library was not built with --watch"),
+        }
+    }
     if let Some(secs) = std::env::var("MH3U_PROFILE").ok().and_then(|v| v.parse::<u64>().ok()) {
         // a sampling profile of the translated code: the function most recently entered, every millisecond (needs a --watch build)
         // SAFETY: the symbol exists only in a library built with the watch, with this signature

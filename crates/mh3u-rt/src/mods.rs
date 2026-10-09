@@ -278,6 +278,28 @@ mod tests {
     }
 }
 
+/// F9 and F10 presses (the window counts them): F9 closes a call-diff window (`MH3U_CALLDIFF`), F10 searches for copies of the
+/// pouch again (`MH3U_WATCH=live`; on a quest, the quest pouch). See `docs/hooks.md`.
+pub static KEY_F9: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+pub static KEY_F10: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// The functions sampled far more often in window `b` than in window `a` (counts of the most recently entered function, `na` and
+/// `nb` samples): (function, count in a, count in b), most first. A function needs 5 samples in `b` and 4 times its rate in `a`.
+pub fn call_diff(a: &std::collections::HashMap<u32, u32>, b: &std::collections::HashMap<u32, u32>) -> Vec<(u32, u32, u32)> {
+    let (na, nb) = (a.values().sum::<u32>().max(1) as f64, b.values().sum::<u32>().max(1) as f64);
+    let mut out: Vec<(u32, u32, u32, f64)> = b
+        .iter()
+        .filter(|&(_, &n)| n >= 5)
+        .filter_map(|(&f, &n)| {
+            let before = a.get(&f).copied().unwrap_or(0);
+            let ratio = (f64::from(n) / nb) / (f64::from(before).max(0.5) / na);
+            (ratio >= 4.0).then_some((f, before, n, ratio))
+        })
+        .collect();
+    out.sort_by(|x, y| y.3.total_cmp(&x.3).then(y.2.cmp(&x.2)));
+    out.into_iter().map(|(f, a, b, _)| (f, a, b)).collect()
+}
+
 /// `MH3U_WATCH=live` (a `--watch` build, `docs/hooks.md`): stores into a range found at run time (the live save) are logged with
 /// what they write (a label from `label`), the function most recently entered and the link register, so the functions that
 /// change items, equipment and money can be found and hooked.
@@ -419,6 +441,20 @@ pub fn watch_copies(at: u32, len: u32, ranges: Vec<(u32, u32)>, around: (i64, i6
 
 #[cfg(test)]
 mod write_watch_tests {
+    #[test]
+    fn the_call_diff_keeps_the_functions_that_only_run_in_the_second_window() {
+        let a: std::collections::HashMap<u32, u32> = [(1, 500), (2, 500)].into();
+        let b: std::collections::HashMap<u32, u32> = [(1, 450), (2, 400), (3, 100), (4, 3), (5, 50)].into();
+        let mut a2 = a.clone();
+        a2.insert(5, 40);
+        let d = super::call_diff(&a2, &b);
+        assert_eq!(
+            d.iter().map(|x| x.0).collect::<Vec<_>>(),
+            vec![3],
+            "5 ran before too, 4 too rarely, 1 and 2 always"
+        );
+        assert_eq!(d[0], (3, 0, 100));
+    }
     #[test]
     fn copies_of_the_pouch_are_found_word_aligned() {
         let pat = [1u8, 2, 3, 4, 5, 6, 7, 8];

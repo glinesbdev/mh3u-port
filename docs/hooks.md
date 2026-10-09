@@ -186,6 +186,41 @@ abandoned; `quest_fee_back` and `quest_reward` mean completed.
 The confidence is medium; a callback can switch on `h.ctx.lr`. `mods/hooks.txt` now hooks the callers as `item_to_pouch`
 (`in:0x219b080`) and `item_to_box` (`in:0x219950c`). They are not confirmed yet; if they fire on other frames, they are shared.
 
+### Item use and menu open: tools (PR #17)
+
+- **The quest pouch (F10):** with `MH3U_WATCH=live`, F10 searches guest memory for copies of the pouch as the save has it
+  now, and watches the first one (`MH3U_WATCH_COPY=n` picks another). Press it right after leaving for a quest, before any
+  item is used, while the quest pouch still equals the save's. Using an item then logs
+  `[watch-live] copy 0x…: pouch N count <- … by f_…, lr …`: the writer of the use.
+- **The call diff (F9, `MH3U_CALLDIFF=1`):** a thread samples the most recently entered function every millisecond. Each F9
+  closes a window and compares it with the one before. The log lists the functions at least 4 times as frequent (and seen at
+  least 5 times) in the new window: `[calldiff]   f_XXXXXXXX  before -> after`. Press F9 with the menu closed, open the
+  menu and wait 3 s, press F9 again: the list is what the menu runs (drawing included). The callers of the top ones are the
+  menu-open candidates.
+
+Both need a watch build. F9 and F10 also reach the game, which does not use them.
+
+#### Test session (PowerShell)
+
+```powershell
+git pull; git checkout mods/hook-points-3
+.\scripts\win-build.ps1 -Watch -Out "$env:LOCALAPPDATA\mh3u\c-watch"
+$env:MH3U_WATCH = 'live'; $env:MH3U_CALLDIFF = '1'; $env:MH3U_HOOK_LOG = '1'
+.\scripts\win-run.ps1 -Out "$env:LOCALAPPDATA\mh3u\c-watch" *> "$env:USERPROFILE\Desktop\session.log"
+Remove-Item Env:MH3U_WATCH, Env:MH3U_CALLDIFF, Env:MH3U_HOOK_LOG
+```
+
+In the village, with at least 3 items and a potion in the pouch, write down each step as you do it:
+1. Use a potion (out of a quest).
+2. Eat or drink something.
+3. Menu diff: press F9, wait 3 s, open the item menu, wait 3 s, press F9, close it. Then the same for the main menu:
+   press F9, wait 3 s, open it, wait 3 s, press F9, close it.
+4. Accept a quest and depart. As soon as you are in the field, press **F10**, then wait for `[watch-live] the pouch is also
+   at …` in the log.
+5. Use a potion on the quest, then another item. Abandon or finish the quest.
+
+Send back `Desktop\session.log` with your notes (the order of the steps, and which menu each F9 pair was).
+
 ## Plan
 
 1. Write this doc. **(done)**
@@ -200,6 +235,5 @@ The confidence is medium; a callback can switch on `h.ctx.lr`. `mods/hooks.txt` 
 
 See the bottom of this file. It is updated with each commit of PR #13.
 
-- Status: PR #16 wires `item_gain`, `pouch_remove_slot`, `money_add`, the craft hooks and `quest_end` into the overlay
-  (events, feed, read on events plus every 2 s; `overlay.md`). `item_to_box` and `item_to_pouch` are not confirmed yet.
-- Next: item use (consume), menu open, and confirming the caller hooks (see the steps above).
+- Status: PR #17 adds the call diff (F9) and the quest-pouch search (F10). Waiting for the user's test session.
+- Next: from that log, hook the item-use writer and the menu-open candidates, then confirm them with `MH3U_HOOK_LOG=1`.
