@@ -79,8 +79,8 @@ pub fn describe(e: &Event, item_name: &dyn Fn(u16) -> String) -> Option<String> 
             "+ {} {}",
             item_name(item),
             match to {
-                Dest::Pouch => "→ pouch",
-                Dest::Box => "→ box",
+                Dest::Pouch => "-> pouch",
+                Dest::Box => "-> box",
                 Dest::Unknown => "",
             }
         )
@@ -130,8 +130,58 @@ impl Default for Refresh {
     }
 }
 
+/// Item gains not in the save yet: during a quest the game keeps the pickups elsewhere and merges them into the save at the quest's
+/// end (PR #16 test). Each gain counts 1 until the save's count of that item goes up past what it was at the gain (then the save
+/// has it) or the quest ends.
+#[derive(Debug, Default)]
+pub struct Provisional {
+    pending: std::collections::BTreeMap<u16, (u32, u32)>,
+}
+
+impl Provisional {
+    /// An item gained; `in_save` is the save's count of it now.
+    pub fn gain(&mut self, item: u16, in_save: u32) {
+        self.pending.entry(item).or_insert((in_save, 0)).1 += 1;
+    }
+
+    /// The save read again: gains the save now has are dropped.
+    pub fn observe(&mut self, in_save: impl Fn(u16) -> u32) {
+        self.pending.retain(|&item, (base, _)| in_save(item) <= *base);
+    }
+
+    pub fn clear(&mut self) {
+        self.pending.clear();
+    }
+
+    pub fn extra(&self, item: u16) -> u32 {
+        self.pending.get(&item).map_or(0, |p| p.1)
+    }
+
+    /// (item, gained) for the ones not in the save yet.
+    pub fn items(&self) -> impl Iterator<Item = (u16, u32)> + '_ {
+        self.pending.iter().map(|(&i, &(_, n))| (i, n))
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn quest_pickups_count_until_the_save_has_them_without_counting_twice() {
+        let mut p = Provisional::default();
+        p.gain(0x10, 3);
+        p.gain(0x10, 3);
+        p.gain(0x20, 0);
+        assert_eq!((p.extra(0x10), p.extra(0x20), p.extra(0x30)), (2, 1, 0));
+        // the save unchanged (on a quest): still counted
+        p.observe(|i| if i == 0x10 { 3 } else { 0 });
+        assert_eq!(p.extra(0x10), 2);
+        // out of a quest the save gets the item at once: dropped, not counted twice
+        p.observe(|i| if i == 0x20 { 1 } else { 3 });
+        assert_eq!((p.extra(0x10), p.extra(0x20)), (2, 0));
+        p.clear();
+        assert_eq!(p.items().count(), 0);
+    }
+
     use super::*;
 
     #[test]
@@ -149,7 +199,7 @@ mod tests {
                 &name
             )
             .unwrap(),
-            "+ Spongy Hide → pouch"
+            "+ Spongy Hide -> pouch"
         );
         assert_eq!(describe(&Event::Money(-750), &name).unwrap(), "-750z");
         assert_eq!(describe(&Event::Money(1000), &name).unwrap(), "+1000z");

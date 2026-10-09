@@ -115,6 +115,8 @@ pub struct Overlay {
     /// When the live save is read (on hook events, see `events`), and the last events, for the feed.
     refresh: crate::events::Refresh,
     feed: std::collections::VecDeque<String>,
+    /// Gains the save does not have yet (a quest's pickups).
+    provisional: crate::events::Provisional,
 }
 
 /// How many events the feed shows.
@@ -167,6 +169,7 @@ impl Overlay {
             last_input: egui::RawInput::default(),
             refresh: crate::events::Refresh::new(),
             feed: Default::default(),
+            provisional: Default::default(),
         }
     }
 
@@ -282,6 +285,14 @@ impl Overlay {
                         _ => format!("item {id}"),
                     };
                     for e in &events {
+                        match *e {
+                            crate::events::Event::ItemGain { item, .. } => {
+                                let now = save.as_ref().map_or(0, |s| s.item_count(item));
+                                self.provisional.gain(item, now);
+                            }
+                            crate::events::Event::QuestEnd => self.provisional.clear(),
+                            _ => {}
+                        }
                         if let Some(line) = crate::events::describe(e, &name_of) {
                             if self.feed.len() == FEED {
                                 self.feed.pop_front();
@@ -297,6 +308,7 @@ impl Overlay {
                 let Some(bytes) = snap.bytes(at, live::LEN as usize) else { return };
                 match live::parse(bytes, at, Some(name)) {
                     Some(parsed) => {
+                        self.provisional.observe(|i| parsed.item_count(i));
                         *save = Some(Box::new(parsed));
                         self.check_craftable();
                     }
@@ -331,9 +343,10 @@ impl Overlay {
         let shared = self.data.clone();
         let guard = shared.lock().unwrap_or_else(|e| e.into_inner());
         let Some(Ok(data)) = guard.as_ref() else { return };
-        let statuses = self
-            .wishlist
-            .status(|p| data.making(p.kind, p.id).map(|m| m.materials), |i| save.item_count(i));
+        let statuses = self.wishlist.status(
+            |p| data.making(p.kind, p.id).map(|m| m.materials),
+            |i| save.item_count(i) + self.provisional.extra(i),
+        );
         let new = self.craftable.update(&statuses);
         let names: Vec<String> = new
             .iter()
@@ -493,7 +506,8 @@ impl Overlay {
                         None
                     }
                 };
-                let have = |item: u16| save.map_or(0, |s| s.item_count(item));
+                let provisional = &self.provisional;
+                let have = |item: u16| save.map_or(0, |s| s.item_count(item)) + provisional.extra(item);
                 ui.separator();
                 // the picker
                 ui.horizontal(|ui| {
@@ -527,6 +541,14 @@ impl Overlay {
                     }
                 });
                 ui.separator();
+                let quest: Vec<String> = self
+                    .provisional
+                    .items()
+                    .map(|(i, n)| format!("+{n} {}", data.item_name(i)))
+                    .collect();
+                if !quest.is_empty() {
+                    ui.label(format!("Counted, not in the save yet (+N this quest): {}", quest.join(", ")));
+                }
                 let statuses = self.wishlist.status(|p| data.making(p.kind, p.id).map(|m| m.materials), have);
                 if statuses.is_empty() {
                     ui.label("Nothing wished for yet: pick pieces above.");

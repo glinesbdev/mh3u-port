@@ -105,5 +105,12 @@ When the build has the hooks from `mods/hooks.txt` (`docs/hooks.md`), the overla
 - **When the save is read:** on the 3 frames after an event (a hook runs before the game writes), and every 2 s as a
   fallback. Without the hooks, it is read every frame, as before.
 - **The "craftable now" toast** comes from that read, so it appears within a few frames of the item gain.
-- **The Events window** shows the last 8 events (`+ Spongy Hide → pouch`, `-750z`, `crafted equipment`, `quest over`).
+- **The Events window** shows the last 8 events (`+ Spongy Hide -> pouch`, `-750z`, `crafted equipment`, `quest over`).
   The log says `[overlay] N hooks feed the overlay` when they are on.
+- **Quest pickups (PR #16 test):** during a quest, the game keeps pickups apart from the save and merges them into it at the
+  quest's end. So the save's counts don't move during a quest.
+  - Each `item_gain` therefore counts +1 for its item until the save's count of that item rises past what it was at the gain,
+    or until `quest_end`. Out of a quest, the save gets the item at once, so nothing is counted twice.
+  - The wishlist lists these as "Counted, not in the save yet (+N this quest)".
+  - It assumes 1 per gain (the count argument isn't known), and the quest pouch itself isn't read.
+- **Arrows:** the event text uses `->`, because egui's default font has no `→`.
