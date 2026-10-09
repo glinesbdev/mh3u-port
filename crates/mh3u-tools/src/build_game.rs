@@ -97,9 +97,13 @@ pub fn run(dir: &Path, flags: CFlags, watch: bool) -> Result<()> {
     if flags.lto {
         // the code is made at the link: it needs the optimisation flags again, and lld (which runs it on every core)
         link.arg("-fuse-ld=lld").args(&args);
-    } else if let Some(t) = args.iter().find(|a| a.starts_with("--target")) {
-        // a cross build links for the same target
-        link.arg(t);
+    } else {
+        if let Some(t) = args.iter().find(|a| a.starts_with("--target")) {
+            // a cross build links for the same target
+            link.arg(t);
+        }
+        // `MH3U_CFLAGS` reaches the link too (as documented above), so `-g -gcodeview -Wl,--pdb=` writes a PDB
+        link.args(&extra);
     }
     for s in &sources {
         link.arg(s.with_extension("o"));
