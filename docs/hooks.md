@@ -42,7 +42,6 @@ HR), not the code. Hooks need the functions that change that data. Find them by 
 Hooks work end to end. Five hooks (0x02000020, 0x02000084, 0x020000e4, 0x0200017c, 0x020001f0) were listed, translated, and
 installed (`[hooks] 5 hooks installed`). Each fired with sensible arguments. For example, `0x020000e4` was called over and over
 from one lr (`0x3122638`), with r3 stepping through `0x108001xx`–`0x108002xx`, which looks like a constructor walking a table.
-No change to speed was noticed.
 
 ## Plan
 
