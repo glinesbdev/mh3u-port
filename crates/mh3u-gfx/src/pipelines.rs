@@ -690,11 +690,15 @@ mod tests {
         p.asynchronous = true;
         let (vs, ps) = (shader(&d.device, VS, false), shader(&d.device, PS, true));
         assert!(p.get(&vs, &ps, &state()).is_none(), "handed to a worker");
-        assert!(p.get(&vs, &ps, &state()).is_none(), "not handed twice");
-        assert_eq!((p.counts.queued, p.counts.draws_waiting), (1, 2));
+        // the worker may already be done (the no-op device is quick): found then, but never handed to a worker twice
+        let early = p.get(&vs, &ps, &state()).is_some();
+        assert_eq!((p.counts.queued, p.counts.draws_waiting), (1, if early { 1 } else { 2 }));
         p.wait();
         assert!(p.get(&vs, &ps, &state()).is_some());
-        assert_eq!((p.counts.made_by_workers, p.counts.made_here, p.counts.found_made), (1, 0, 1));
+        assert_eq!(
+            (p.counts.made_by_workers, p.counts.made_here, p.counts.found_made),
+            (1, 0, if early { 2 } else { 1 })
+        );
         // without the workers, the draw waits for it
         let mut p = Pipelines::new(d.device.clone());
         p.asynchronous = false;

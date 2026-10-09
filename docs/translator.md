@@ -294,7 +294,7 @@ with their text and the cloth background, upright, in the right places (the hunt
   (`gilrs`, on a thread of their own), combined in one shared state. Keys are named by position: WASD is the left stick, the arrow keys the
   right stick, Enter A, Backspace B, X, C the X and Y buttons, I/J/K/L the D-pad, Q/E L and R, 1/3 ZL and ZR, P plus, O minus, Left
   and Right Shift the stick clicks. A pushed stick also
-  sets the stick's direction buttons (the menus read those). Gamepad face buttons go by label (the Xbox A is the GamePad's A); `MH3U_PAD_LAYOUT=position` puts them where the GamePad's are. The gamepad thread takes the pending events without waiting and sleeps 4 ms when there are none (it used to wait in
+  sets the stick's direction buttons (the menus read those). Gamepad face buttons: by default the button gilrs names East is the GamePad's A, South B, North X, West Y. With the user's Xbox pad on Windows, this makes the Xbox A the game's A; the earlier mapping (South A, East B, West X, North Y) had the Xbox A acting as the game's B. `MH3U_PAD_LAYOUT=nintendo` brings the earlier mapping back (`position`, the old setting, now means the default). The log says which layout is on (`gamepad buttons: …`), and the first press of each face button what it was taken as (`[gamepad] South is the GamePad's B`). The gamepad thread takes the pending events without waiting and sleeps 4 ms when there are none (it used to wait in
   gilrs's blocking call; a Windows profile seemed to put a whole core there, but the time was the baton's, see Threads above); `MH3U_GAMEPADS=0` turns gamepads off entirely (no thread,
   no backend), for comparing. The mouse is the touch panel (the picture is the TV's, so it only matters once
   the GamePad's screen is shown). `VPADGetTPCalibratedPoint` scales the raw touch values (0 to 4095) to 1280 x 720 (a guess). The Wii
@@ -417,4 +417,4 @@ from a given call site), `MH3U_PROFILE=<s>` (a sampling profile of the translate
 PowerPC (`mh3u_ppc::format`). More: `MH3U_TRACE_FROM=<s>` (trace only after that long), `MH3U_TRACE_DYNAMIC=1` (calls of functions found
 at run time, with arguments and return address), `MH3U_TRACE_PAD=1` (what `VPADRead` returns), `MH3U_TRACE_AX=1` (voice positions),
 `MH3U_PRESS_DUTY=<percent>` (how long of its period `MH3U_PRESS` holds), `MH3U_PRESS_SWEEP=<s>` and `MH3U_TOUCH_SWEEP=<s>` (press every
-button, or touch a grid of points, in turn from then on), `MH3U_PAD_LAYOUT=position` (gamepad face buttons by position instead of label).
+button, or touch a grid of points, in turn from then on), `MH3U_PAD_LAYOUT=nintendo` (gamepad face buttons with A and B, and X and Y, swapped back to the earlier mapping).

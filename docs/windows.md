@@ -88,7 +88,9 @@ $out   = "$env:LOCALAPPDATA\mh3u\c"       # anywhere outside the repository
 (`$env:MH3U_CC = 'C:\llvm-mingw\bin\clang.exe'`) and `MH3U_CFLAGS` adds flags to every compile and the link. Saves go to `$out\save`
 unless `--save-dir` says otherwise. `run` stops after `--max-imports` system calls (100,000 by default, for exploring), hence the big
 number to play. The variables of `translator.md` work the same in PowerShell: `$env:MH3U_GFX_LOG = '1'`, and
-`Remove-Item Env:MH3U_GFX_LOG` to turn one off again.
+`Remove-Item Env:MH3U_GFX_LOG` to turn one off again. An Xbox pad's A, B, X and Y are the game's A, B, X and Y; if they come out
+swapped, `$env:MH3U_PAD_LAYOUT = 'nintendo'` swaps A with B and X with Y (the log's `[gamepad] … is the GamePad's …` lines say what each
+face button was taken as).
 
 ## Comparing builds (frame rate)
 
