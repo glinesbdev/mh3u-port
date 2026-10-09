@@ -283,6 +283,7 @@ impl Gx2 {
                 }))
             }
             Err(e) => {
+                self.diag.untranslated(format!("geometry pipeline {gs:#x}"), &e);
                 self.caches_report(format!("geometry pipeline {gs:#x} not translated: {e}"));
                 None
             }

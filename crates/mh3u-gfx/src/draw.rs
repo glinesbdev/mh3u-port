@@ -154,6 +154,10 @@ pub(crate) struct PipelineKey {
     depth_func: u32,
     cull: u8,
     front_face: u32,
+    /// The stencil test when it is on (and the depth buffer has stencil): the faces' settings and the read and write masks.
+    stencil: Option<([u32; 4], [u32; 4], u32, u32)>,
+    /// The depth bias: constant, and the bits of the slope scale and the clamp.
+    bias: (i32, u32, u32),
 }
 
 /// A depth buffer the game draws with, and its views (made once): the whole of it for drawing, its depth for sampling.
@@ -564,6 +568,30 @@ fn blend_op(op: u32) -> wgpu::BlendOperation {
     }
 }
 
+fn stencil_op(f: u32) -> wgpu::StencilOperation {
+    use wgpu::StencilOperation as S;
+    match f {
+        1 => S::Zero,
+        2 => S::Replace,
+        3 => S::IncrementClamp,
+        4 => S::DecrementClamp,
+        5 => S::Invert,
+        6 => S::IncrementWrap,
+        7 => S::DecrementWrap,
+        _ => S::Keep,
+    }
+}
+
+/// One face's stencil settings: (comparison, fail, depth fail, pass).
+fn stencil_face(f: [u32; 4]) -> wgpu::StencilFaceState {
+    wgpu::StencilFaceState {
+        compare: compare(f[0]),
+        fail_op: stencil_op(f[1]),
+        depth_fail_op: stencil_op(f[2]),
+        pass_op: stencil_op(f[3]),
+    }
+}
+
 fn compare(f: u32) -> wgpu::CompareFunction {
     use wgpu::CompareFunction as C;
     match f {
@@ -604,6 +632,19 @@ impl Gx2 {
             label: Some(label),
             source: wgpu::ShaderSource::Wgsl(wgsl.into()),
         })
+    }
+
+    /// Keeps a shader's listing and WGSL (or why it was not translated) for the frame that is written out.
+    pub(crate) fn keep_shader_text(&mut self, name: String, code: &[u8], result: Result<&str, &str>) {
+        if !self.diag.keeps_shaders() {
+            return;
+        }
+        let listing = decode(code).map_or_else(|e| format!("not decoded: {e}"), |d| mh3u_latte::decode::listing(&d));
+        let tail = match result {
+            Ok(wgsl) => format!("--- WGSL ---\n{wgsl}"),
+            Err(e) => format!("--- NOT TRANSLATED ---\n{e}\n"),
+        };
+        self.diag.shader_texts.insert(name, format!("--- listing ---\n{listing}\n{tail}"));
     }
 
     pub(crate) fn caches_report(&mut self, text: String) {
@@ -677,6 +718,11 @@ impl Gx2 {
                 &ctx,
             )
         })();
+        self.keep_shader_text(
+            format!("vs-{vs:08x}"),
+            &code,
+            result.as_ref().map(|t| t.wgsl.as_str()).map_err(String::as_str),
+        );
         let compiled = match result {
             Ok(t) => {
                 let module = self.compile("vertex shader", &t.wgsl);
@@ -686,6 +732,7 @@ impl Gx2 {
                 }))
             }
             Err(e) => {
+                self.diag.untranslated(format!("vertex shader {vs:#x}"), &e);
                 self.report(format!("vertex shader {vs:#x} not translated: {e}"));
                 None
             }
@@ -764,6 +811,11 @@ impl Gx2 {
             ctx.alpha_test = (alpha.0 != 7).then_some((alpha.0, f32::from_bits(alpha.1)));
             translate_pixel(&decoded, &inputs, &ctx)
         })();
+        self.keep_shader_text(
+            format!("ps-{ps:08x}"),
+            &code,
+            result.as_ref().map(|t| t.wgsl.as_str()).map_err(String::as_str),
+        );
         let compiled = match result {
             Ok(mut t) => {
                 if std::env::var_os("MH3U_GFX_SOLID").is_some() {
@@ -779,6 +831,7 @@ impl Gx2 {
                 }))
             }
             Err(e) => {
+                self.diag.untranslated(format!("pixel shader {ps:#x}"), &e);
                 self.report(format!("pixel shader {ps:#x} not translated: {e}"));
                 None
             }
@@ -872,6 +925,7 @@ impl Gx2 {
             lap.mark("texture decode (in texture views)");
             match decoded {
                 Ok(d) => {
+                    self.diag.decoded(&h, d.laid_pitch, d.format.block_dimensions().0);
                     if let Some(dir) = texdump {
                         let name = format!(
                             "tex-{:08x}-{}x{}-f{:x}-m{}.decoded",
@@ -936,6 +990,7 @@ impl Gx2 {
                     Some(())
                 }
                 Err(e) => {
+                    self.diag.decode_failed(&h, &e);
                     self.report(format!(
                         "texture {t:#x} (format {:#x}, {}x{}, tile mode {}) not read: {e}",
                         h.format, h.width, h.height, h.tile_mode
@@ -1588,6 +1643,14 @@ impl Gx2 {
             if t != 0 {
                 variant.kinds[unit] = tex_kind(g.u32(t), g.u32(t + 0x14));
                 variant.selects[unit] = g.u32(t + 0x84) & 0x0707_0707;
+                if self.diag.report {
+                    self.diag.texture(g, t);
+                }
+            }
+        }
+        if self.diag.report {
+            for a in fetch.iter() {
+                self.diag.attribute(a.format, a.endian);
             }
         }
         let (alpha_on, alpha_func, alpha_ref) = st.alpha_test;
@@ -1603,6 +1666,7 @@ impl Gx2 {
             match geo {
                 Some(x) => Some(x),
                 None => {
+                    self.diag.skipped_for(format!("geometry pipeline {:#x}", st.geometry_shader));
                     *self.caches.skipped.entry("geometry pipeline not drawn").or_default() += 1;
                     return;
                 }
@@ -1614,6 +1678,7 @@ impl Gx2 {
             Some(x) => x.copy.clone(),
             None => {
                 let Some(vs) = self.vertex_shader(g, st.vertex_shader, &fetch, st.half_z) else {
+                    self.diag.skipped_for(format!("vertex shader {:#x}", st.vertex_shader));
                     *self.caches.skipped.entry("vertex shader not translated").or_default() += 1;
                     return;
                 };
@@ -1622,6 +1687,7 @@ impl Gx2 {
         };
         let semantics_at = geo.as_ref().map_or(st.vertex_shader + 0x10, |x| x.semantics_at);
         let Some(ps) = self.pixel_shader(g, st.pixel_shader, semantics_at, &variant) else {
+            self.diag.skipped_for(format!("pixel shader {:#x}", st.pixel_shader));
             *self.caches.skipped.entry("pixel shader not translated").or_default() += 1;
             return;
         };
@@ -1665,7 +1731,36 @@ impl Gx2 {
         } else {
             None
         };
-        let use_depth = depth.filter(|_| st.depth_test || st.depth_write);
+        // culling both faces leaves no triangle (lines and points are not culled)
+        if st.cull_front
+            && st.cull_back
+            && matches!(
+                topology,
+                wgpu::PrimitiveTopology::TriangleList | wgpu::PrimitiveTopology::TriangleStrip
+            )
+        {
+            *self.caches.skipped.entry("both faces culled").or_default() += 1;
+            return;
+        }
+        let has_stencil = |d: &(u32, wgpu::TextureFormat)| d.1 == wgpu::TextureFormat::Depth24PlusStencil8;
+        let use_depth = depth.filter(|d| st.depth_test || st.depth_write || st.stencil_test && has_stencil(d));
+        let masks = st.stencil.masks.unwrap_or([0xff, 0xff, 0, 0xff, 0xff, 0]);
+        let stencil = use_depth.filter(|d| st.stencil_test && has_stencil(d)).map(|_| {
+            let back = if st.stencil.back_enabled {
+                st.stencil.back
+            } else {
+                st.stencil.front
+            };
+            (st.stencil.front, back, masks[0], masks[1])
+        });
+        // one depth bias for both faces: the front's when front faces are offset, else the back's
+        let [front_offset, front_scale, back_offset, back_scale, bias_clamp] = st.polygon_offset;
+        let bias = match (st.offset_front, st.offset_back) {
+            (true, _) => (front_offset.round() as i32, front_scale.to_bits(), bias_clamp.to_bits()),
+            (false, true) => (back_offset.round() as i32, back_scale.to_bits(), bias_clamp.to_bits()),
+            _ => (0, 0, 0),
+        };
+        let bias = if use_depth.is_some() { bias } else { (0, 0, 0) };
         let strip = matches!(
             topology,
             wgpu::PrimitiveTopology::TriangleStrip | wgpu::PrimitiveTopology::LineStrip
@@ -1684,6 +1779,8 @@ impl Gx2 {
             depth_func: st.depth_func,
             cull: st.cull_front as u8 * 2 + st.cull_back as u8,
             front_face: st.front_face,
+            stencil,
+            bias,
         };
         let entry = match self.caches.pipelines.get(&key) {
             Some(e) => e.clone(),
@@ -1762,8 +1859,17 @@ impl Gx2 {
                         } else {
                             wgpu::CompareFunction::Always
                         }),
-                        stencil: Default::default(),
-                        bias: Default::default(),
+                        stencil: stencil.map_or_else(Default::default, |(front, back, read, write)| wgpu::StencilState {
+                            front: stencil_face(front),
+                            back: stencil_face(back),
+                            read_mask: read,
+                            write_mask: write,
+                        }),
+                        bias: wgpu::DepthBiasState {
+                            constant: bias.0,
+                            slope_scale: f32::from_bits(bias.1),
+                            clamp: f32::from_bits(bias.2),
+                        },
                     }),
                     multisample: wgpu::MultisampleState::default(),
                     multiview_mask: None,
@@ -1993,7 +2099,13 @@ impl Gx2 {
             self.batch.key = Some(key);
         }
         let Some(pass) = self.batch.pass.as_mut() else { return };
-        let [vx, vy, vw, vh, ..] = st.viewport;
+        let [vx, vy, vw, vh, near, far] = st.viewport;
+        // the depth range, when the target API can have it (0 to 1, near not past far)
+        let (near, far) = if (0.0..=1.0).contains(&near) && (0.0..=1.0).contains(&far) && near <= far && far > 0.0 {
+            (near, far)
+        } else {
+            (0.0, 1.0)
+        };
         if vw > 0.0 && vh > 0.0 {
             let x = vx.clamp(0.0, target_w as f32);
             let y = vy.clamp(0.0, target_h as f32);
@@ -2002,11 +2114,11 @@ impl Gx2 {
                 y,
                 vw.min(target_w as f32 - x).max(1.0),
                 vh.min(target_h as f32 - y).max(1.0),
-                0.0,
-                1.0,
+                near,
+                far,
             );
         } else {
-            pass.set_viewport(0.0, 0.0, target_w as f32, target_h as f32, 0.0, 1.0);
+            pass.set_viewport(0.0, 0.0, target_w as f32, target_h as f32, near, far);
         }
         let [sx, sy, sw, sh] = st.scissor;
         if sw > 0 && sh > 0 && sx < target_w && sy < target_h {
@@ -2015,6 +2127,9 @@ impl Gx2 {
             pass.set_scissor_rect(0, 0, target_w, target_h);
         }
         pass.set_pipeline(&entry.pipeline);
+        if stencil.is_some() {
+            pass.set_stencil_reference(masks[2]);
+        }
         pass.set_bind_group(0, &group0, &[]);
         pass.set_bind_group(1, &group1, &[]);
         pass.set_bind_group(2, &group2, &[]);

@@ -270,10 +270,39 @@ with their text and the cloth background, upright, in the right places (the hunt
   Remote and Pro Controller functions (`KPAD*`, `WPAD*`) are not answered: no controller of those kinds exists for the game.
   `MH3U_PRESS` still works and is added to the real input.
 
-**Not done yet:** 3D textures, the component selectors of a texture (`compMap`), the rest of the sampler state (borders, the mip bias), alpha
-test and stencil, depth bias, other geometry inputs (lines, triangles, instances), loops and relative
-addressing in vertex shaders, rects and other primitive types, stream out, and the second render target (the GamePad's picture is
-drawn but not shown). (Speed is in "Speed" above: draws are batched and their buffers come from arenas.)
+- **Rendering correctness** (the 3D models and the areas were wrong while the 2D pictures were right; checked offline, not yet against
+  the game's picture):
+  - *Tiling* now matches AMD's address library for this chip (R7xx: no dual pitch, no doubled macro-tile bytes, thick tiles in the
+    displayable order with the slice bits 6 and 7): `mh3u-formats/src/tiling_vectors.txt` holds every 15th of 9,828 cases made by the
+    library itself (`tools/addrlib_vectors.cpp`); all 9,828 match (pitch, height, size, base alignment and a hash of every address).
+    The 2D-tiled textures with a pitch that is not a power of two, and all thick ones, were laid out wrong before.
+  - *Vertex attributes* are read by their type and the GX2 flags: the scaled formats (integer to float) were raw integers or halves,
+    signed 10_10_10_2 was read unsigned, and the default swap was applied to every size; now bits are swapped per unit (none for 8-bit
+    types, 16-bit units for 16-bit ones, 32-bit for the rest) and sign-extended, a missing component reads 0 and the fourth 1.
+  - *Texels* are little-endian (GX2's format table asks for no swap; Cemu reads them that way): the 16-bit packed formats had their
+    bytes swapped. Volumes are 3D textures; depth formats include 0x1c.
+  - *Shaders*: loops (`LOOP_START`, `_DX10`, `_NO_AL`, `LOOP_END`, `LOOP_BREAK`, `LOOP_CONTINUE`, and the ALU clauses that break,
+    continue or end with `ELSE`), the address register (`MOVA`, `MOVA_FLOOR`, `MOVA_INT`) and the loop index for relatively addressed
+    registers, uniform blocks and constants; counted loops read the shader's `GX2LoopVar`s; a loop with no count stops after 4,096
+    trips. The one vertex shader the village could not translate (`0x169ac000`: `LOOP_START_DX10`, `ALU_BREAK`, `LOOP_END`) is in this
+    set. A program that indexes its registers has them as an array.
+  - *State*: the texture's component selectors (`compSel`, applied to what a lookup returns, as Cemu's image views do), the alpha test
+    (a discard in the pixel shader), the stencil test (`GX2SetDepthStencilControl`'s 13 arguments and `GX2SetStencilMask`; one read and
+    write mask for both faces), depth bias (`GX2SetPolygonOffset` and the enables of `GX2SetPolygonControl`; one bias for both faces),
+    the viewport's depth range, and a draw that culls both faces draws nothing.
+  - **Diagnostics**: `MH3U_GFX_REPORT=1` prints a `[gfx report]` block every report window: draws and skipped draws by reason, the
+    shaders not translated and why (with the draws skipped for each), the texture formats / tile modes / kinds read (binds, images,
+    largest size, levels, selectors, and `APPROXIMATE` or `NOT DECODED`), textures that failed to decode and header pitches that differ
+    from the computed one, the vertex attribute formats with their swap mode, and once the `gx2` imports that do nothing here.
+    `MH3U_GFX_DUMP_FRAME=<n>[,<n>...]` writes frame `n` (counting swaps) to `MH3U_GFX_DUMP_DIR` (`mh3u-frames` by default) as
+    `frame-<n>/`: `draws.txt` (every draw's shaders, state, attributes, textures and whether it was drawn or why not),
+    `shaders/vs-*.txt` and `ps-*.txt` (listing and WGSL, or why not translated), `textures/*.png` and `tv.png`.
+
+**Not done yet:** the rest of the sampler state (borders, the mip bias), separate stencil masks and depth bias for back faces, other
+geometry inputs (lines, triangles, instances), rects and other primitive types, stream out, a viewport larger than its target (it is
+clamped, which squeezes the picture), the `*Reg` forms of the state calls (`GX2SetDepthStencilControlReg`...; the report lists which
+the game imports), and the second render target (the GamePad's picture is drawn but not shown). (Speed is in "Speed" above: draws are
+batched and their buffers come from arenas.)
 
 Looking at what it draws: `MH3U_GFX_SAVE=<folder>` writes the TV picture as a PPM every `MH3U_GFX_SAVE_EVERY` swaps (120 by default),
 `MH3U_GFX_SAVE_IMAGE=<hex image address>` saves a given colour buffer instead; `MH3U_GFX_SOLID=1` makes every pixel red (to see
@@ -298,8 +327,11 @@ derivative_uniformity)`). **All 579 different pixel programs become WGSL that na
 OpenGL face convention (its exact output is not checked against a cube-map picture yet). Whether a translated
 shader computes what the hardware does is not checked by anything but looking at the picture: the semantics are from the documents,
 so an operation the translator does not know is an error, never a guess.
-Vertex shaders are translated with the fetch shader replaced by decoded attribute streams (vertex pulling); loops and relative
-addressing in them are not done. The geometry pipeline's three programs are translated by `translate_es`, `translate_gs` and
+Vertex shaders are translated with the fetch shader replaced by decoded attribute streams (vertex pulling). Loops become WGSL `loop`s
+with the exec-mask stack pushed at the start and popped at the end: a lane that is off at the top of the loop leaves it, a breaking
+clause sends the lanes it turned off out of the loop, a continuing one sends them to the next trip (live again), and `LOOP_BREAK` /
+`LOOP_CONTINUE` do that to the lanes that are on. Relatively addressed operands add `ar.<c>` (set by `MOVA*` after its group) or
+`al` (the loop index of `LOOP_START`), clamped to the register file, the 4,096-entry bank or the 256 constants. The geometry pipeline's three programs are translated by `translate_es`, `translate_gs` and
 `translate_vertex` with a ring configuration (the hardware's ring writes are dwords at an absolute offset; the item sizes come from
 the vertex shader's `ringItemsize` and the geometry shader's `sq_gs_vert_itemsize`).
 

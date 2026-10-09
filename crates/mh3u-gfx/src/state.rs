@@ -30,6 +30,20 @@ pub struct UniformBlock {
     pub size: u32,
 }
 
+/// The stencil test (`GX2SetDepthStencilControl`, `GX2SetStencilMask`): for front and back faces the comparison and what is done
+/// when the stencil test fails, the depth test fails and both pass (`GX2CompareFunction`, `GX2StencilFunction`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub struct Stencil {
+    /// Whether back faces have their own settings (else they use the front's).
+    pub back_enabled: bool,
+    /// (comparison, fail, depth fail, pass).
+    pub front: [u32; 4],
+    pub back: [u32; 4],
+    /// The masks and references (front read, write, reference; back read, write, reference); `None` until the game sets them (then
+    /// everything is read and written, and the reference is 0).
+    pub masks: Option<[u32; 6]>,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct State {
     pub vertex_shader: u32,
@@ -58,6 +72,12 @@ pub struct State {
     pub cull_back: bool,
     pub front_face: u32,
     pub alpha_test: (bool, u32, f32),
+    pub stencil: Stencil,
+    /// `GX2SetPolygonOffset`: front offset and scale, back offset and scale, clamp; and whether front and back faces are offset
+    /// (`GX2SetPolygonControl`).
+    pub polygon_offset: [f32; 5],
+    pub offset_front: bool,
+    pub offset_back: bool,
     /// Whether clip-space depth is 0 to 1 (set by `GX2SetRasterizerClipControlEx`).
     /// The index that ends a strip (set by `GX2SetPrimitiveRestartIndex`).
     pub restart_index: Option<u32>,

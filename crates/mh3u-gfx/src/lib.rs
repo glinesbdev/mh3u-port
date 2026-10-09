@@ -5,6 +5,7 @@ mod draw;
 mod draw_bench;
 mod geometry;
 mod gx2;
+mod report;
 mod shader_cache;
 mod state;
 mod texture;

@@ -145,6 +145,23 @@ small, plain and finite, and the programs can all be translated once, before the
 blend state), to show the rest of the graphics layer is reachable. A capture from Cemu through RenderDoc shows Vulkan calls, not GX2, and
 it contains the game's textures, so it stays on the owner's machine and out of the repository. It is needed after 3a and 3b, not before.
 
+**3e. Why the 3D was wrong (checked offline, October 2026).** The 2D pictures were right and the models and areas were not, so the
+paths only 3D uses were checked against references, each with tests in the repository:
+
+- *Tiling* against AMD's address library itself (built from its MIT sources on this machine, configured as the console's R7xx: family
+  0x51, `gbAddrConfig` 0x44902): 1,256 of 9,828 cases differed before (macro-tiled pitches that are not a power of two, every thick
+  mode, base alignments); none now. Bad untiling of exactly the 2D-tiled textures fits "UI right, models noisy".
+- *Vertex attributes* against GX2's attribute format list and Cemu's fetch code: the scaled formats were read as raw integers (a
+  position or weight of 3 read as a denormal), signed 10_10_10_2 unsigned, and 8-bit types were swapped as if 32-bit. That fits the
+  long streaks.
+- *Texel byte order* against GX2's format table (no swap for any texture format) and Cemu's decoders: 16-bit packed texels were
+  read byte-swapped.
+- *What is not known yet:* whether the remaining wrong pictures come from these, from a shader whose semantics are guessed (the
+  translator errs rather than guesses, but the order of a group's writes, `CUBE`'s output and the rounding of `MOVA` are from the
+  documents only), from state the game sets through `*Reg` calls this backend does not take, or from a texture format read
+  approximately. `MH3U_GFX_REPORT` and `MH3U_GFX_DUMP_FRAME` (see `docs/translator.md`) are there to tell those apart on the owner's
+  machine.
+
 ## 4. Does the generated code compile in a reasonable time? (done: as C yes, as one Rust crate no)
 
 `mh3u-tools codegen-bench <dump> <out> --lang rust|c --functions N` translates an even sample of the game's functions (found as the

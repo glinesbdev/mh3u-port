@@ -63,6 +63,8 @@ calls! {
     SetCullOnlyControl = "gx2:GX2SetCullOnlyControl",
     SetPolygonControl = "gx2:GX2SetPolygonControl",
     SetAlphaTest = "gx2:GX2SetAlphaTest",
+    SetStencilMask = "gx2:GX2SetStencilMask",
+    SetPolygonOffset = "gx2:GX2SetPolygonOffset",
     SetRasterizerClipControlEx = "gx2:GX2SetRasterizerClipControlEx",
     SetShaderModeEx = "gx2:GX2SetShaderModeEx",
     CalcFetchShaderSizeEx = "gx2:GX2CalcFetchShaderSizeEx",
@@ -132,6 +134,8 @@ pub struct Gx2 {
     pub(crate) fetch_shaders: HashMap<u32, std::sync::Arc<[crate::draw::AttribStream]>>,
     /// With MH3U_FPS set: when the frame rate was last printed, and the swap count then.
     fps: Option<(Instant, u32)>,
+    /// MH3U_GFX_REPORT and MH3U_GFX_DUMP_FRAME.
+    pub(crate) diag: crate::report::Diagnostics,
 }
 
 /// The texture format of a `GX2SurfaceFormat` of a colour buffer.
@@ -270,6 +274,7 @@ impl Gx2 {
                 .unwrap_or(120),
             fetch_shaders: HashMap::new(),
             fps: std::env::var_os("MH3U_FPS").map(|_| (Instant::now(), 0)),
+            diag: crate::report::Diagnostics::from_env(),
         }
     }
 
@@ -434,6 +439,17 @@ impl Gx2 {
     /// Writes the TV picture as a PPM file (for looking at what the game drew without the window): MH3U_GFX_SAVE=<folder> saves one
     /// every 120 swaps.
     fn save_tv(&self, folder: &std::path::Path) {
+        let Some((w, h, rgba)) = self.read_tv() else { return };
+        let mut ppm = format!("P6\n{w} {h}\n255\n").into_bytes();
+        for px in rgba.as_chunks::<4>().0 {
+            ppm.extend_from_slice(&px[..3]);
+        }
+        let _ = std::fs::create_dir_all(folder);
+        let _ = std::fs::write(folder.join(format!("tv-{:06}.ppm", self.swaps)), ppm);
+    }
+
+    /// The TV picture (or the colour buffer MH3U_GFX_SAVE_IMAGE names) as 8-bit RGBA, read back from the GPU.
+    fn read_tv(&self) -> Option<(u32, u32, Vec<u8>)> {
         // MH3U_GFX_SAVE_IMAGE=<hex address of a colour buffer's image> saves that buffer instead of the TV picture
         let wanted = std::env::var("MH3U_GFX_SAVE_IMAGE")
             .ok()
@@ -442,9 +458,9 @@ impl Gx2 {
             Some(image) => self.targets.get(&image).map(|t| &t.texture),
             None => self.tv.as_ref(),
         };
-        let Some(tv) = tv else { return };
+        let tv = tv?;
         if tv.format() != wgpu::TextureFormat::Rgba8Unorm {
-            return;
+            return None;
         }
         let (w, h) = (tv.width(), tv.height());
         let row = (w * 4).div_ceil(256) * 256;
@@ -475,16 +491,13 @@ impl Gx2 {
         let slice = buffer.slice(..);
         slice.map_async(wgpu::MapMode::Read, |_| {});
         let _ = self.d.device.poll(wgpu::PollType::wait_indefinitely());
-        let Ok(data) = slice.get_mapped_range() else { return };
-        let mut ppm = format!("P6\n{w} {h}\n255\n").into_bytes();
+        let data = slice.get_mapped_range().ok()?;
+        let mut rgba = Vec::with_capacity((w * h * 4) as usize);
         for y in 0..h {
-            for x in 0..w {
-                let at = (y * row + x * 4) as usize;
-                ppm.extend_from_slice(&data[at..at + 3]);
-            }
+            let at = (y * row) as usize;
+            rgba.extend_from_slice(&data[at..at + (w * 4) as usize]);
         }
-        let _ = std::fs::create_dir_all(folder);
-        let _ = std::fs::write(folder.join(format!("tv-{:06}.ppm", self.swaps)), ppm);
+        Some((w, h, rgba))
     }
 
     /// Shows the TV picture, scaled to the window with the picture's proportions kept.
@@ -779,8 +792,19 @@ impl Gx2 {
             }
             Call::SetDepthStencilControl => {
                 let (t, w, f, s) = (a(0) != 0, a(1) != 0, a(2), a(3) != 0);
+                // front: comparison, pass, depth fail, fail; then the same for back faces (the arguments' order)
+                let (back_enabled, front, back) = (a(4) != 0, [a(5), a(8), a(7), a(6)], [a(9), a(12), a(11), a(10)]);
                 let st = self.state();
                 (st.depth_test, st.depth_write, st.depth_func, st.stencil_test) = (t, w, f, s);
+                (st.stencil.back_enabled, st.stencil.front, st.stencil.back) = (back_enabled, front, back);
+            }
+            Call::SetStencilMask => {
+                let masks = std::array::from_fn(|k| a(k) & 0xff);
+                self.state().stencil.masks = Some(masks);
+            }
+            Call::SetPolygonOffset => {
+                let offset = std::array::from_fn(|k| farg(c, k));
+                self.state().polygon_offset = offset;
             }
             Call::SetCullOnlyControl => {
                 let (face, front, back) = (a(0), a(1) != 0, a(2) != 0);
@@ -789,8 +813,10 @@ impl Gx2 {
             }
             Call::SetPolygonControl => {
                 let (face, front, back) = (a(0), a(1) != 0, a(2) != 0);
+                let (offset_front, offset_back) = (a(6) != 0, a(7) != 0);
                 let st = self.state();
                 (st.front_face, st.cull_front, st.cull_back) = (face, front, back);
+                (st.offset_front, st.offset_back) = (offset_front, offset_back);
             }
             Call::SetAlphaTest => {
                 let (e, f, r) = (a(0) != 0, a(1), farg(c, 0));
@@ -874,6 +900,13 @@ impl Gx2 {
                 self.swaps += 1;
                 mh3u_rt::FRAMES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 self.prune();
+                self.diag.maybe_print(&self.caches.skipped);
+                if self.diag.swapped(self.swaps) {
+                    // the frame written out is on the TV now
+                    if let (Some((w, h, rgba)), Some(dir)) = (self.read_tv(), self.diag.finished_dir.take()) {
+                        let _ = std::fs::write(dir.join("tv.png"), crate::report::png(w, h, &rgba));
+                    }
+                }
                 if let Some((since, at)) = self.fps {
                     // the frame rate, swaps per second, every five seconds (for comparing builds)
                     let secs = since.elapsed().as_secs_f64();
@@ -964,7 +997,47 @@ impl Gx2 {
 
     fn draw(&mut self, g: &Guest, primitive: u32, count: u32, indexed: Option<(u32, u32)>, offset: u32, instances: u32) {
         self.draws += 1;
-        self.draw_call(g, primitive, count, indexed, offset, instances);
+        if !self.diag.per_draw() {
+            self.draw_call(g, primitive, count, indexed, offset, instances);
+        } else {
+            self.diag.draw();
+            let before: u64 = self.caches.skipped.values().sum();
+            let skipped_before = self.diag.dumping.then(|| self.caches.skipped.clone());
+            self.draw_call(g, primitive, count, indexed, offset, instances);
+            if let Some(then) = skipped_before {
+                let outcome = if self.caches.skipped.values().sum::<u64>() == before {
+                    "drawn".to_string()
+                } else {
+                    let why = self
+                        .caches
+                        .skipped
+                        .iter()
+                        .find(|(k, v)| then.get(*k).copied().unwrap_or(0) != **v)
+                        .map_or("skipped", |(k, _)| *k);
+                    format!("SKIPPED ({why})")
+                };
+                let st = self.contexts.entry(self.current).or_default().clone();
+                let shaders = [
+                    (
+                        format!("vs-{:08x}", st.vertex_shader),
+                        self.diag.shader_texts.get(&format!("vs-{:08x}", st.vertex_shader)).cloned(),
+                    ),
+                    (
+                        format!("ps-{:08x}", st.pixel_shader),
+                        self.diag.shader_texts.get(&format!("ps-{:08x}", st.pixel_shader)).cloned(),
+                    ),
+                ];
+                let fetch = self.fetch_shaders.get(&st.fetch_shader).cloned();
+                self.diag.dump_draw(
+                    g,
+                    &st,
+                    (primitive, count, indexed, offset, instances),
+                    &outcome,
+                    shaders,
+                    fetch.as_deref().unwrap_or(&[]),
+                );
+            }
+        }
         {
             let (vs, ps) = {
                 let st = self.contexts.entry(self.current).or_default();
@@ -1037,7 +1110,11 @@ impl Gx2 {
 
 impl Gx2Backend for Gx2 {
     fn implements(&self, name: &str) -> bool {
-        Call::from_name(name).is_some()
+        let known = Call::from_name(name).is_some();
+        if !known && name.starts_with("gx2:") {
+            self.diag.stub(name.trim_start_matches("gx2:"));
+        }
+        known
     }
 
     fn resolve(&self, name: &str) -> Option<u32> {
@@ -1134,7 +1211,7 @@ mod tests {
             assert!(seen.insert(call.name()), "duplicate name {}", call.name());
             assert_eq!(Call::from_name(call.name()), Some(call));
         }
-        assert_eq!(Call::ALL.len(), 50);
+        assert_eq!(Call::ALL.len(), 52);
         assert_eq!(Call::from_name("gx2:GX2Nothing"), None);
         assert_eq!(Call::from_name("coreinit:GX2DrawEx"), None);
     }
