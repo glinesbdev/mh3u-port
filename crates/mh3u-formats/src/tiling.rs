@@ -131,23 +131,20 @@ fn pixel_index(x: u64, y: u64, z: u64, bits: u32, mode: TileMode, depth: bool) -
     let (y0, y1, y2) = (bit(y, 0), bit(y, 1), bit(y, 2));
     let (z0, z1, z2) = (bit(z, 0), bit(z, 1), bit(z, 2));
     let thickness = mode.thickness();
-    let (b0, b1, b2, b3, b4, b5, b6, b7);
-    if thickness > 1 && mode.is_thick_macro() || mode == TileMode::OneDThick {
-        (b0, b1, b2, b3, b4, b5, b6, b7) = (x0, y0, z0, x1, y1, z1, x2, y2);
+    // The library has a third order for "thick" tiling, but the console's surfaces are always displayable (colour) or
+    // non-displayable (depth) ones, thick or not: a thick tile keeps the 2D order and adds the slice bits on top.
+    let (b0, b1, b2, b3, b4, b5) = if depth {
+        (x0, y0, x1, y1, x2, y2)
     } else {
-        (b0, b1, b2, b3, b4, b5) = if depth {
-            (x0, y0, x1, y1, x2, y2)
-        } else {
-            match bits {
-                8 => (x0, x1, x2, y1, y0, y2),
-                16 => (x0, x1, x2, y0, y1, y2),
-                64 => (x0, y0, x1, x2, y1, y2),
-                128 => (y0, x0, x1, x2, y1, y2),
-                _ => (x0, x1, y0, x2, y1, y2),
-            }
-        };
-        (b6, b7) = if thickness > 1 { (z0, z1) } else { (0, 0) };
-    }
+        match bits {
+            8 => (x0, x1, x2, y1, y0, y2),
+            16 => (x0, x1, x2, y0, y1, y2),
+            64 => (x0, y0, x1, x2, y1, y2),
+            128 => (y0, x0, x1, x2, y1, y2),
+            _ => (x0, x1, y0, x2, y1, y2),
+        }
+    };
+    let (b6, b7) = if thickness > 1 { (z0, z1) } else { (0, 0) };
     let b8 = if thickness == 8 { z2 } else { 0 };
     b0 | b1 << 1 | b2 << 2 | b3 << 3 | b4 << 4 | b5 << 5 | b6 << 6 | b7 << 7 | b8 << 8
 }
@@ -480,8 +477,8 @@ fn adjust_pitch(display: bool, pitch_align: &mut u32) {
     }
 }
 
-/// (base alignment, pitch alignment, height alignment, macro tile width, macro tile height)
-fn macro_alignments(m: TileMode, bpp: u32, samples: u32, c: &Config) -> (u32, u32, u32, u32, u32) {
+/// (base alignment, pitch alignment, height alignment)
+fn macro_alignments(m: TileMode, bpp: u32, samples: u32, c: &Config) -> (u32, u32, u32) {
     let aspect = m.aspect() as u32;
     let thickness = m.thickness() as u32;
     let bpp = if matches!(bpp, 96 | 48 | 24) { bpp / 3 } else { bpp };
@@ -490,10 +487,9 @@ fn macro_alignments(m: TileMode, bpp: u32, samples: u32, c: &Config) -> (u32, u3
     let macro_h = aspect * 8 * c.pipes;
     let pitch_align = macro_w.max(macro_w * (c.pipe_interleave_bytes / bpp / (8 * thickness) / samples));
     let height_align = macro_h;
-    let mut macro_bytes = samples * (bpp * macro_h * macro_w).div_ceil(8);
-    if samples == 1 {
-        macro_bytes *= 2;
-    }
+    // (the R6xx parts double this for single-sampled surfaces and want the base on an even number of macro tiles; the console's
+    // chip is an R7xx, which does neither)
+    let macro_bytes = samples * (bpp * macro_h * macro_w).div_ceil(8);
     let mut base = if thickness == 1 {
         macro_bytes.max((samples * height_align * bpp * pitch_align).div_ceil(8))
     } else {
@@ -506,14 +502,7 @@ fn macro_alignments(m: TileMode, bpp: u32, samples: u32, c: &Config) -> (u32, u3
         1
     };
     base /= per_micro;
-    // this chip family wants the base on an even number of macro tiles
-    if m as u32 > TileMode::OneDThick as u32 {
-        let macro_bytes = (bpp * macro_h * macro_w).div_ceil(8);
-        if base / macro_bytes % 2 == 1 {
-            base += macro_bytes;
-        }
-    }
-    (base, pitch_align, height_align, macro_w, macro_h)
+    (base, pitch_align, height_align)
 }
 
 fn size_of(height: u32, pitch: u32, slices: u32, bits: u32, samples: u32) -> u64 {
@@ -592,25 +581,17 @@ pub fn surface_info(r: &Request) -> Info {
                 mode = TwoDThin1;
             }
             if mode != base_mode && mip && base_mode.is_thick_macro() && !mode.is_thick_macro() {
-                let (_, pa, ha, _, _) = macro_alignments(base_mode, bpp, samples, c);
+                let (_, pa, ha) = macro_alignments(base_mode, bpp, samples, c);
                 let factor = ((c.pipe_interleave_bytes >> 3) / bpp).max(1);
                 if pitch < pa * factor || hgt < ha {
                     return micro(r, OneDThin1, pad_dims, pitch, hgt, slices);
                 }
             }
             let thickness = mode.thickness() as u32;
-            let (base_align, mut pitch_align, height_align, macro_w, macro_h) = macro_alignments(mode, bpp, samples, c);
+            let (base_align, mut pitch_align, height_align) = macro_alignments(mode, bpp, samples, c);
             let swapped = bank_swapped_width(mode, bpp, u64::from(samples), u64::from(pitch), c) as u32;
             pitch_align = pitch_align.max(swapped);
-            let dual_pitch = !r.depth && r.level == 0 && !mode.is_thick_macro();
-            if dual_pitch {
-                let per_group = (((c.pipe_interleave_bytes >> 3) / bpp / samples).max(1) / thickness).max(1);
-                let even_w = ((pitch - 1) / macro_w) & 1;
-                let even_h = ((hgt - 1) / macro_h) & 1;
-                if samples == 1 && per_group == 1 && even_w == 0 && (pitch > macro_w || (even_h == 0 && hgt > macro_h)) {
-                    pitch += macro_w;
-                }
-            }
+            // (no dual pitch alignment: the library does that for R6xx parts only)
             pad(
                 mode,
                 pad_dims,
@@ -785,5 +766,110 @@ mod tests {
             (i.pitch, i.height, i.size),
             (16u32.max(i.pitch_align), 16, u64::from(i.pitch) * 16 * 8)
         );
+    }
+}
+
+/// Checks against vectors computed with AMD's address library (see `tiling_vectors.txt` for how they were made).
+#[cfg(test)]
+mod reference {
+    use super::*;
+
+    /// FNV-1a over the little-endian bytes of every address, in slice, row, column order.
+    fn hash(addresses: impl Iterator<Item = u64>) -> u64 {
+        let mut h = 0xcbf2_9ce4_8422_2325u64;
+        for a in addresses {
+            for b in a.to_le_bytes() {
+                h ^= u64::from(b);
+                h = h.wrapping_mul(0x0100_0000_01b3);
+            }
+        }
+        h
+    }
+
+    /// Compares every line of a vector file; returns the lines that differ.
+    pub(super) fn mismatches(text: &str) -> Vec<String> {
+        let mut bad = Vec::new();
+        for line in text.lines().filter(|l| !l.starts_with('#') && !l.trim().is_empty()) {
+            let f: Vec<&str> = line.split_whitespace().collect();
+            let n = |i: usize| f[i].parse::<u64>().unwrap();
+            let (mode, bits, format) = (
+                n(0) as u32,
+                n(1) as u32,
+                u32::from_str_radix(f[2].trim_start_matches("0x"), 16).unwrap(),
+            );
+            let (w, h, slices, cube, level, base256) = (n(3) as u32, n(4) as u32, n(5) as u32, n(6) == 1, n(7) as u32, n(8) as u32);
+            let want = (
+                n(9) as u32,
+                n(10) as u32,
+                n(11) as u32,
+                n(13),
+                n(14) as u32,
+                u64::from_str_radix(f[15], 16).unwrap(),
+            );
+            let compressed = format >= 0x31;
+            let info = surface_info(&Request {
+                mode: TileMode::from_number(mode).unwrap(),
+                bits_per_element: bits,
+                compressed,
+                width: w,
+                height: h,
+                slices,
+                samples: 1,
+                level,
+                cube,
+                depth: false,
+                display: false,
+            });
+            let (pipe_swizzle, bank_swizzle) = swizzles(base256 << 8);
+            let s = Surface {
+                mode: info.mode,
+                bits_per_element: bits,
+                pitch: info.pitch,
+                height: info.height,
+                samples: 1,
+                depth: false,
+                pipe_swizzle,
+                bank_swizzle,
+            };
+            let (ew, eh) = if compressed { (w.div_ceil(4), h.div_ceil(4)) } else { (w, h) };
+            let addresses = (0..slices.min(4))
+                .flat_map(|z| (0..eh).flat_map(move |y| (0..ew).map(move |x| (x, y, z))))
+                .map(|(x, y, z)| address(&s, x, y, z, 0));
+            let got = (
+                info.mode as u32,
+                info.pitch,
+                info.height,
+                info.size,
+                info.base_align,
+                hash(addresses),
+            );
+            if got != want {
+                bad.push(format!(
+                    "{line}\n    got mode {} pitch {} height {} size {} align {} hash {:016x}",
+                    got.0, got.1, got.2, got.3, got.4, got.5
+                ));
+            }
+        }
+        bad
+    }
+
+    #[test]
+    fn layouts_and_addresses_match_the_address_library() {
+        let bad = mismatches(include_str!("tiling_vectors.txt"));
+        assert!(bad.is_empty(), "{} differ:\n{}", bad.len(), bad.join("\n"));
+    }
+
+    /// The full set, when a file is given (`MH3U_TILING_VECTORS`).
+    #[test]
+    fn layouts_match_an_extra_vector_file() {
+        if let Ok(path) = std::env::var("MH3U_TILING_VECTORS") {
+            let bad = mismatches(&std::fs::read_to_string(path).unwrap());
+            assert!(
+                bad.is_empty(),
+                "{} differ:\n{}",
+                bad.len(),
+                bad.iter().take(100000).cloned().collect::<Vec<_>>().join("\n")
+            );
+        }
     }
 }
