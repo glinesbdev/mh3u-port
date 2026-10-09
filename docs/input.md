@@ -60,6 +60,18 @@ Shift L3 and R3, and the arrows the right stick. The file replaces it.
     the mouse stops. 0 means no smoothing.
   - No dead zone is added (the game has its own). `invert_y` makes moving the mouse up push the stick down.
 
+### Tested (after PR #12)
+
+The user's run: the keyboard config works well, and remapping the bindings and the camera settings in `bindings.json` worked
+perfectly. It is a little awkward to play only because MH3U's controls are made for a controller: the attacks are face buttons,
+the camera has no free look, and the item bar and map are on the touch screen.
+
+Possible later, with translation-time hooks (`roadmap.md`): mouse-friendly features the GamePad can't express, such as
+- free mouse-look written straight into the camera's angles, instead of going through the right stick;
+- scrolling the item bar with the mouse wheel;
+- touch-screen actions on keys;
+- target lock on a mouse button.
+
 ## Gamepads
 
 Read with gilrs on a thread of their own. `MH3U_PAD_LAYOUT=nintendo` swaps A with B and X with Y, and `MH3U_GAMEPADS=0` turns them

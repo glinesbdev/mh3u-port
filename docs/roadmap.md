@@ -4,8 +4,10 @@ What comes after the current work. Order: graphics and performance, then audio (
 
 ## Keyboard and mouse (PR #12)
 
-WASD and mouse-look onto the virtual GamePad, a bindings file, and a grabbed cursor (`input.md`). Later: a rebinding screen in the
-overlay, and the touch screen's buttons (the item bar, the map) on keys.
+WASD and mouse-look onto the virtual GamePad, a bindings file, and a grabbed cursor (`input.md`). Merged and tested: the bindings and camera
+settings remap correctly. It is a bit awkward only because the game is built for a controller. Later, with translation-time hooks:
+- mouse-friendly features (direct mouse-look on the camera, the wheel for the item bar, touch-screen actions on keys);
+- a rebinding screen in the overlay.
 
 ## After audio: mod hooks and an overlay
 
