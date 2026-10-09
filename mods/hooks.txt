@@ -1,4 +1,5 @@
-# Translation-time hooks (docs/hooks.md): one `ADDRESS name` a line (hex, the `0x` is optional),
+# Translation-time hooks (docs/hooks.md): one `ADDRESS name` a line (hex, the `0x` is optional;
+# `in:ADDRESS name` hooks the function containing that address),
 # the entry of a guest function. The translated functions are named f_XXXXXXXX in the build's .h/.c files (f_02000020 is 0x02000020).
 # Re-run `mh3u-tools translate` (scripts/win-build.ps1) after editing; MH3U_HOOK_LOG=1 logs every call of each hook.
 # No real addresses yet (step 5 of the plan finds them). To try the mechanism, list any function the translator found, e.g. one
@@ -10,5 +11,11 @@
 0x02199438 item_gain          # rare (20 calls): pickup, box->pouch; r5 = item id (0xb4 on a pickup), r4 = &save
 0x0219ae84 pouch_remove_slot  # 1 call, putting a pouch item back in the box; r4 = r5 = the pouch
 0x02198d40 equip_records      # writes the records at +0x50..+0xbf after crafting armour; r5 = record kind (0x10..0x19)
+# The functions that call money_add at these return addresses (in: = the function containing the address; the translator prints
+# which f_ it is):
+in:0x022087d4 craft_jewel      # the jewel craft fee (-200)
+in:0x0220715c craft_armour     # the armour craft fee (-300)
+in:0x021e3724 quest_accept     # the quest fee (-310)
+in:0x02172ca4 quest_abandon    # the refund on abandoning (+310)
 # Rejected (thousands of calls a minute, queries, not actions): 0x0219acec (pouch item lookup, r4 = item id),
 # 0x02199408 (box item lookup, r4 = item id), 0x02198770 (field getter, r5 = 7/8), 0x0216afd4 (per-frame, another object).

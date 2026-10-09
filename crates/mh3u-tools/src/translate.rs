@@ -25,7 +25,7 @@ pub struct Input<'a> {
     pub imports: &'a [String],
     pub targets: &'a BTreeMap<u32, u32>,
     /// The hooks list (`docs/hooks.md`): functions that call `rt_hook` on entry.
-    pub hooks: &'a BTreeMap<u32, String>,
+    pub hooks: &'a mh3u_recomp::HookList,
 }
 
 pub fn run(input: &Input, out: &Path, per_file: usize) -> Result<Report> {
@@ -62,11 +62,12 @@ pub fn run(input: &Input, out: &Path, per_file: usize) -> Result<Report> {
     names.push_str("};\n");
     std::fs::write(out.join("imports.h"), names)?;
     // the runtime reads the hooks' names from the build
+    let (hooks, notes) = mh3u_recomp::resolve_hooks(hooks, &functions);
+    for n in notes {
+        println!("[hooks] {n}");
+    }
     let list: String = hooks.iter().map(|(a, n)| format!("{a:#010x} {n}\n")).collect();
     std::fs::write(out.join("hooks.txt"), list)?;
-    if let Some(a) = hooks.keys().find(|a| !functions.contains(a)) {
-        eprintln!("[hooks] {a:#x} is not the start of a function the translator found; it is not hooked");
-    }
     let end = base + 4 * words.len() as u32;
     let mut bytes = header.len();
     let mut files = 0;

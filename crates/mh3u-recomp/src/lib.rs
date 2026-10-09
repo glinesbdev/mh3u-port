@@ -997,10 +997,16 @@ pub fn emit_function_with(start: u32, words: &[u32], functions: &BTreeSet<u32>, 
     emit_function_hooked(start, words, functions, imports, false)
 }
 
-/// The hooks list (`mods/hooks.txt`, see `docs/hooks.md`): one `0xADDRESS name` a line, `#` starting a comment. Gives address ->
-/// name, or the first bad line.
-pub fn parse_hooks(text: &str) -> Result<BTreeMap<u32, String>, String> {
-    let mut out = BTreeMap::new();
+/// The hooks list (`mods/hooks.txt`, see `docs/hooks.md`): one `ADDRESS name` a line (hex, `0x` optional; the entry of a
+/// function), or `in:ADDRESS name` (the function containing that address, found by the translator); `#` starts a comment.
+#[derive(Debug, Default, Clone, PartialEq)]
+pub struct HookList {
+    pub at: BTreeMap<u32, String>,
+    pub inside: Vec<(u32, String)>,
+}
+
+pub fn parse_hook_list(text: &str) -> Result<HookList, String> {
+    let mut out = HookList::default();
     for (n, line) in text.lines().enumerate() {
         let line = line.split('#').next().unwrap_or("").trim();
         if line.is_empty() {
@@ -1008,18 +1014,68 @@ pub fn parse_hooks(text: &str) -> Result<BTreeMap<u32, String>, String> {
         }
         let mut it = line.split_whitespace();
         let (Some(a), Some(name), None) = (it.next(), it.next(), it.next()) else {
-            return Err(format!("line {}: want `0xADDRESS name`, got {line:?}", n + 1));
+            return Err(format!(
+                "line {}: want `0xADDRESS name` or `in:0xADDRESS name`, got {line:?}",
+                n + 1
+            ));
+        };
+        let (inside, a) = match a.strip_prefix("in:") {
+            Some(rest) => (true, rest),
+            None => (false, a),
         };
         let address = u32::from_str_radix(a.trim_start_matches("0x").trim_start_matches("0X"), 16)
             .map_err(|_| format!("line {}: {a:?} is not a hex address", n + 1))?;
         if address % 4 != 0 {
             return Err(format!("line {}: {a} is not word-aligned", n + 1));
         }
-        if out.insert(address, name.to_string()).is_some() {
+        if inside {
+            out.inside.push((address, name.to_string()));
+        } else if out.at.insert(address, name.to_string()).is_some() {
             return Err(format!("line {}: {a} is listed twice", n + 1));
         }
     }
     Ok(out)
+}
+
+/// A plain hooks list (function entries only; what the translator writes into the build).
+pub fn parse_hooks(text: &str) -> Result<BTreeMap<u32, String>, String> {
+    let l = parse_hook_list(text)?;
+    if let Some((a, _)) = l.inside.first() {
+        return Err(format!("in:{a:#x} needs the translator to find its function"));
+    }
+    Ok(l.at)
+}
+
+/// The function entries to hook: `at` as listed, and each `inside` address's function (the nearest function start at or below
+/// it). Two names on one function are joined with `+`. Also gives a note for each `in:` resolved, and for each address that is
+/// not a function's start (not hooked).
+pub fn resolve_hooks(list: &HookList, functions: &BTreeSet<u32>) -> (BTreeMap<u32, String>, Vec<String>) {
+    let mut out = BTreeMap::new();
+    let mut notes = Vec::new();
+    for (&a, n) in &list.at {
+        if functions.contains(&a) {
+            out.insert(a, n.clone());
+        } else {
+            notes.push(format!(
+                "{a:#x} ({n}) is not the start of a function the translator found; it is not hooked"
+            ));
+        }
+    }
+    for (a, n) in &list.inside {
+        match functions.range(..=*a).next_back() {
+            Some(&f) => {
+                notes.push(format!("in:{a:#x} {n} is in f_{f:08x} (+{:#x})", a - f));
+                out.entry(f)
+                    .and_modify(|e: &mut String| {
+                        e.push('+');
+                        e.push_str(n);
+                    })
+                    .or_insert_with(|| n.clone());
+            }
+            None => notes.push(format!("in:{a:#x} ({n}) is before every function; it is not hooked")),
+        }
+    }
+    (out, notes)
 }
 
 /// As `emit_function_with`; with `hooked`, the function calls `rt_hook(c, start)` on entry, before its registers are loaded into
@@ -1170,6 +1226,22 @@ mod tests {
         let at = hooked.find(&format!("rt_hook(c, {});", hex(0x0200_1000))).expect("hooked");
         assert!(at > hooked.find("ENTER(").unwrap() && at < hooked.find("FILL();").unwrap());
         assert!(!emit_function_with(0x0200_1000, &words, &f, &BTreeMap::new()).contains("rt_hook"));
+    }
+
+    #[test]
+    fn in_hooks_resolve_to_the_containing_function() {
+        let l = parse_hook_list("2001000 entry\nin:0x02002010 quest_accept\nin:02002020 quest_abandon\nin:0x01000000 early\n").unwrap();
+        assert_eq!(l.inside.len(), 3);
+        assert!(parse_hooks("in:0x02002010 x").is_err(), "the build's list is resolved");
+        let f: BTreeSet<u32> = [0x0200_1000, 0x0200_2000, 0x0200_3000].into();
+        let (hooks, notes) = resolve_hooks(&l, &f);
+        assert_eq!(hooks[&0x0200_1000], "entry");
+        assert_eq!(hooks[&0x0200_2000], "quest_accept+quest_abandon");
+        assert_eq!(hooks.len(), 2);
+        assert!(notes.iter().any(|n| n.contains("f_02002000 (+0x10)")));
+        assert!(notes.iter().any(|n| n.contains("early") && n.contains("not hooked")));
+        let (_, notes) = resolve_hooks(&parse_hook_list("0x02001004 mid").unwrap(), &f);
+        assert!(notes[0].contains("not the start"));
     }
 
     #[test]

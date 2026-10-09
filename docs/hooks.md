@@ -5,7 +5,9 @@ Mods so far only read memory (`overlay.md`). Hooks let a mod run native code whe
 
 ## Design
 
-- **The list:** `mods/hooks.txt` in the repo, one hook per line (`0x02123456 name`; the address is hex and the `0x` is optional; `#` starts a comment). The translated
+- **The list:** `mods/hooks.txt` in the repo, one hook per line (`0x02123456 name`; the address is hex and the `0x` is optional; `#` starts a comment). `in:0xADDR name` hooks the function *containing*
+  that address: the translator takes the nearest function start at or below it, and prints `[hooks] in:0x… name is in f_…
+  (+0x…)`. The translated
   functions are named `f_XXXXXXXX` in the build's `game.h` and `part_*.c` (`f_02123456` is `0x02123456`), which is where to
   look for addresses. It holds addresses
   and names only, nothing from the game. `mh3u-tools translate` reads it and copies it to the build (`<c dir>/hooks.txt`), so the
@@ -141,6 +143,16 @@ Still missing, with the cheapest next step for each:
   live watch again on that pouch slot.
 - **Menu open:** no data field is known. `MH3U_PROFILE` with the menu open versus closed would show the menu's functions.
 
+### Craft and quest hooks (PR #15)
+
+The `money_add` call sites from run 31 are hooked through the functions that contain them (`in:` entries): `craft_jewel` (lr
+`0x22087d4`), `craft_armour` (`0x220715c`), `quest_accept` (`0x21e3724`) and `quest_abandon` (`0x2172ca4`). The translator
+prints which `f_` each one is.
+- **Shared functions:** if two land in one function, its name is `a+b`. Such a function, or one that also fires on other
+  frames, is shared code, not the action; then hook one level up (the lr of its log line).
+- **Not hooked yet:** weapon craft or upgrade, and the quest reward. They are likely other callers of `money_add`. Its
+  `[hook] money_add ... lr 0x…` lines give their call sites, which become new `in:` entries.
+
 ## Plan
 
 1. Write this doc. **(done)**
@@ -155,6 +167,6 @@ Still missing, with the cheapest next step for each:
 
 See the bottom of this file. It is updated with each commit of PR #13.
 
-- Status: step 5 is done for money and item gain (run 31). Four hooks are kept, four are rejected (PR #14, ready for review).
-- Next: craft and quest hooks through the callers of `money_add` (the lrs above); then step 6 (exit hooks), or step 7 (a hook
-  that drives the overlay: refresh the wishlist on `item_gain` and `money_add`).
+- Status: PR #15 adds `in:` entries and the craft and quest hooks (craft_jewel, craft_armour, quest_accept, quest_abandon).
+  None is confirmed yet.
+- Next: the confirm run (steps in the PR). It also gives the `money_add` lrs of a weapon craft and a quest reward.
