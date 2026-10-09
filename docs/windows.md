@@ -113,6 +113,17 @@ $env:MH3U_TIMES_WINDOW = '10'
 & $tools run $games $out --window --max-imports 1000000000000
 ```
 
+**Sampling profilers and the Rust side.** A `-gnullvm` build's PDB (`-C link-arg=-Wl,--pdb=`) holds only the public symbols
+(about 12 thousand): the Rust code's own functions are local symbols, which lld does not put in it, so Visual Studio's profiler
+gives each sample to the public symbol before it in memory, whatever function it really is in (`--icf=none` does not change that).
+In such a build of `perf/draw-overhead`, `Gx2::texture_view` was followed by `cached_streams`, `decode_texture` and
+`uniform_buffer` (its 14.5 KB were the four of them), `Gx2::new` by all of the graphics dispatch (`run`, `exec`, `draw`,
+`geometry_pass`, `bind_group`, the arenas, `flush_draws`: 57 KB), and `__rust_no_alloc_shim_is_unstable_v2` (a one-byte static of
+the allocator) by drop glue, two closures of `draw_call`, and `copy_surface`. The local symbols are in the executable's own symbol
+table, so a sample's address can be named with `llvm-nm -n --demangle mh3u-tools.exe` (addresses in the PDB are
+`0001:offset`, from `.text` at 0x140001000). A profiler that reads DWARF from a Windows executable would name them directly in a build
+with `-C debuginfo=line-tables-only`. The `MH3U_GFX_TIMES` timers are the numbers to go by.
+
 `--lto` needs clang with lld, which llvm-mingw and MSYS2's CLANG64 both are. To compare with the code before a change of the
 translator, translate with each version of the tools into its own folder (the C differs, not only the flags).
 

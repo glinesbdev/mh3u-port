@@ -211,9 +211,19 @@ with their text and the cloth background, upright, in the right places (the hunt
     rest of that frame (the console's GPU reads programs through its own cache too). Geometry pipelines are found the same way (their
     key also has half z and the ring sizes, which the translation uses).
   - *Uploads*: what a batch's draws read (uniform blocks, indices, geometry parameters) is written into a copy of the arena in memory
-    and uploaded with one write per arena when the batch is flushed; a uniform block whose contents were already uploaded in the batch
-    reuses those bytes (compared, not only hashed). The vertex streams' start table lives with the cached streams, and the geometry
-    draws use the stream cache too.
+    and uploaded with one write per arena when the batch is flushed. The vertex streams' start table lives with the cached streams,
+    and the geometry draws use the stream cache too.
+  - *Uniform blocks*: each upload of the batch keeps the guest bytes it was made from, by (address, vec4 count, bytes read); a draw
+    that finds the same bytes there (compared in place: no copy, no hash, no word swapping) reads that upload. Only new contents are
+    swapped and written. A bank the shader reads by index (`VFETCH` on resource 128 + n) is declared 4096 vec4 (64 KiB) and must be
+    bound whole, with zeros past the block; such blocks go to 64 KiB slots of their own that are kept zero past what was written, so
+    only the block's own bytes are copied and uploaded. Before, every use read, swapped, hashed and compared all 64 KiB, and every
+    new upload zeroed and uploaded 64 KiB: that was most of the 2.2 ms per frame of "uniforms and groups 0, 1" in the village.
+  - *Vertex streams and indices*: the vertex bytes of a draw are hashed where they are, with XXH3, not copied out and hashed a byte
+    at a time. A draw's index list (made relative to its lowest vertex, fans and quads made into triangles) is kept by the draw and an
+    XXH3 hash of its index bytes, which are also compared: the first time it goes into the arena, the second time it gets a buffer of
+    its own that later frames use as it is, so a mesh drawn every frame builds and uploads its list once. Lists not drawn again
+    within two frames are forgotten.
   - *Textures*: a texture already made is found by the five header words of its key in one look-up. `GX2Invalidate` over its memory
     no longer throws it away: it is marked, and at its next use the header words and the bytes of its image and smaller levels are
     hashed and compared with what it was decoded from; it is decoded again only if they differ (a hash pass instead of untiling every
@@ -228,8 +238,14 @@ with their text and the cloth background, upright, in the right places (the hunt
   The reports: `MH3U_GFX_TIMES=1` gives each line as a total, a count, and both per frame (`[gfx times]` per graphics call, `[draw
   times]` per part of a draw, where "geometry pass" counts only the draws with a geometry shader), and `[draw counts]`: hits, checks
   and misses of the shader caches, bind groups and uniform uploads, texture decodes (and bytes), textures invalidated and
-  invalidations of textures found unchanged, and the display list calls replayed and left out. "texture decode (in texture views)"
-  and "texture upload and hash (in texture views)" are timed inside "texture views", not added to it.
+  invalidations of textures found unchanged, and the display list calls replayed and left out; "uniform bytes uploaded" and
+  "uniform blocks read by index" (the 64 KiB banks), "index list hits" and "misses", and "vertex bytes hashed". "texture decode (in
+  texture views)" and "texture upload and hash (in texture views)" are timed inside "texture views", not added to it. "index list"
+  covers the whole index path (found or made, and uploaded), and "decode streams" only the vertex streams (the indices used to be
+  made relative to the lowest vertex inside it).
+  `cargo test -p mh3u-gfx --release draw_bench -- --nocapture` times the same parts on wgpu's no-op device with a synthetic frame shaped
+  like the village's (190 draws, half of them with a bank read by index), and the playback of a display list of state calls; the
+  graphics tests run on that device too (no window, nothing drawn, everything validated).
   `MH3U_TIMES_WINDOW=<seconds>` sets how long each report covers (10 by default); the per-frame numbers are the ones to compare
   between builds and scenes.
 - **Textures** (`texture.rs`): a `GX2Texture` is read from the guest, untiled texel by texel (`tiling::address`) and uploaded in the
