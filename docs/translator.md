@@ -264,16 +264,23 @@ with their text and the cloth background, upright, in the right places (the hunt
     at a time. A draw's index list (made relative to its lowest vertex, fans and quads made into triangles) is kept by the draw and an
     XXH3 hash of its index bytes, which are also compared: the first time it goes into the arena, the second time it gets a buffer of
     its own that later frames use as it is, so a mesh drawn every frame builds and uploads its list once. Lists not drawn again
-    within two frames are forgotten. Decoded vertex streams follow the same rule: one not drawn with in a later frame than the one
-    it was made in (vertex data the game rewrites every frame) goes at the next prune, and any stream goes after 120 frames unused.
-    Each stream is two GPU buffers, and wgpu's per-pass and per-submit bookkeeping grows with the most buffers ever alive (run 12:
-    31,000 streams kept, the replay three times slower at the same draws; see `docs/performance.md`, open concern 3).
+    within two frames are forgotten. Decoded vertex streams follow the same rule:
+    - A new stream goes into the batch's arena. Its bytes are kept with it, and it is written into the arena again for a later
+      batch of the same frame.
+    - Drawn with in a later frame, it gets two GPU buffers of its own: the streams, and where each starts.
+    - A stream not drawn with in a later frame than the one it was made in (vertex data the game rewrites every frame) goes two
+      frames later, never having had buffers. Any stream goes after 120 frames unused. Both are checked every frame.
+
+    wgpu's per-pass and per-submit bookkeeping grows with the most buffers ever alive (run 12: 31,000 streams kept, the replay
+    three times slower at the same draws; see `docs/performance.md`, open concern 3). Making and destroying buffers for streams
+    used once cost 26 ms frames every 60 frames (run 18, concern 7).
   - *Textures*: a texture already made is found by the five header words of its key in one look-up. `GX2Invalidate` over its memory
     no longer throws it away: it is marked, and at its next use the header words and the bytes of its image and smaller levels are
     hashed and compared with what it was decoded from; it is decoded again only if they differ (a hash pass instead of untiling every
     texel). A marked texture not drawn for a second is forgotten, as an invalidated one was before.
-  - *Bind groups*: cached by layout and the resources bound (`wgpu` handles compare by identity), pruned of what a second of frames did
-    not use; pipelines keep their bind group layouts; texture, target and depth views are made once with their textures; samplers are
+  - *Bind groups*: cached by layout and the resources bound (`wgpu` handles compare by identity). Every frame, the ones a second of
+    frames did not use go, so they are destroyed a few at a time, not a second's worth at once. A bind group with vertex streams
+    still in the batch's arena is not kept; pipelines keep their bind group layouts; texture, target and depth views are made once with their textures; samplers are
     keyed by the three `GX2Sampler` words, and the default and compare samplers are made once. A bind group with a per-draw snapshot
     of the target is not kept.
   - *System calls*: the report's counters are arrays indexed by import number, `MH3U_TRACE_FROM` is read once, and the timing report
@@ -289,6 +296,27 @@ with their text and the cloth background, upright, in the right places (the hunt
   later it prints how those frames went: the slowest (with its time in graphics calls), the mean, how many took over 50 ms, the
   pipelines, and the same shader and texture counts. `[gfx caches]` also shows the translations on disk and how many were found or
   not.
+
+  **`[gfx slow frame]`.** With `MH3U_GFX_TIMES=1`, a frame of 25 ms or more (`MH3U_GFX_SLOW_MS`) prints `[gfx slow frame] frame N:
+  <ms> (<ms> in graphics calls); steps: ...; counts: ...`.
+  - Its steps are that frame's twelve longest draw steps and graphics calls, each with its time and count. Steps nest, so they do
+    not add up.
+  - The non-draw calls (copies, clears, `GX2Invalidate`, ...) are timed one by one for this, with the same two clock readings that
+    give the frame's time in graphics calls and the runtime's `[gfx times]`.
+  - A frame ends inside the swap, after presenting and after the caches let go of what they no longer use. That much of the swap
+    counts in the frame it ends: `gx2:GX2SwapScanBuffers` and `caches aged out (at the swap)`.
+  - Its counts are that frame's `[draw counts]`.
+
+  `[draw times]` also has:
+  - `stream miss: buffers and upload`: putting a new vertex stream in the arena, or giving one drawn again buffers of its own;
+  - `bind group made (in groups)`;
+  - `arena uploads`: the batch's arena writes;
+  - `command encoding (finish)`: wgpu 30 checks a batch's passes, tracks their resources and makes the Vulkan or D3D12 commands
+    only when the command buffer is finished, so this is most of what the draws cost on the CPU outside this code.
+
+  `[draw counts]` adds `vertex stream bytes made`, `vertex streams given buffers`, `vertex streams aged out`, `bind groups aged
+  out`, `arena uploads` and `arena bytes uploaded`. `MH3U_GFX_TIMES=calls` leaves out the draw steps and counts (about 25 clock
+  readings a draw). It keeps the calls' and frames' times, for timing with as little added as possible.
 
   The reports: `MH3U_GFX_TIMES=1` gives each line as a total, a count, and both per frame (`[gfx times]` per graphics call, `[draw
   times]` per part of a draw, where "geometry pass" counts only the draws with a geometry shader), and `[draw counts]`: hits, checks

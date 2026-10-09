@@ -103,7 +103,8 @@ impl Gx2 {
         let (es_pipeline, gs_pipeline) = (&entry.es_pipeline, &entry.gs_pipeline);
         let total = first + count;
         // the vertex streams, as for any vertex shader (and from the same cache: decoded and uploaded again only when they change)
-        let (va, meta_buffer) = self.cached_streams(g, st, fetch, 0, total.min(1 << 22), 1);
+        let streams = self.cached_streams(g, st, fetch, 0, total.min(1 << 22), 1);
+        let (va, meta_buffer) = (streams.data, streams.meta);
         let ring_in = self.arena_alloc(Role::RingIn, u64::from(total) * u64::from(es_vec4) * 16);
         // what the geometry shader does not write must read as zero (an empty triangle)
         let ring_out = self.arena_alloc(Role::Out, u64::from(count) * u64::from(max_vertices) * u64::from(gs_vec4) * 16);
@@ -135,7 +136,7 @@ impl Gx2 {
                 (2, ring_in.bound()),
                 (5, es_params.bound()),
             ],
-            true,
+            streams.kept,
         );
         let gs_g0 = self.bind_group(&entry.gs_layouts[0], gs_consts, true);
         let gs_g1 = self.bind_group(
