@@ -33,11 +33,13 @@ const MAIN: &str = r#"
 #define IN_BASE 0x10002000u
 #define SCRATCH_AT 0x200
 #define SCRATCH_LEN 256
-void rt_syscall(Ctx *c) { (void)c; }
+/* the hooks look at the registers and change them, as the runtime's do: the tests of calls check that the translated code wrote its
+   registers back before a hook and read them again after it (no other test reaches a hook) */
+void rt_syscall(Ctx *c) { c->r[27] = c->r[3]; c->r[3] ^= 0xffffu; }
 void rt_trap(Ctx *c, uint32_t w) { (void)c; (void)w; }
 void rt_unsupported(Ctx *c, uint32_t w) { (void)c; (void)w; }
-void rt_call(Ctx *c, uint32_t t) { (void)c; (void)t; }
-void rt_jump(Ctx *c, uint32_t t) { (void)c; (void)t; }
+void rt_call(Ctx *c, uint32_t t) { c->r[29] = c->r[3]; c->r[3] += 0x100; c->r[4] = t; }
+void rt_jump(Ctx *c, uint32_t t) { c->r[28] = c->r[3]; c->r[4] = t; }
 typedef void (*Fn)(Ctx *);
 extern Fn table[];
 static uint32_t be32(const uint8_t *p) { return (uint32_t)p[0] << 24 | p[1] << 16 | p[2] << 8 | p[3]; }
@@ -76,20 +78,27 @@ int main(int argc, char **argv) {
 
 /// Compile the translation of each `programs[i]` (a list of words at the test address) into a program with a table of them.
 fn build_program(programs: &[Vec<u32>], tag: &str) -> Result<std::path::PathBuf, String> {
-    let cc = compiler().ok_or("no C compiler")?;
-    let dir = std::env::temp_dir().join(format!("mh3u-c-diff-{}-{tag}", std::process::id()));
-    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-    std::fs::write(dir.join("ppc.h"), RUNTIME_H).map_err(|e| e.to_string())?;
     let start = test_address();
     let none = BTreeSet::new();
-    let mut src = String::from("#include \"ppc.h\"\n");
+    let mut src = String::new();
     for (i, words) in programs.iter().enumerate() {
         let c = emit_function(start, words, &none).replace(&function_name(start), &format!("t_{i}"));
         src.push_str(&c);
     }
+    let names: Vec<String> = (0..programs.len()).map(|i| format!("t_{i}")).collect();
+    compile(&src, &names, tag)
+}
+
+/// Compile translated functions (`src`) into a program whose table holds the functions `entries`.
+fn compile(src: &str, entries: &[String], tag: &str) -> Result<std::path::PathBuf, String> {
+    let cc = compiler().ok_or("no C compiler")?;
+    let dir = std::env::temp_dir().join(format!("mh3u-c-diff-{}-{tag}", std::process::id()));
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    std::fs::write(dir.join("ppc.h"), RUNTIME_H).map_err(|e| e.to_string())?;
+    let mut src = format!("#include \"ppc.h\"\n{src}");
     src.push_str("typedef void (*Fn)(Ctx *);\nFn table[] = {");
-    for i in 0..programs.len() {
-        src.push_str(&format!("t_{i},"));
+    for name in entries {
+        src.push_str(&format!("{name},"));
     }
     src.push_str("};\n");
     std::fs::write(dir.join("gen.c"), src).map_err(|e| e.to_string())?;
@@ -381,4 +390,130 @@ fn the_translated_reservation_pair_matches_the_interpreter() {
     }
     let _ = std::fs::remove_dir_all(exe.parent().unwrap());
     assert!(failures.is_empty(), "{} failures:\n{}", failures.len(), failures.join("\n"));
+}
+
+/// Calls, jumps out and system calls: the translated code keeps registers in locals, so it must write them back before a hook (which
+/// reads them, in the stubs above, into r27 to r29) and read them again after it (the stubs change r3 and r4). Checked against what
+/// the hooks do, not against the interpreter (for which a call is a jump).
+#[test]
+fn the_registers_are_written_back_and_read_again_around_hooks() {
+    if compiler().is_none() {
+        return;
+    }
+    let at = test_address();
+    let programs: Vec<Vec<u32>> = vec![
+        vec![0x3863_0001, 0x4800_1001, 0x3863_0001], // addi r3, r3, 1; bl +0x1000 (not a function: rt_call); addi r3, r3, 1
+        vec![0x3863_0001, 0x4800_1000],              // addi r3, r3, 1; b +0x1000 (rt_jump)
+        vec![0x3863_0001, 0x4400_0002, 0x3863_0001], // addi r3, r3, 1; sc (rt_syscall); addi r3, r3, 1
+    ];
+    let exe = build_program(&programs, "hooks").expect("the translated C builds");
+    let mut rng = Rng(0x600d_f00d_0bad_beef);
+    let mut states = Vec::new();
+    for _ in 0..CASES {
+        let mut st = St::default();
+        for r in 0..30 {
+            st.gpr[r] = rng.word();
+        }
+        st.lr = 0x4;
+        states.push(st);
+    }
+    let mut failures = Vec::new();
+    for (i, _) in programs.iter().enumerate() {
+        let out = run_program(&exe, i, &states).expect("the program ran");
+        for (st, got) in states.iter().zip(&out) {
+            let r3 = st.gpr[3];
+            let mut want = st.clone();
+            match i {
+                0 => {
+                    want.gpr[29] = r3.wrapping_add(1);
+                    want.gpr[3] = r3.wrapping_add(0x102);
+                    want.gpr[4] = at + 4 + 0x1000;
+                    want.lr = at + 8;
+                }
+                1 => {
+                    want.gpr[28] = r3.wrapping_add(1);
+                    want.gpr[3] = r3.wrapping_add(1);
+                    want.gpr[4] = at + 4 + 0x1000;
+                }
+                _ => {
+                    want.gpr[27] = r3.wrapping_add(1);
+                    want.gpr[3] = (r3.wrapping_add(1) ^ 0xffff).wrapping_add(1);
+                }
+            }
+            if got.gpr[..30] != want.gpr[..30] || got.lr != want.lr {
+                failures.push(format!(
+                    "program {i}: got {:08x?} lr {:#x}, want {:08x?} lr {:#x}",
+                    &got.gpr[..30],
+                    got.lr,
+                    &want.gpr[..30],
+                    want.lr
+                ));
+                break;
+            }
+        }
+    }
+    let _ = std::fs::remove_dir_all(exe.parent().unwrap());
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// Calls and tail calls between translated functions: a tail call is a jump (`TAIL`, `musttail` where the compiler has it), and the
+/// registers the caller changed reach the callee, and the callee's reach the caller after a call.
+#[test]
+fn calls_and_tail_calls_between_functions_carry_the_registers() {
+    if compiler().is_none() {
+        return;
+    }
+    let at = test_address();
+    let (callee, tail, caller) = (at + 0x100, at, at + 0x200);
+    let known = BTreeSet::from([callee, tail, caller]);
+    let rel = |from: u32, to: u32| to.wrapping_sub(from) & 0x03ff_fffc;
+    // the callee: addi r3, r3, 2; mulli r5, r3, 3; blr
+    let callee_words = vec![0x3863_0002, 0x1ca3_0003, 0x4e80_0020];
+    // a tail call: addi r3, r3, 1; b callee
+    let tail_words = vec![0x3863_0001, 0x4800_0000 | rel(tail + 4, callee)];
+    // a call: addi r3, r3, 1; bl callee; add r6, r5, r3; blr
+    let caller_words = vec![0x3863_0001, 0x4800_0001 | rel(caller + 4, callee), 0x7cc5_1a14, 0x4e80_0020];
+    let mut src = String::new();
+    for start in [callee, tail, caller] {
+        src.push_str(&format!("void {}(Ctx *c);\n", function_name(start)));
+    }
+    for (start, words) in [(callee, &callee_words), (tail, &tail_words), (caller, &caller_words)] {
+        src.push_str(&mh3u_recomp::emit_function(start, words, &known));
+    }
+    let exe = compile(&src, &[function_name(tail), function_name(caller)], "calls").expect("the translated C builds");
+    let mut rng = Rng(0x1234_4321_abcd_dcba);
+    let mut states = Vec::new();
+    for _ in 0..CASES {
+        let mut st = St::default();
+        for r in 0..30 {
+            st.gpr[r] = rng.word();
+        }
+        st.lr = 0x4;
+        states.push(st);
+    }
+    let mut failures = Vec::new();
+    for idx in 0..2 {
+        let out = run_program(&exe, idx, &states).expect("the program ran");
+        for (st, got) in states.iter().zip(&out) {
+            let mut want = st.clone();
+            want.gpr[3] = st.gpr[3].wrapping_add(3);
+            want.gpr[5] = want.gpr[3].wrapping_mul(3);
+            if idx == 1 {
+                want.gpr[6] = want.gpr[5].wrapping_add(want.gpr[3]);
+                want.lr = caller + 8;
+            }
+            if got.gpr[..30] != want.gpr[..30] || got.lr != want.lr {
+                failures.push(format!(
+                    "entry {idx}: got {:08x?} lr {:#x}, want {:08x?} lr {:#x}",
+                    &got.gpr[..30],
+                    got.lr,
+                    &want.gpr[..30],
+                    want.lr
+                ));
+                break;
+            }
+        }
+    }
+    let _ = std::fs::remove_dir_all(exe.parent().unwrap());
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
 }

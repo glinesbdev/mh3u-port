@@ -46,6 +46,17 @@ void rt_call(Ctx *c, uint32_t target);     /* a call through a register or to an
 void rt_import(Ctx *c, uint32_t number);   /* a call to a system function; the number is its place in `imports.h` */
 void rt_jump(Ctx *c, uint32_t target);     /* a jump through a register */
 
+/* A tail call to another translated function: a jump where the compiler can promise one (clang, GCC 15), so a chain of tail calls
+ * does not grow the host's stack; a call and a return elsewhere. The caller has written its registers back first (SPILL). */
+#if defined(__has_attribute)
+#if __has_attribute(musttail)
+#define TAIL(f) __attribute__((musttail)) return f(c)
+#endif
+#endif
+#ifndef TAIL
+#define TAIL(f) do { f(c); return; } while (0)
+#endif
+
 /* ---- the condition register */
 AI uint32_t crbit(Ctx *c, uint32_t b) { return (c->cr >> (31 - b)) & 1; }
 AI void setcrbit(Ctx *c, uint32_t b, uint32_t v) {
@@ -196,9 +207,7 @@ AI void fcmp(Ctx *c, uint32_t f, double a, double b) {
     setcrf(c, f, isnan(a) || isnan(b) ? 1 : (a < b ? 8 : (a > b ? 4 : 2)));
 }
 
-/* ---- paired singles */
-AI float hf(Ctx *c, int r, int i) { return (float)(i ? c->ps1[r].d : c->f[r].d); }
-AI void sh(Ctx *c, int r, int i, float v) { if (i) c->ps1[r].d = (double)v; else c->f[r].d = (double)v; }
+/* ---- paired singles (the translator reads and writes the halves itself, `f` the first and `ps1` the second, so they can be locals) */
 AI int32_t sat32(float x) {
     if (isnan(x)) return INT32_MIN;
     if (x >= 2147483648.0f) return INT32_MAX;
@@ -223,14 +232,14 @@ AI uint64_t qread(Ctx *c, uint32_t at, uint32_t kind, int scale) {
     }
     }
 }
-AI void psq_load(Ctx *c, int rd, uint32_t ea, int w, int g) {
+AI void psq_load(Ctx *c, FR *lo, FR *hi, uint32_t ea, int w, int g) {
     uint32_t kind = (c->gqr[g] >> 16) & 7;
     int scale = qscale(c->gqr[g] >> 24);
     uint64_t first = qread(c, ea, kind, scale);
     FR one; one.d = 1.0;
     uint64_t second = w ? one.u : qread(c, ea + qsize(kind), kind, scale);
-    c->f[rd].u = first;
-    c->ps1[rd].u = second;
+    lo->u = first;
+    hi->u = second;
 }
 AI void qwrite(Ctx *c, uint32_t at, uint64_t bits, uint32_t kind, int scale) {
     FR v; v.u = bits;
@@ -244,10 +253,9 @@ AI void qwrite(Ctx *c, uint32_t at, uint64_t bits, uint32_t kind, int scale) {
     default: st32(c, at, narrow(bits)); break;
     }
 }
-AI void psq_store(Ctx *c, int rs, uint32_t ea, int w, int g) {
+AI void psq_store(Ctx *c, uint64_t first, uint64_t second, uint32_t ea, int w, int g) {
     uint32_t kind = c->gqr[g] & 7;
     int scale = qscale(c->gqr[g] >> 8);
-    uint64_t first = c->f[rs].u, second = c->ps1[rs].u;
     qwrite(c, ea, first, kind, scale);
     if (!w) qwrite(c, ea + qsize(kind), second, kind, scale);
 }

@@ -37,7 +37,27 @@ memory, see `docs/spikes.md`) is planned.
 loads and stores through a base pointer, the carry and overflow rules, the condition register). `tests/c_diff.rs` translates every
 instruction word of the same random cases, compiles them all into one program with the system C compiler (clang, cc or gcc), runs the
 program on the same states and compares with the interpreter bit for bit: 1,320 words, every branch form that stays inside a
-function, and the reservation pair. Together with the first part this is a chain: translated C = interpreter = QEMU.
+function, and the reservation pair. Together with the first part this is a chain: translated C = interpreter = QEMU. Two more tests
+there check what the interpreter cannot: that the registers reach the runtime's hooks (`rt_call`, `rt_jump`, `rt_syscall`, whose test
+versions read and change them) and come back from them, and that calls and tail calls between translated functions carry them.
+
+**Registers in locals.** Inside a translated function the general-purpose and floating point registers (both halves of a paired
+single) that it names are C locals (`R_3`, `F_1`, `P_1`), not fields of the `Ctx`: `FILL()` loads all of them on entry, `SPILL()`
+writes back the ones the function ever changes before anything outside it can look (a call, a tail call, a jump through a register,
+a return, `rt_import`, `rt_syscall`, `rt_trap`, `rt_unsupported`), and `FILL()` loads them again after a call or hook returns (it may
+have changed any of them, or let another guest thread run). The two macros are defined before each function and undefined after it.
+The condition, link, count and XER registers, the GQRs and the reservation stay in the `Ctx`. The translator writes every instruction
+against `c->r[N]` and the like as before and then renames the ones with a constant `N` (`localize` in `mh3u-recomp`); to make every
+index constant, `lmw`, `stmw`, `lswi` and `stswi` are unrolled and the paired-single halves are named directly. `lswx` and `stswx` (the
+count is in XER, so the registers are picked at run time) still work on the `Ctx` and spill and fill around themselves. The function's
+`Ctx *` is `restrict`: a `Ctx` lives in the host's memory, never in the guest's, so a guest store through `c->mem` cannot change it,
+and the compiler need not reload the condition register and the rest after every store. Without this every register was a memory
+access that every guest store forced to be redone. In a `--watch` build the store watch reports `r1` from the `Ctx`, which can be
+behind the function's local.
+
+A tail call to a translated function is `TAIL(f)`: `__attribute__((musttail)) return f(c)` where the compiler has it (clang, and
+GCC from version 15), so a chain of tail calls is a chain of jumps and does not grow the host's stack at any optimisation level; with
+an older compiler it is a call and a return.
 
 Where the C is deliberately not the interpreter: a `bl` or `bctrl` is a *call* (a C call, or a hook for an address the translator does
 not know) and `blr` is a *return*, where the interpreter changes the program counter; code that uses them as jumps into the middle

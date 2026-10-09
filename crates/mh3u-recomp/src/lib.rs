@@ -3,6 +3,11 @@
 //! Each instruction becomes a few C statements that give it the meaning the reference interpreter in `mh3u-ppc` gives it (the
 //! interpreter is checked against QEMU; this against the interpreter, on the same random states). The statements work on a `Ctx` (the
 //! registers) and use the helpers of `ppc.h`. Control flow inside a function is `goto`; a call is a C call; `blr` is `return`.
+//!
+//! Inside a function the general-purpose and floating point registers it uses live in C locals (`R_3`, `F_1`, `P_1`), not in the
+//! `Ctx`: they are loaded from it on entry (`FILL`), written back to it before anything else can look at it (`SPILL`: a call, a jump
+//! out, a return, a system or runtime hook) and loaded again after anything that may have changed it. The condition, link, count and
+//! fixed-point exception registers stay in the `Ctx`; `c` is `restrict`, so guest stores (through `c->mem`) are known not to touch it.
 
 pub mod discover;
 
@@ -65,6 +70,22 @@ pub fn function_name(address: u32) -> String {
 
 fn label(address: u32) -> String {
     format!("L_{address:08x}")
+}
+
+/// One half of a paired-single register as a float (`i` 0 is the first half, kept in `f`; 1 the second, in `ps1`).
+fn hf(n: usize, i: u32) -> String {
+    format!("(float)c->{}[{n}].d", if i == 0 { "f" } else { "ps1" })
+}
+
+/// Sets one half of a paired-single register from a float.
+fn sh(n: usize, i: u32, v: &str) -> String {
+    format!("c->{}[{n}].d = (double)({v});", if i == 0 { "f" } else { "ps1" })
+}
+
+/// A call to a runtime hook: the registers are written back before it (the hook may look at them) and read again after it (it may
+/// have changed them).
+fn hook(call: &str) -> String {
+    format!("{{ SPILL(); {call} FILL(); }}")
 }
 
 /// A statement that records the result into CR0 when the instruction has the record bit.
@@ -273,13 +294,13 @@ pub fn emit_insn(insn: Insn, addr: u32, fx: &Function) -> Vec<String> {
                 (Some(p), Mfspr) => push(format!("{} = {p};", r(rd))),
                 (Some(p), _) if n == 1 => push(format!("{p} = {} & 0xe000007fu;", r(rd))),
                 (Some(p), _) => push(format!("{p} = {};", r(rd))),
-                (None, _) => push(format!("rt_unsupported(c, {});", hex(w))),
+                (None, _) => push(hook(&format!("rt_unsupported(c, {});", hex(w)))),
             }
         }
         Mftb => match insn.spr() {
             268 => push(format!("{} = (uint32_t)c->tb;", r(rd))),
             269 => push(format!("{} = (uint32_t)(c->tb >> 32);", r(rd))),
-            _ => push(format!("rt_unsupported(c, {});", hex(w))),
+            _ => push(hook(&format!("rt_unsupported(c, {});", hex(w)))),
         },
         // ---- loads
         Lbz | Lbzu | Lbzx | Lbzux | Lhz | Lhzu | Lhzx | Lhzux | Lha | Lhau | Lhax | Lhaux | Lwz | Lwzu | Lwzx | Lwzux | Lhbrx | Lwbrx
@@ -308,19 +329,37 @@ pub fn emit_insn(insn: Insn, addr: u32, fx: &Function) -> Vec<String> {
             }
             push(format!("{{ {body} }}"));
         }
-        Lmw => push(format!(
-            "{{ uint32_t ea = {}; for (int i = {rd}; i < 32; i++) {{ c->r[i] = ld32(c, ea); ea += 4; }} }}",
-            ea_d(ra, insn.simm())
-        )),
+        // unrolled, so every register is named by a constant (and can live in a local)
+        Lmw => {
+            let mut body = format!("{{ uint32_t ea = {};", ea_d(ra, insn.simm()));
+            for (k, i) in (rd..32).enumerate() {
+                let _ = write!(body, " c->r[{i}] = ld32(c, ea + {});", hex(4 * k as u32));
+            }
+            push(body + " }");
+        }
         Lswi | Lswx => {
             let (ea, n) = if insn.op == Lswi {
                 (if ra == 0 { "0u".to_string() } else { r(ra) }, insn.nb().to_string())
             } else {
                 (ea_x(ra, rb), "(c->xer & 0x7f)".to_string())
             };
-            push(format!(
-                "{{ uint32_t ea = {ea}; uint32_t n = {n}; for (uint32_t k = 0; k < n; k++) {{ uint32_t q = ({rd} + k / 4) % 32; if (k % 4 == 0) c->r[q] = 0; c->r[q] |= ld8(c, ea + k) << (24 - 8 * (k % 4)); }} }}"
-            ));
+            if insn.op == Lswi {
+                // the count is known: unrolled, with every register named by a constant
+                let mut body = format!("{{ uint32_t ea = {ea};");
+                for k in 0..insn.nb() as usize {
+                    let q = (rd + k / 4) % 32;
+                    if k % 4 == 0 {
+                        let _ = write!(body, " c->r[{q}] = 0;");
+                    }
+                    let _ = write!(body, " c->r[{q}] |= ld8(c, ea + {}) << {};", hex(k as u32), 24 - 8 * (k % 4));
+                }
+                push(body + " }");
+            } else {
+                // the count is in XER: the registers are picked at run time, so this one works on the `Ctx` itself
+                push(format!(
+                    "{{ uint32_t ea = {ea}; SPILL(); uint32_t n = {n}; for (uint32_t k = 0; k < n; k++) {{ uint32_t q = ({rd} + k / 4) % 32; if (k % 4 == 0) c->r[q] = 0; c->r[q] |= ld8(c, ea + k) << (24 - 8 * (k % 4)); }} FILL(); }}"
+                ));
+            }
         }
         // ---- stores
         Stb | Stbu | Stbx | Stbux | Sth | Sthu | Sthx | Sthux | Stw | Stwu | Stwx | Stwux | Sthbrx | Stwbrx | Stwcx => {
@@ -344,19 +383,31 @@ pub fn emit_insn(insn: Insn, addr: u32, fx: &Function) -> Vec<String> {
             }
             push(format!("{{ {body} }}"));
         }
-        Stmw => push(format!(
-            "{{ uint32_t ea = {}; for (int i = {rd}; i < 32; i++) {{ st32(c, ea, c->r[i]); ea += 4; }} }}",
-            ea_d(ra, insn.simm())
-        )),
+        Stmw => {
+            let mut body = format!("{{ uint32_t ea = {};", ea_d(ra, insn.simm()));
+            for (k, i) in (rd..32).enumerate() {
+                let _ = write!(body, " st32(c, ea + {}, c->r[{i}]);", hex(4 * k as u32));
+            }
+            push(body + " }");
+        }
         Stswi | Stswx => {
             let (ea, n) = if insn.op == Stswi {
                 (if ra == 0 { "0u".to_string() } else { r(ra) }, insn.nb().to_string())
             } else {
                 (ea_x(ra, rb), "(c->xer & 0x7f)".to_string())
             };
-            push(format!(
-                "{{ uint32_t ea = {ea}; uint32_t n = {n}; for (uint32_t k = 0; k < n; k++) {{ uint32_t q = ({rd} + k / 4) % 32; st8(c, ea + k, c->r[q] >> (24 - 8 * (k % 4))); }} }}"
-            ));
+            if insn.op == Stswi {
+                let mut body = format!("{{ uint32_t ea = {ea};");
+                for k in 0..insn.nb() as usize {
+                    let q = (rd + k / 4) % 32;
+                    let _ = write!(body, " st8(c, ea + {}, c->r[{q}] >> {});", hex(k as u32), 24 - 8 * (k % 4));
+                }
+                push(body + " }");
+            } else {
+                push(format!(
+                    "{{ uint32_t ea = {ea}; SPILL(); uint32_t n = {n}; for (uint32_t k = 0; k < n; k++) {{ uint32_t q = ({rd} + k / 4) % 32; st8(c, ea + k, c->r[q] >> (24 - 8 * (k % 4))); }} }}"
+                ));
+            }
         }
         // ---- floating point memory
         Lfs | Lfsu | Lfsx | Lfsux | Lfd | Lfdu | Lfdx | Lfdux => {
@@ -496,11 +547,7 @@ pub fn emit_insn(insn: Insn, addr: u32, fx: &Function) -> Vec<String> {
             let c_reg = insn.rc_f();
             let mut body = String::from("{ ");
             for i in 0..2 {
-                let (a, b, cc) = (
-                    format!("hf(c, {ra}, {i})"),
-                    format!("hf(c, {rb}, {i})"),
-                    format!("hf(c, {c_reg}, {i})"),
-                );
+                let (a, b, cc) = (hf(ra, i), hf(rb, i), hf(c_reg, i));
                 let e = match insn.op {
                     PsAdd => format!("canon3f({a} + {b}, {a}, {b}, {b})"),
                     PsSub => format!("canon3f({a} - {b}, {a}, {b}, {b})"),
@@ -513,14 +560,14 @@ pub fn emit_insn(insn: Insn, addr: u32, fx: &Function) -> Vec<String> {
                 };
                 let _ = write!(body, "float r{i} = {e}; ");
             }
-            let _ = write!(body, "sh(c, {rd}, 0, r0); sh(c, {rd}, 1, r1); }}");
+            let _ = write!(body, "{} {} }}", sh(rd, 0, "r0"), sh(rd, 1, "r1"));
             push(body);
         }
         PsMuls0 | PsMuls1 | PsMadds0 | PsMadds1 => {
             let which = u32::from(matches!(insn.op, PsMuls1 | PsMadds1));
-            let mut body = format!("{{ float cc = hf(c, {}, {which}); ", insn.rc_f());
+            let mut body = format!("{{ float cc = {}; ", hf(insn.rc_f(), which));
             for i in 0..2 {
-                let (a, b) = (format!("hf(c, {ra}, {i})"), format!("hf(c, {rb}, {i})"));
+                let (a, b) = (hf(ra, i), hf(rb, i));
                 let e = if matches!(insn.op, PsMuls0 | PsMuls1) {
                     format!("canon3f({a} * cc, {a}, cc, cc)")
                 } else {
@@ -528,19 +575,26 @@ pub fn emit_insn(insn: Insn, addr: u32, fx: &Function) -> Vec<String> {
                 };
                 let _ = write!(body, "float r{i} = {e}; ");
             }
-            let _ = write!(body, "sh(c, {rd}, 0, r0); sh(c, {rd}, 1, r1); }}");
+            let _ = write!(body, "{} {} }}", sh(rd, 0, "r0"), sh(rd, 1, "r1"));
             push(body);
         }
         PsSum0 | PsSum1 => {
             let c_reg = insn.rc_f();
-            let sum = format!("canon3f(hf(c, {ra}, 0) + hf(c, {rb}, 1), hf(c, {ra}, 0), hf(c, {rb}, 1), hf(c, {rb}, 1))");
+            let (a0, b1) = (hf(ra, 0), hf(rb, 1));
+            let sum = format!("canon3f({a0} + {b1}, {a0}, {b1}, {b1})");
             if insn.op == PsSum0 {
                 push(format!(
-                    "{{ float s = {sum}; float k = hf(c, {c_reg}, 1); sh(c, {rd}, 0, s); sh(c, {rd}, 1, k); }}"
+                    "{{ float s = {sum}; float k = {}; {} {} }}",
+                    hf(c_reg, 1),
+                    sh(rd, 0, "s"),
+                    sh(rd, 1, "k")
                 ));
             } else {
                 push(format!(
-                    "{{ float s = {sum}; float k = hf(c, {c_reg}, 0); sh(c, {rd}, 0, k); sh(c, {rd}, 1, s); }}"
+                    "{{ float s = {sum}; float k = {}; {} {} }}",
+                    hf(c_reg, 0),
+                    sh(rd, 0, "k"),
+                    sh(rd, 1, "s")
                 ));
             }
         }
@@ -548,18 +602,15 @@ pub fn emit_insn(insn: Insn, addr: u32, fx: &Function) -> Vec<String> {
             let c_reg = insn.rc_f();
             let mut body = String::from("{ ");
             for i in 0..2 {
-                let _ = write!(
-                    body,
-                    "float r{i} = hf(c, {ra}, {i}) >= 0.0f ? hf(c, {c_reg}, {i}) : hf(c, {rb}, {i}); "
-                );
+                let _ = write!(body, "float r{i} = {} >= 0.0f ? {} : {}; ", hf(ra, i), hf(c_reg, i), hf(rb, i));
             }
-            let _ = write!(body, "sh(c, {rd}, 0, r0); sh(c, {rd}, 1, r1); }}");
+            let _ = write!(body, "{} {} }}", sh(rd, 0, "r0"), sh(rd, 1, "r1"));
             push(body);
         }
         PsRes | PsRsqrte => {
             let mut body = String::from("{ ");
             for i in 0..2 {
-                let b = format!("hf(c, {rb}, {i})");
+                let b = hf(rb, i);
                 let e = if insn.op == PsRes {
                     format!("1.0f / {b}")
                 } else {
@@ -567,7 +618,7 @@ pub fn emit_insn(insn: Insn, addr: u32, fx: &Function) -> Vec<String> {
                 };
                 let _ = write!(body, "float r{i} = canon3f({e}, {b}, {b}, {b}); ");
             }
-            let _ = write!(body, "sh(c, {rd}, 0, r0); sh(c, {rd}, 1, r1); }}");
+            let _ = write!(body, "{} {} }}", sh(rd, 0, "r0"), sh(rd, 1, "r1"));
             push(body);
         }
         PsNeg | PsMr | PsNabs | PsAbs => {
@@ -596,10 +647,7 @@ pub fn emit_insn(insn: Insn, addr: u32, fx: &Function) -> Vec<String> {
         }
         PsCmpu0 | PsCmpo0 | PsCmpu1 | PsCmpo1 => {
             let i = u32::from(matches!(insn.op, PsCmpu1 | PsCmpo1));
-            push(format!(
-                "fcmp(c, {}, (double)hf(c, {ra}, {i}), (double)hf(c, {rb}, {i}));",
-                insn.crfd()
-            ));
+            push(format!("fcmp(c, {}, (double){}, (double){});", insn.crfd(), hf(ra, i), hf(rb, i)));
         }
         PsqL | PsqLu | PsqLx | PsqLux => {
             let indexed = matches!(insn.op, PsqLx | PsqLux);
@@ -609,7 +657,10 @@ pub fn emit_insn(insn: Insn, addr: u32, fx: &Function) -> Vec<String> {
             } else {
                 (insn.psq_w(), insn.psq_i())
             };
-            let mut body = format!("uint32_t ea = {ea}; psq_load(c, {rd}, ea, {}, {i});", u32::from(w));
+            let mut body = format!(
+                "uint32_t ea = {ea}; psq_load(c, &c->f[{rd}], &c->ps1[{rd}], ea, {}, {i});",
+                u32::from(w)
+            );
             if matches!(insn.op, PsqLu | PsqLux) {
                 let _ = write!(body, " {} = ea;", r(ra));
             }
@@ -623,7 +674,10 @@ pub fn emit_insn(insn: Insn, addr: u32, fx: &Function) -> Vec<String> {
             } else {
                 (insn.psq_w(), insn.psq_i())
             };
-            let mut body = format!("uint32_t ea = {ea}; psq_store(c, {rd}, ea, {}, {i});", u32::from(w));
+            let mut body = format!(
+                "uint32_t ea = {ea}; psq_store(c, c->f[{rd}].u, c->ps1[{rd}].u, ea, {}, {i});",
+                u32::from(w)
+            );
             if matches!(insn.op, PsqStu | PsqStux) {
                 let _ = write!(body, " {} = ea;", r(ra));
             }
@@ -633,7 +687,7 @@ pub fn emit_insn(insn: Insn, addr: u32, fx: &Function) -> Vec<String> {
         Dcbz => push(format!("zero32(c, {});", ea_x(ra, rb))),
         Dcbf | Dcbi | Dcbst | Dcbt | Dcbtst | Icbi | Sync | Isync | Eieio => push(format!("/* {} */", insn.op.name())),
         // ---- traps and the system
-        Sc => push("rt_syscall(c);".to_string()),
+        Sc => push(hook("rt_syscall(c);")),
         Tw | Twi => {
             let to = rd as u32;
             let (a, b) = (
@@ -662,10 +716,10 @@ pub fn emit_insn(insn: Insn, addr: u32, fx: &Function) -> Vec<String> {
                 conds.push(format!("{ua} > {ub}"));
             }
             if !conds.is_empty() {
-                push(format!("if ({}) rt_trap(c, {});", conds.join(" || "), hex(w)));
+                push(format!("if ({}) {}", conds.join(" || "), hook(&format!("rt_trap(c, {});", hex(w)))));
             }
         }
-        _ => push(format!("rt_unsupported(c, {}); /* {} */", hex(w), insn.op.name())),
+        _ => push(hook(&format!("rt_unsupported(c, {}); /* {} */", hex(w), insn.op.name()))),
     }
     out
 }
@@ -679,20 +733,20 @@ fn emit_branch(insn: Insn, addr: u32, fx: &Function) -> Vec<String> {
     // a jump to another place: a tail call when it is a function, a runtime jump when it is not
     let leave = |t: u32| -> Vec<String> {
         if fx.functions.contains(&t) {
-            vec![format!("{}(c); return;", function_name(t))]
+            vec![format!("SPILL(); TAIL({});", function_name(t))]
         } else if let Some(n) = fx.imports.get(&t) {
-            vec![format!("rt_import(c, {n}); return;")]
+            vec![format!("SPILL(); rt_import(c, {n}); return;")]
         } else {
-            vec![format!("rt_jump(c, {});", hex(t)), "return;".to_string()]
+            vec![format!("SPILL(); rt_jump(c, {});", hex(t)), "return;".to_string()]
         }
     };
     let call = |t: u32| -> String {
         if fx.functions.contains(&t) {
-            format!("{}(c);", function_name(t))
+            hook(&format!("{}(c);", function_name(t)))
         } else if let Some(n) = fx.imports.get(&t) {
-            format!("rt_import(c, {n});")
+            hook(&format!("rt_import(c, {n});"))
         } else {
-            format!("rt_call(c, {});", hex(t))
+            hook(&format!("rt_call(c, {});", hex(t)))
         }
     };
     match insn.op {
@@ -739,18 +793,23 @@ fn emit_branch(insn: Insn, addr: u32, fx: &Function) -> Vec<String> {
         Op::Bclr => {
             let always = insn.bo() & 20 == 20;
             if always && !lk {
-                out.push("return;".to_string());
+                out.push("SPILL(); return;".to_string());
             } else if always {
-                out.push("{ uint32_t t = c->lr & ~3u; ".to_string() + &format!("c->lr = {}; rt_call(c, t); }}", hex(next)));
+                out.push(format!(
+                    "{{ uint32_t t = c->lr & ~3u; c->lr = {}; {} }}",
+                    hex(next),
+                    hook("rt_call(c, t);")
+                ));
             } else {
                 let cond = format!("bcond(c, {}, {}, 1)", insn.bo(), insn.bi());
                 if lk {
                     out.push(format!(
-                        "{{ uint32_t t = c->lr & ~3u; int go = {cond}; c->lr = {}; if (go) rt_call(c, t); }}",
-                        hex(next)
+                        "{{ uint32_t t = c->lr & ~3u; int go = {cond}; c->lr = {}; if (go) {} }}",
+                        hex(next),
+                        hook("rt_call(c, t);")
                     ));
                 } else {
-                    out.push(format!("if ({cond}) return;"));
+                    out.push(format!("if ({cond}) {{ SPILL(); return; }}"));
                 }
             }
         }
@@ -764,8 +823,9 @@ fn emit_branch(insn: Insn, addr: u32, fx: &Function) -> Vec<String> {
             };
             if lk {
                 out.push(format!(
-                    "{{ uint32_t t = c->ctr & ~3u; int go = {go}; c->lr = {}; if (go) rt_call(c, t); }}",
-                    hex(next)
+                    "{{ uint32_t t = c->ctr & ~3u; int go = {go}; c->lr = {}; if (go) {} }}",
+                    hex(next),
+                    hook("rt_call(c, t);")
                 ));
             } else if let (Some(&n), true) = (fx.tables.get(&addr), always) {
                 // a switch: the table is `n` branches right after this instruction, and the target is one of them
@@ -774,11 +834,11 @@ fn emit_branch(insn: Insn, addr: u32, fx: &Function) -> Vec<String> {
                     let _ = write!(cases, "case {k}: goto {}; ", label(next + 4 * k));
                 }
                 out.push(format!(
-                    "{{ uint32_t k = (c->ctr - {}) >> 2; switch (k) {{ {cases}default: rt_jump(c, c->ctr & ~3u); return; }} }}",
+                    "{{ uint32_t k = (c->ctr - {}) >> 2; switch (k) {{ {cases}default: SPILL(); rt_jump(c, c->ctr & ~3u); return; }} }}",
                     hex(next)
                 ));
             } else {
-                out.push(format!("if ({go}) {{ rt_jump(c, c->ctr & ~3u); return; }}"));
+                out.push(format!("if ({go}) {{ SPILL(); rt_jump(c, c->ctr & ~3u); return; }}"));
             }
         }
     }
@@ -910,31 +970,113 @@ pub fn emit_function_with(start: u32, words: &[u32], functions: &BTreeSet<u32>, 
         labels: &labels,
         functions,
     };
-    let mut out = String::new();
-    let _ = writeln!(out, "void {}(Ctx *c) {{", function_name(start));
-    let _ = writeln!(out, "    ENTER(c, {});", hex(start));
+    let mut body = String::new();
     for (i, &w) in words.iter().enumerate() {
         let addr = start + 4 * i as u32;
         if labels.contains(&addr) {
-            let _ = writeln!(out, "{}:;", label(addr));
+            let _ = writeln!(body, "{}:;", label(addr));
         }
         match Insn::decode(w) {
             Some(insn) => {
                 for s in emit_insn(insn, addr, &fx) {
-                    let _ = writeln!(out, "    {s}");
+                    let _ = writeln!(body, "    {s}");
                 }
             }
             None => {
-                let _ = writeln!(out, "    rt_unsupported(c, {}); /* not an instruction */", hex(w));
+                let _ = writeln!(
+                    body,
+                    "    {}",
+                    hook(&format!("rt_unsupported(c, {}); /* not an instruction */", hex(w)))
+                );
             }
         }
     }
     // running off the end of the function continues in whatever follows it
     if functions.contains(&end) {
-        let _ = writeln!(out, "    {}(c);", function_name(end));
+        let _ = writeln!(body, "    SPILL(); TAIL({});", function_name(end));
+    } else {
+        body.push_str("    SPILL();\n");
     }
-    out.push_str("}\n");
+    let (body, regs) = localize(&body);
+    let mut out = String::new();
+    // the registers this function keeps in locals: written back by SPILL (the ones it changes), read again by FILL (all it uses)
+    let (mut spill, mut fill, mut decls) = (String::new(), String::new(), String::new());
+    for &(kind, n, dirty) in &regs {
+        let (local, field, ty) = match kind {
+            Reg::Gpr => (format!("R_{n}"), format!("c->r[{n}]"), "uint32_t"),
+            Reg::Fpr => (format!("F_{n}"), format!("c->f[{n}]"), "FR"),
+            Reg::Ps1 => (format!("P_{n}"), format!("c->ps1[{n}]"), "FR"),
+        };
+        if dirty {
+            let _ = write!(spill, " {field} = {local};");
+        }
+        let _ = write!(fill, " {local} = {field};");
+        let _ = writeln!(decls, "    {ty} {local};");
+    }
+    let _ = writeln!(out, "#define SPILL() do {{{spill} }} while (0)");
+    let _ = writeln!(out, "#define FILL() do {{{fill} }} while (0)");
+    let _ = writeln!(out, "void {}(Ctx *restrict c) {{", function_name(start));
+    out.push_str(&decls);
+    let _ = writeln!(out, "    ENTER(c, {});", hex(start));
+    out.push_str("    FILL();\n");
+    out.push_str(&body);
+    out.push_str("}\n#undef SPILL\n#undef FILL\n");
     out
+}
+
+/// A register of the `Ctx` that a function may keep in a local.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Reg {
+    Gpr,
+    Fpr,
+    Ps1,
+}
+
+/// Turns every `c->r[N]`, `c->f[N]` and `c->ps1[N]` with a constant `N` into its local (`R_N`, `F_N`, `P_N`), and says which registers
+/// were used and whether each is ever written (assigned, or its address taken). An access with an index computed at run time (the
+/// string instructions with the count in XER) stays on the `Ctx`; the statement that makes it spills and fills around it.
+fn localize(body: &str) -> (String, Vec<(Reg, u32, bool)>) {
+    let mut out = String::with_capacity(body.len());
+    let mut used: BTreeMap<(Reg, u32), bool> = BTreeMap::new();
+    let mut rest = body;
+    while let Some(at) = rest.find("c->") {
+        out.push_str(&rest[..at]);
+        let after = &rest[at + 3..];
+        let found = [("r[", Reg::Gpr, "R_"), ("f[", Reg::Fpr, "F_"), ("ps1[", Reg::Ps1, "P_")]
+            .into_iter()
+            .find_map(|(prefix, kind, local)| {
+                let digits = after.strip_prefix(prefix)?;
+                let len = digits.bytes().take_while(u8::is_ascii_digit).count();
+                if len == 0 || !digits[len..].starts_with(']') {
+                    return None;
+                }
+                let n: u32 = digits[..len].parse().ok()?;
+                Some((kind, local, n, prefix.len() + len + 1))
+            });
+        match found {
+            Some((kind, local, n, skip)) => {
+                let taken = out.ends_with('&') && !out.ends_with("&&");
+                let tail = &after[skip..];
+                // what follows the register: a field of the union, then perhaps an assignment (`=` that is not `==`, or `|=`)
+                let t = tail
+                    .strip_prefix(".u")
+                    .or_else(|| tail.strip_prefix(".d"))
+                    .unwrap_or(tail)
+                    .trim_start();
+                let assigned = (t.starts_with('=') && !t.starts_with("==")) || t.starts_with("|=");
+                let dirty = used.entry((kind, n)).or_insert(false);
+                *dirty |= taken || assigned;
+                let _ = write!(out, "{local}{n}");
+                rest = tail;
+            }
+            None => {
+                out.push_str("c->");
+                rest = after;
+            }
+        }
+    }
+    out.push_str(rest);
+    (out, used.into_iter().map(|((k, n), d)| (k, n, d)).collect())
 }
 
 #[cfg(test)]
