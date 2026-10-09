@@ -198,7 +198,7 @@ The confidence is medium; a callback can switch on `h.ctx.lr`. `mods/hooks.txt` 
   menu and wait 3 s, press F9 again: the list is what the menu runs (drawing included). The callers of the top ones are the
   menu-open candidates.
 
-Both need a watch build. F9 and F10 also reach the game, which does not use them.
+Both need a watch build. Each press logs `[keys] F9 pressed (n)`. F9 and F10 also reach the game, which does not use them.
 
 #### Test session (PowerShell)
 
@@ -221,6 +221,15 @@ In the village, with at least 3 items and a potion in the pouch, write down each
 
 Send back `Desktop\session.log` with your notes (the order of the steps, and which menu each F9 pair was).
 
+#### Run 34 (user): the first session
+
+- **F9 worked:** 6 windows. Item menu open versus closed: only `f_02aeeca8` (5 -> 6 samples, weak). Main menu: `f_0211a388`
+  and `f_02d31904` (1 -> 5, weak). The quest window against the menu window gave many functions (field code). The counts are
+  low, so these are weak leads, not hooks yet.
+- **F10 did nothing:** the live save was never found. The overlay only looked for it while open or with a non-empty wishlist,
+  and the watch build's folder has its own empty wishlist. Fixed: an `MH3U_WATCH=live` run always looks for it. F10 before
+  that says why, and every F9/F10 press is logged.
+
 ## Plan
 
 1. Write this doc. **(done)**
@@ -235,5 +244,6 @@ Send back `Desktop\session.log` with your notes (the order of the steps, and whi
 
 See the bottom of this file. It is updated with each commit of PR #13.
 
-- Status: PR #17 adds the call diff (F9) and the quest-pouch search (F10). Waiting for the user's test session.
-- Next: from that log, hook the item-use writer and the menu-open candidates, then confirm them with `MH3U_HOOK_LOG=1`.
+- Status: run 34 found weak menu leads; F10 is fixed (the save search runs in live-watch runs). Retest of the quest-pouch part
+  pending (PR #17).
+- Next: the item-use writer from the retest; longer menu windows (10 s or more) to firm up the menu leads.

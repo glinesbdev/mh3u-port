@@ -311,7 +311,8 @@ impl<F: FnOnce(Display) + Send + 'static> ApplicationHandler for App<F> {
                 _ => None,
             };
             if let Some(key) = key {
-                key.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let n = key.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                eprintln!("[keys] {code:?} pressed ({n})");
             }
         }
         if let WindowEvent::KeyboardInput { event: k, .. } = &event

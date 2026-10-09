@@ -193,7 +193,9 @@ impl Overlay {
             OVERLAY_PRESSES.lock().unwrap_or_else(|e| e.into_inner()).clear();
         }
         self.frame += 1;
-        if self.open || (!self.wishlist.pieces.is_empty() && self.frame.is_multiple_of(LOOK_EVERY)) {
+        // the save is followed while the overlay is open, now and then for a wishlist, and always for the live watch (PR #17 run:
+        // with an empty wishlist and the overlay never opened, F10 found no save to search from)
+        if self.open || mods::watching_live() || (!self.wishlist.pieces.is_empty() && self.frame.is_multiple_of(LOOK_EVERY)) {
             self.follow_save();
         }
         self.notices.retain(|(_, t)| t.elapsed() < NOTICE);
@@ -209,6 +211,13 @@ impl Overlay {
     /// Finds the live save (the search runs on its own thread; its candidates are checked from a snapshot taken at a frame) and reads
     /// it from the snapshot of each frame.
     fn follow_save(&mut self) {
+        let f10 = mods::KEY_F10.load(std::sync::atomic::Ordering::Relaxed);
+        if f10 != self.f10 && !matches!(self.save, Save::At(..)) {
+            self.f10 = f10;
+            eprintln!(
+                "[watch-live] F10: the live save is not found yet, so there is no pouch to search for; wait for `[overlay] the live save is at`"
+            );
+        }
         match &mut self.save {
             Save::Waiting { until, .. } => {
                 if Instant::now() >= *until {

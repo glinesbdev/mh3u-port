@@ -300,6 +300,11 @@ pub fn call_diff(a: &std::collections::HashMap<u32, u32>, b: &std::collections::
     out.into_iter().map(|(f, a, b, _)| (f, a, b)).collect()
 }
 
+/// Whether this is an `MH3U_WATCH=live` run of a watch build (the overlay then looks for the live save even while closed).
+pub fn watching_live() -> bool {
+    WATCH_FNS.get().is_some()
+}
+
 /// `MH3U_WATCH=live` (a `--watch` build, `docs/hooks.md`): stores into a range found at run time (the live save) are logged with
 /// what they write (a label from `label`), the function most recently entered and the link register, so the functions that
 /// change items, equipment and money can be found and hooked.
