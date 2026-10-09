@@ -286,10 +286,15 @@ pub static KEY_F10: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32:
 /// The functions sampled far more often in window `b` than in window `a` (counts of the most recently entered function, `na` and
 /// `nb` samples): (function, count in a, count in b), most first. A function needs 5 samples in `b` and 4 times its rate in `a`.
 pub fn call_diff(a: &std::collections::HashMap<u32, u32>, b: &std::collections::HashMap<u32, u32>) -> Vec<(u32, u32, u32)> {
+    call_diff_min(a, b, 5)
+}
+
+/// As `call_diff`, with the fewest calls in `b` given (1 for exact counts: a function called once, only in `b`, is kept).
+pub fn call_diff_min(a: &std::collections::HashMap<u32, u32>, b: &std::collections::HashMap<u32, u32>, min: u32) -> Vec<(u32, u32, u32)> {
     let (na, nb) = (a.values().sum::<u32>().max(1) as f64, b.values().sum::<u32>().max(1) as f64);
     let mut out: Vec<(u32, u32, u32, f64)> = b
         .iter()
-        .filter(|&(_, &n)| n >= 5)
+        .filter(|&(_, &n)| n >= min)
         .filter_map(|(&f, &n)| {
             let before = a.get(&f).copied().unwrap_or(0);
             let ratio = (f64::from(n) / nb) / (f64::from(before).max(0.5) / na);
@@ -459,6 +464,9 @@ mod write_watch_tests {
             "5 ran before too, 4 too rarely, 1 and 2 always"
         );
         assert_eq!(d[0], (3, 0, 100));
+        // exact counts: a function called once, only in the second window, is kept
+        let b: std::collections::HashMap<u32, u32> = [(1, 450), (9, 1)].into();
+        assert_eq!(super::call_diff_min(&a, &b, 1), vec![(9, 0, 1)]);
     }
     #[test]
     fn copies_of_the_pouch_are_found_word_aligned() {

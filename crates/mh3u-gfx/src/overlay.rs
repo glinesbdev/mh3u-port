@@ -261,7 +261,13 @@ impl Overlay {
                         mods::watch(&[(at, live::LEN)]);
                         // MH3U_WATCH=live: log the stores to it, to find the functions to hook (docs/hooks.md)
                         let (lo, hi) = live::WATCH_SPAN;
-                        if mods::watch_writes(at + lo, at + hi, Box::new(move |a| live::field(a - at)))
+                        // MH3U_WATCH_AT=<address>: watch a block with the save's layout there instead (the quest's working save,
+                        // copied from the save when a quest starts; docs/hooks.md)
+                        let block = std::env::var("MH3U_WATCH_AT")
+                            .ok()
+                            .and_then(|v| u32::from_str_radix(v.trim().trim_start_matches("0x"), 16).ok())
+                            .unwrap_or(at);
+                        if mods::watch_writes(block + lo, block + hi, Box::new(move |a| live::field(a - block)))
                             && std::env::var_os("MH3U_WATCH_COPY").is_some()
                         {
                             // and, asked for with MH3U_WATCH_COPY, other copies of the pouch (run 30 found the save itself is the one written)

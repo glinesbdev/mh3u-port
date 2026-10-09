@@ -163,7 +163,10 @@ extern uint32_t g_enter;
 void rt_enter(Ctx *c, uint32_t function);
 extern volatile uint32_t g_last_fn;
 extern uint32_t g_enter_lr;
-#define ENTER(c, f) do { g_last_fn = (f); if ((f) == g_enter || (c)->lr == g_enter_lr) rt_enter(c, f); } while (0)
+extern uint32_t g_calls[];
+#define CALLS_BASE 0x02000000u
+#define CALLS_N (1u << 23)
+#define ENTER(c, f) do { g_last_fn = (f); { uint32_t i_ = ((uint32_t)(f) - CALLS_BASE) >> 2; if (i_ < CALLS_N) g_calls[i_]++; } if ((f) == g_enter || (c)->lr == g_enter_lr) rt_enter(c, f); } while (0)
 #else
 #define WATCH(c, a, v, n) do { } while (0)
 #define ENTER(c, f) do { } while (0)

@@ -206,7 +206,7 @@ Both need a watch build. Each press logs `[keys] F9 pressed (n)`. F9 and F10 als
 git pull; git checkout mods/hook-points-3
 .\scripts\win-build.ps1 -Watch -Out "$env:LOCALAPPDATA\mh3u\c-watch"
 $env:MH3U_WATCH = 'live'; $env:MH3U_CALLDIFF = '1'; $env:MH3U_HOOK_LOG = '1'
-.\scripts\win-run.ps1 -Out "$env:LOCALAPPDATA\mh3u\c-watch" *> "$env:USERPROFILE\Desktop\session.log"
+.\scripts\win-run.ps1 -Out "$env:LOCALAPPDATA\mh3u\c-watch" *>&1 | Out-File -Encoding utf8 "$env:USERPROFILE\Desktop\session.log"
 Remove-Item Env:MH3U_WATCH, Env:MH3U_CALLDIFF, Env:MH3U_HOOK_LOG
 ```
 
@@ -230,6 +230,21 @@ Send back `Desktop\session.log` with your notes (the order of the steps, and whi
   and the watch build's folder has its own empty wishlist. Fixed: an `MH3U_WATCH=live` run always looks for it. F10 before
   that says why, and every F9/F10 press is logged.
 
+#### Run 35 (user): the retest
+
+- **The quest's working save:** the log has no `pouch` write on the watched copy (`0x2e68e7ec`); only a memset and other
+  writes past the pouch. The quest's pouch lives somewhere else: when the quest starts, the runtime copies the whole save
+  (`[watch-host] copy: 31232 bytes at 0x2e66bd44`) into a block at **`0x2e66bd1c`** (pouch at `0x2e66bdec`, the first copy the
+  village F10 found; the quest-load code at lr `0x2165f18` clears it first). By the in-quest F10, its pouch no longer matched
+  the save's, so another copy was watched. The fix: `MH3U_WATCH_AT=0x2e66bd1c` watches that block with the save's labels from
+  the start. No F10 needed; the address was the same in every run so far.
+- **Menus:** the 10 s windows still gave only 2 -> 6 samples, which is noise. Sampling spreads over thousands of functions.
+  Watch builds now count every call exactly (a table indexed by function, `game_calls`). The call diff uses the exact deltas
+  between F9 presses and lists, first, the functions called 1–3 times **only** in the new window
+  (`once-like f_… called N times, only now`): menu-open candidates.
+- **Logs:** no `[hook]` lines (the watch build's folder was translated without them; harmless). The end of this log is
+  UTF-16; `*>` in PowerShell mixes encodings. Use `| Out-File -Encoding utf8` in the steps instead.
+
 ## Plan
 
 1. Write this doc. **(done)**
@@ -244,6 +259,6 @@ Send back `Desktop\session.log` with your notes (the order of the steps, and whi
 
 See the bottom of this file. It is updated with each commit of PR #13.
 
-- Status: run 34 found weak menu leads; F10 is fixed (the save search runs in live-watch runs). Retest of the quest-pouch part
-  pending (PR #17).
-- Next: the item-use writer from the retest; longer menu windows (10 s or more) to firm up the menu leads.
+- Status: run 35. The quest's working save is at `0x2e66bd1c`; exact call counts are in watch builds (PR #17). The item-use
+  writer and the menu hook are not found yet.
+- Next: a short run with `MH3U_WATCH_AT=0x2e66bd1c` (use items on a quest) and exact-count F9 windows around opening a menu.
