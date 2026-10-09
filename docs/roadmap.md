@@ -4,6 +4,9 @@ What comes after the current work. Order: graphics and performance, then audio (
 
 ## After audio: mod hooks and an overlay
 
+**Started in PR #11** (`overlay.md`): the overlay, read-only memory through frame snapshots, and the wishlist. Still to do: hooks
+patched in at translation time, and native in-game menus.
+
 A layer for mods that read the game without changing it:
 
 - **Read-only guest memory access**: a safe view of the game's memory for mods, with no writes (the same rule as the companion's live mode).

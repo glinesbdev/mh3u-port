@@ -13,6 +13,7 @@ mod gx2;
 pub mod input;
 mod kernel;
 mod memory;
+pub mod mods;
 mod sync;
 
 pub use fs::Roots;

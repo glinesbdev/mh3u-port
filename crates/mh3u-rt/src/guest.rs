@@ -28,6 +28,16 @@ impl Guest {
         unsafe { self.base.add(address as usize) }
     }
 
+    /// Where guest address 0 is in the host (for the mods' search thread, which reads with atomic loads).
+    pub fn base_addr(&self) -> usize {
+        self.base as usize
+    }
+
+    /// Whether the page at `address` has been touched (see `memory::touched`).
+    pub fn touched(&self, address: u32) -> bool {
+        crate::memory::touched(self.at(address))
+    }
+
     /// Copies `out.len()` bytes from the guest. The caller keeps `address + len` below 4 GiB.
     pub fn read(&self, address: u32, out: &mut [u8]) {
         debug_assert!(u64::from(address) + out.len() as u64 <= 1 << 32);

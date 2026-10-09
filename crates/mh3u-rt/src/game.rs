@@ -154,6 +154,10 @@ extern "C" fn import(c: *mut Ctx, number: u32) {
                     } else {
                         b.call_id(id, name, c, &guest);
                     }
+                    // the frame's end: what mods watch is copied here (see `mods`)
+                    if name == "gx2:GX2SwapScanBuffers" {
+                        crate::mods::on_frame(&guest);
+                    }
                 }
                 Step::Done
             }

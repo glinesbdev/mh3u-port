@@ -11,6 +11,7 @@ usage() {
 usage: scripts/run.sh [options]
   --games DIR        the folder with the [Game] and [Update] dumps ($MH3U_GAMES, else ~/Downloads/wiiu)
   --out DIR          the translated C and libgame.so ($MH3U_OUT, else ~/.local/share/mh3u/c)
+  --fullscreen       borderless fullscreen on the window's monitor (F11 or Alt+Enter toggles it while playing)
   --fps              print the FPS and the graphics timings (MH3U_FPS, MH3U_GFX_TIMES)
   --report           print the graphics report at the end (MH3U_GFX_REPORT)
   --dump DIR         write frames to DIR (MH3U_GFX_DUMP_DIR); which ones is --frames
@@ -24,11 +25,12 @@ USAGE
 repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 games="${MH3U_GAMES:-$HOME/Downloads/wiiu}"
 out="${MH3U_OUT:-$HOME/.local/share/mh3u/c}"
-fps=0 report=0 dump="" frames="2400" debug_ps="" pad_layout="" log=""
+fullscreen=0 fps=0 report=0 dump="" frames="2400" debug_ps="" pad_layout="" log=""
 while [ $# -gt 0 ]; do
     case "$1" in
         --games) games="$2"; shift 2 ;;
         --out) out="$2"; shift 2 ;;
+        --fullscreen) fullscreen=1; shift ;;
         --fps) fps=1; shift ;;
         --report) report=1; shift ;;
         --dump) dump="$2"; shift 2 ;;
@@ -75,9 +77,11 @@ if [ -z "$log" ]; then
         echo "kept the previous log as $kept"
     fi
 fi
-echo "> $tools run $games $out --window --max-imports 1000000000000"
+extra=()
+[ "$fullscreen" = 1 ] && extra+=(--fullscreen)
+echo "> $tools run $games $out --window --max-imports 1000000000000 ${extra[*]}"
 echo "log: $log"
 code=0
-"$tools" run "$games" "$out" --window --max-imports 1000000000000 2>&1 | tee -- "$log" || code=$?
+"$tools" run "$games" "$out" --window --max-imports 1000000000000 "${extra[@]}" 2>&1 | tee -- "$log" || code=$?
 echo "exit code $code; log: $log"
 exit "$code"
