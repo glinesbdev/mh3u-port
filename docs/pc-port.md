@@ -99,7 +99,8 @@ New crates, beside the existing ones (nothing is renamed):
 | `mh3u-gfx` | GX2 to `wgpu`: render state, draws, textures, the window | exists |
 | `mh3u-latte` | the GPU's shader programs, to WGSL | exists |
 | `mh3u-testkit` | the interpreter against QEMU, the translated C against the interpreter | exists |
-| `mh3u-platform` | window, input, audio, saves on disk | not made: the window is in `mh3u-gfx`, input and saves in `mh3u-rt`, no audio |
+| `mh3u-audio` | the audio system's voices and mixer, and the sound device (`cpal`) | exists (see `audio.md`) |
+| `mh3u-platform` | window, input, audio, saves on disk | not made: the window is in `mh3u-gfx`, input and saves in `mh3u-rt`, audio in `mh3u-audio` |
 | `mh3u-port` | the program: asks for the dump, runs the recompiler on first start, then the game | not made: `mh3u-tools translate`, `build-game` and `run` do it by hand |
 | `mh3u-tools` | explorers, and the commands that translate, build and run the game | exists |
 

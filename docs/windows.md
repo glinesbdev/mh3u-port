@@ -58,6 +58,8 @@ take paths as they are, brackets and all.
   (mingw-w64's own `fma`, which the msvcrt builds link because msvcrt.dll has none, is off by a bit in some cases and gives NaN for a
   finite product plus an infinity. Nothing of the port calls it: the C uses the instruction and the Rust interpreter uses the `libm`
   crate's exact `fma`, `mh3u_ppc::fused`.)
+- **A sound device** (any; WASAPI's default output is used). Nothing to install for it. `$env:MH3U_AUDIO = 'off'` runs without
+  sound (see `audio.md`).
 - **Your dump** of the game, base game and update (see the first section of `pc-port.md`).
 
 ## Build, translate, run

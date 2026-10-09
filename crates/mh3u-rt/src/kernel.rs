@@ -102,6 +102,8 @@ pub struct Kernel {
     pub procui_acquired: bool,
     /// The audio frame callbacks (`AXRegisterFrameCallback`), run every audio frame by a service thread made when the first is added.
     pub ax_callbacks: Vec<u32>,
+    /// Whether the audio thread was started.
+    pub audio_started: bool,
     /// The alarms that are set (by the address of the game's `OSAlarm`), and whether the thread that runs their handlers exists.
     pub alarms: BTreeMap<u32, Alarm>,
     pub alarm_thread: bool,
@@ -282,6 +284,7 @@ impl Kernel {
             procui_callbacks: Vec::new(),
             procui_acquired: false,
             ax_callbacks: Vec::new(),
+            audio_started: false,
             alarms: BTreeMap::new(),
             alarm_thread: false,
             alarm_user_data: BTreeMap::new(),
