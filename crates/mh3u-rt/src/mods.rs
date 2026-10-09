@@ -399,7 +399,7 @@ pub fn copies_in_masked(piece: &[u8], base: u32, pattern: &[u8], mask: &[bool], 
 pub fn cluster(copies: &[u32], span: u32) -> Option<(u32, u32)> {
     let mut best: Option<(usize, u32, u32)> = None;
     for (i, &a) in copies.iter().enumerate() {
-        let n = copies[i..].iter().take_while(|&&c| c - a <= span).count();
+        let n = copies[i..].iter().take_while(|&&c| c >= a && c - a <= span).count();
         let last = copies[i + n - 1];
         if best.is_none_or(|b| n > b.0) {
             best = Some((n, a, last));
@@ -510,7 +510,7 @@ mod write_watch_tests {
         let mut out = Vec::new();
         super::copies_in_masked(&piece2, 0x1000, &pat, &mask, &mut out);
         assert_eq!(out, vec![0x1008]);
-        assert_eq!(super::cluster(&[0x100, 0x200, 0x5000_0000, 0x300], 0x1000), Some((0x100, 0x300)));
+        assert_eq!(super::cluster(&[0x100, 0x200, 0x300, 0x5000_0000], 0x1000), Some((0x100, 0x300)));
     }
 
     #[test]
