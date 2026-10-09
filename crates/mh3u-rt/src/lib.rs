@@ -46,6 +46,23 @@ pub trait Gx2Backend: Send {
     fn call(&mut self, name: &str, c: &mut Ctx, g: &Guest);
 }
 
+/// Frames shown so far: the graphics backend counts its swaps here, so the timing reports (MH3U_GFX_TIMES) can give per-frame averages.
+pub static FRAMES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// MH3U_TIMES_WINDOW: how many seconds each timing report covers (10 when it is not set or not a number).
+pub fn times_window() -> std::time::Duration {
+    static WINDOW: std::sync::OnceLock<std::time::Duration> = std::sync::OnceLock::new();
+    *WINDOW.get_or_init(|| {
+        let secs = std::env::var("MH3U_TIMES_WINDOW").ok().and_then(|v| v.trim().parse::<f64>().ok());
+        std::time::Duration::from_secs_f64(secs.filter(|s| s.is_finite() && *s > 0.0).unwrap_or(10.0))
+    })
+}
+
+/// The frames shown since `since` (a value of [`FRAMES`]), at least one so averages can be divided by it.
+pub fn frames_since(since: u64) -> u64 {
+    FRAMES.load(std::sync::atomic::Ordering::Relaxed).saturating_sub(since).max(1)
+}
+
 /// A piece of the executable to put in the guest's memory, or to clear.
 pub struct Piece {
     pub address: u32,

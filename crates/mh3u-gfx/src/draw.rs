@@ -1501,46 +1501,92 @@ impl Gx2 {
     }
 }
 
-/// MH3U_GFX_TIMES: how long the parts of a draw take, added up and reported every ten seconds.
+/// MH3U_GFX_TIMES: how long the parts of a draw take, and how often the caches hit, added up and reported every report window
+/// (MH3U_TIMES_WINDOW seconds, ten by default) as totals and as per-frame averages (steady-state numbers to compare builds with).
 pub(crate) struct Lap {
     on: bool,
     at: std::time::Instant,
 }
 
-type LapTable = (
-    Option<std::time::Instant>,
-    std::collections::BTreeMap<&'static str, (std::time::Duration, u64)>,
-);
+#[derive(Default)]
+struct LapTable {
+    /// When the window began, and the frame count then.
+    since: Option<(std::time::Instant, u64)>,
+    times: std::collections::BTreeMap<&'static str, (std::time::Duration, u64)>,
+    counts: std::collections::BTreeMap<&'static str, u64>,
+}
 
-static LAPS: std::sync::Mutex<LapTable> = std::sync::Mutex::new((None, std::collections::BTreeMap::new()));
+static LAPS: std::sync::Mutex<LapTable> = std::sync::Mutex::new(LapTable {
+    since: None,
+    times: std::collections::BTreeMap::new(),
+    counts: std::collections::BTreeMap::new(),
+});
 
 impl Lap {
-    pub(crate) fn new() -> Lap {
+    pub(crate) fn enabled() -> bool {
         static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("MH3U_GFX_TIMES").is_some())
+    }
+
+    pub(crate) fn new() -> Lap {
+        let on = Lap::enabled();
         Lap {
-            on: *ON.get_or_init(|| std::env::var_os("MH3U_GFX_TIMES").is_some()),
+            on,
             at: std::time::Instant::now(),
         }
     }
 
+    /// Adds the time since the last mark (or since `new`) to `what`.
     pub(crate) fn mark(&mut self, what: &'static str) {
         if !self.on {
             return;
         }
         let now = std::time::Instant::now();
         let mut l = LAPS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        let e = l.1.entry(what).or_default();
+        let e = l.times.entry(what).or_default();
         e.0 += now - self.at;
         e.1 += 1;
         self.at = now;
-        let since = *l.0.get_or_insert(now);
-        if now.duration_since(since) >= std::time::Duration::from_secs(10) {
-            for (name, (d, n)) in &l.1 {
-                eprintln!("[draw times] {:>8.3} s {n:>8}  {name}", d.as_secs_f64());
-            }
-            l.1.clear();
-            l.0 = Some(now);
+        Lap::maybe_print(&mut l, now);
+    }
+
+    /// Counts `n` of `what` (cache hits and misses, calls), reported with the times.
+    pub(crate) fn count(what: &'static str, n: u64) {
+        if !Lap::enabled() {
+            return;
         }
+        let mut l = LAPS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        *l.counts.entry(what).or_default() += n;
+    }
+
+    fn maybe_print(l: &mut LapTable, now: std::time::Instant) {
+        let (since, frames_at) = *l
+            .since
+            .get_or_insert_with(|| (now, mh3u_rt::FRAMES.load(std::sync::atomic::Ordering::Relaxed)));
+        let wall = now.duration_since(since);
+        if wall < mh3u_rt::times_window() {
+            return;
+        }
+        let frames = mh3u_rt::frames_since(frames_at);
+        eprintln!(
+            "[draw times] {:.1} s, {frames} frames ({:.1} fps); total s, count, ms per frame, count per frame",
+            wall.as_secs_f64(),
+            frames as f64 / wall.as_secs_f64()
+        );
+        for (name, (d, n)) in &l.times {
+            eprintln!(
+                "[draw times] {:>8.3} s {n:>8} {:>8.3} ms {:>8.1}  {name}",
+                d.as_secs_f64(),
+                d.as_secs_f64() * 1000.0 / frames as f64,
+                *n as f64 / frames as f64
+            );
+        }
+        for (name, n) in &l.counts {
+            eprintln!("[draw counts] {n:>8} {:>8.1} per frame  {name}", *n as f64 / frames as f64);
+        }
+        l.times.clear();
+        l.counts.clear();
+        l.since = None;
     }
 }
 

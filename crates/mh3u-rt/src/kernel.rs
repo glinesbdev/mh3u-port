@@ -233,27 +233,47 @@ pub fn pass_baton(mut guard: MutexGuard<'static, Option<Kernel>>, waiting: bool)
 /// Time spent in the graphics calls, by name.
 #[derive(Default)]
 pub struct CallTimes {
-    by_name: HashMap<String, (Duration, u64)>,
-    since: Option<Instant>,
+    /// Time and calls by import number (no allocation per call).
+    by_import: Vec<(Duration, u64)>,
+    since: Option<(Instant, u64)>,
 }
 
 impl CallTimes {
-    pub fn record(&mut self, name: &str, took: Duration) {
-        let since = *self.since.get_or_insert_with(Instant::now);
-        let e = self.by_name.entry(name.to_string()).or_default();
+    /// Adds a call of import `n`; every report window (MH3U_TIMES_WINDOW, ten seconds by default) the busiest are printed, with their
+    /// time per frame, using `names` (import number to name).
+    pub fn record(&mut self, n: u32, took: Duration, names: &[String]) {
+        let (since, frames_at) = *self
+            .since
+            .get_or_insert_with(|| (Instant::now(), crate::FRAMES.load(std::sync::atomic::Ordering::Relaxed)));
+        let n = n as usize;
+        if self.by_import.len() <= n {
+            self.by_import.resize(n + 1, (Duration::ZERO, 0));
+        }
+        let e = &mut self.by_import[n];
         e.0 += took;
         e.1 += 1;
-        if since.elapsed() >= Duration::from_secs(10) {
+        if since.elapsed() >= crate::times_window() {
             let wall = since.elapsed().as_secs_f64();
-            let mut v: Vec<_> = self.by_name.iter().collect();
+            let frames = crate::frames_since(frames_at);
+            let mut v: Vec<_> = self.by_import.iter().enumerate().filter(|(_, (_, c))| *c > 0).collect();
             v.sort_by_key(|(_, (d, _))| std::cmp::Reverse(*d));
             let total: f64 = v.iter().map(|(_, (d, _))| d.as_secs_f64()).sum();
-            eprintln!("[gfx times] {wall:.1} s: {total:.1} s in graphics calls");
-            for (name, (d, n)) in v.iter().take(8) {
-                eprintln!("[gfx times]   {:>7.3} s {n:>8} calls  {name}", d.as_secs_f64());
+            eprintln!(
+                "[gfx times] {wall:.1} s, {frames} frames ({:.1} fps): {total:.1} s in graphics calls, {:.2} ms per frame",
+                frames as f64 / wall,
+                total * 1000.0 / frames as f64
+            );
+            for (i, (d, c)) in v.iter().take(8) {
+                let name = names.get(*i).map_or("?", String::as_str);
+                eprintln!(
+                    "[gfx times]   {:>7.3} s {c:>8} calls  {:>7.3} ms {:>7.1} calls per frame  {name}",
+                    d.as_secs_f64(),
+                    d.as_secs_f64() * 1000.0 / frames as f64,
+                    *c as f64 / frames as f64
+                );
             }
-            self.by_name.clear();
-            self.since = Some(Instant::now());
+            self.by_import.iter_mut().for_each(|e| *e = (Duration::ZERO, 0));
+            self.since = None;
         }
     }
 }

@@ -151,7 +151,7 @@ extern "C" fn import(c: *mut Ctx, number: u32) {
                     if k.gfx_times {
                         let t = std::time::Instant::now();
                         b.call(name, c, &guest);
-                        k.times.record(name, t.elapsed());
+                        k.times.record(number, t.elapsed(), &k.report.names);
                     } else {
                         b.call(name, c, &guest);
                     }

@@ -815,6 +815,7 @@ impl Gx2 {
             Call::SwapScanBuffers => {
                 self.present();
                 self.swaps += 1;
+                mh3u_rt::FRAMES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 if let Some((since, at)) = self.fps {
                     // the frame rate, swaps per second, every five seconds (for comparing builds)
                     let secs = since.elapsed().as_secs_f64();
@@ -990,6 +991,8 @@ impl Gx2Backend for Gx2 {
             Call::DirectCallDisplayList => {
                 // replayed by reference (a cheap shared handle, so a list that re-records itself is still safe); one scratch context for the whole list
                 let Some(calls) = self.lists.get(&c.r[3]).cloned() else { return };
+                crate::draw::Lap::count("display lists replayed", 1);
+                crate::draw::Lap::count("display list calls replayed", calls.len() as u64);
                 let mut replay = c.clone();
                 for rec in calls.iter() {
                     rec.load(&mut replay);
