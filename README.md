@@ -3,10 +3,12 @@
 A native PC port of Monster Hunter 3 Ultimate (Wii U) for Linux and Windows, in progress. **Private for now.** The game's PowerPC code
 is translated ahead of time into C, built into a library on the owner's machine, and run against a runtime in Rust that stands in for
 the console's system libraries, with the graphics on `wgpu`. It starts, reaches its character screen and the village, draws them with
-translated shaders, and reads keyboard, mouse and gamepads; much of the graphics is incomplete and there is no sound yet. Tested on
+translated shaders, and reads keyboard, mouse and gamepads, and plays the game's sound voices through `cpal` (first steps: no effects, see
+[`docs/audio.md`](docs/audio.md)); much of the graphics is incomplete. Tested on
 Linux; the Windows build is checked from Linux (see [`docs/windows.md`](docs/windows.md) for building and running it there). Read [`docs/pc-port.md`](docs/pc-port.md) for what the project is meant to be, [`docs/spikes.md`](docs/spikes.md)
 for what was measured before it was built, [`docs/performance.md`](docs/performance.md) for measured costs and open performance concerns, and [`docs/translator.md`](docs/translator.md) for how the translator, the runtime and the
-graphics work and what is not done.
+graphics work and what is not done, and [`docs/audio.md`](docs/audio.md) for the sound. On Linux, building needs the ALSA development files
+(`alsa-lib` on Arch, `libasound2-dev` on Debian and Ubuntu).
 
 **You must own the game.** This repository contains no game code and no game data, and the port will not run without your own dump of
 your own copy of the Wii U game (base game `0005000010118300` and its update `0005000e10118300`). See the first section of

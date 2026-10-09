@@ -119,58 +119,129 @@ fn simple(name: &str) -> Option<SimpleHandler> {
             c.r[3] = 0;
         },
         "nn_ac:Connect__Q2_2nn2acFv" => |_, _, c| c.r[3] = 0xffff_ffff,
-        // a voice of the audio system: only its index is looked at by the game
-        "snd_core.rpl:AXAcquireVoice" => |os, g, c| {
-            let v = os.carve(g, 0x100);
-            g.put_u32(v, os.voices);
-            os.voices += 1;
+        // the audio system (`AX`): the voices' settings go to the mixer (`mh3u-audio`), which the audio thread runs every 3 ms frame
+        // (`game::spawn_audio`); `AXInit*` and the frame callbacks are in `sync.rs`
+        "snd_core.rpl:AXAcquireVoice" | "snd_core.rpl:AXAcquireVoiceEx" => |os, g, c| {
+            let (priority, callback, context) = (c.r[3], c.r[4], c.r[5]);
+            let v = match os.free_voices.pop() {
+                Some(v) => v,
+                None => {
+                    let v = os.carve(g, AX_VOICE_SIZE);
+                    g.put_u32(v, os.voices);
+                    os.voices += 1;
+                    v
+                }
+            };
+            // the `AXVoice` the game may read: its index, state, priority, callback and context
+            g.put_u32(v + 4, 0);
+            g.put_u32(v + 0x1c, priority);
+            g.put_u32(v + 0x20, callback);
+            g.put_u32(v + 0x24, context);
+            os.ax.voices.insert(v, mh3u_audio::Voice::new());
             c.r[3] = v;
         },
         "snd_core.rpl:AXFreeVoice" => |os, _, c| {
-            os.voice_state.remove(&c.r[3]);
+            if os.ax.voices.remove(&c.r[3]).is_some() {
+                os.free_voices.push(c.r[3]);
+            }
             c.r[3] = 0;
         },
-        "snd_core.rpl:AXInit" | "snd_core.rpl:AXInitEx" => |_, _, c| c.r[3] = 0,
-        // where a voice's sample data starts, loops and ends, and where it is now (in samples)
-        "snd_core.rpl:AXSetVoiceOffsets" => |os, g, c| {
-            let (voice, at) = (c.r[3], c.r[4]);
-            let v = os.voice_state.entry(voice).or_default();
-            v.advance();
-            v.format = g.u16(at);
-            v.looping = g.u16(at + 2) != 0;
-            v.loop_offset = g.u32(at + 4);
-            v.end = g.u32(at + 8);
-            v.current = f64::from(g.u32(at + 12));
-        },
+        "snd_core.rpl:AXIsInit" => |_, _, c| c.r[3] = 1,
+        "snd_core.rpl:AXGetMaxVoices" => |_, _, c| c.r[3] = 96,
+        "snd_core.rpl:AXCheckVoiceOffsets" => |_, _, c| c.r[3] = 1,
+        "snd_core.rpl:AXGetInputSamplesPerSec" => |os, _, c| c.r[3] = os.ax.rate,
+        "snd_core.rpl:AXGetInputSamplesPerFrame" => |os, _, c| c.r[3] = os.ax.samples_per_frame() as u32,
+        "snd_core.rpl:AXGetRendererFreq" => |os, _, c| c.r[3] = u32::from(os.ax.rate == 48_000),
+        // where a voice's samples are: format, loop, and the loop, end and current offsets relative to its data
+        "snd_core.rpl:AXSetVoiceOffsets" => |os, g, c| set_offsets(os, g, c.r[3], c.r[4], g.u32(c.r[4] + 0x10)),
+        "snd_core.rpl:AXSetVoiceOffsetsEx" => |os, g, c| set_offsets(os, g, c.r[3], c.r[4], c.r[5]),
         "snd_core.rpl:AXGetVoiceOffsets" => |os, g, c| {
-            let (voice, at) = (c.r[3], c.r[4]);
-            let v = os.voice_state.entry(voice).or_default();
-            v.advance();
-            g.put_u16(at, v.format);
-            g.put_u16(at + 2, u16::from(v.looping));
-            g.put_u32(at + 4, v.loop_offset);
-            g.put_u32(at + 8, v.end);
-            g.put_u32(at + 12, v.current as u32);
+            let data = os.ax.voice(c.r[3]).data;
+            get_offsets(os, g, c.r[3], c.r[4], data);
+        },
+        "snd_core.rpl:AXGetVoiceOffsetsEx" => |os, g, c| get_offsets(os, g, c.r[3], c.r[4], c.r[5]),
+        "snd_core.rpl:AXSetVoiceCurrentOffset" => |os, _, c| set_offset(os, c.r[3], c.r[4], None, Which::Current),
+        "snd_core.rpl:AXSetVoiceCurrentOffsetEx" => |os, _, c| set_offset(os, c.r[3], c.r[4], Some(c.r[5]), Which::Current),
+        "snd_core.rpl:AXSetVoiceLoopOffset" => |os, _, c| set_offset(os, c.r[3], c.r[4], None, Which::Loop),
+        "snd_core.rpl:AXSetVoiceLoopOffsetEx" => |os, _, c| set_offset(os, c.r[3], c.r[4], Some(c.r[5]), Which::Loop),
+        "snd_core.rpl:AXSetVoiceEndOffset" => |os, _, c| set_offset(os, c.r[3], c.r[4], None, Which::End),
+        "snd_core.rpl:AXSetVoiceEndOffsetEx" => |os, _, c| set_offset(os, c.r[3], c.r[4], Some(c.r[5]), Which::End),
+        "snd_core.rpl:AXGetVoiceCurrentOffsetEx" => |os, _, c| {
+            let v = os.ax.voice(c.r[3]);
+            c.r[3] = mh3u_audio::voice::relative(v.format, c.r[4], v.current);
+        },
+        "snd_core.rpl:AXSetVoiceLoop" => |os, _, c| os.ax.voice(c.r[3]).looping = c.r[4] & 0xffff != 0,
+        "snd_core.rpl:AXGetVoiceLoopCount" => |os, _, c| c.r[3] = os.ax.voice(c.r[3]).loops,
+        "snd_core.rpl:AXIsVoiceRunning" => |os, _, c| c.r[3] = u32::from(os.ax.voice(c.r[3]).running),
+        "snd_core.rpl:AXSetVoiceState" => |os, g, c| {
+            let running = c.r[4] != 0;
+            os.ax.voice(c.r[3]).running = running;
+            g.put_u32(c.r[3] + 4, u32::from(running));
             if std::env::var_os("MH3U_TRACE_AX").is_some() {
-                eprintln!("[ax] voice {voice:#x} {v:?}");
+                eprintln!(
+                    "[ax] voice {:#x} {}: {:?}",
+                    c.r[3],
+                    if running { "on" } else { "off" },
+                    os.ax.voice(c.r[3])
+                );
             }
         },
-        "snd_core.rpl:AXSetVoiceState" => |os, _, c| {
-            let v = os.voice_state.entry(c.r[3]).or_default();
-            v.advance();
-            v.running = c.r[4] != 0;
-        },
-        // the pitch: how many samples of the voice go by per sample of the output
+        // the pitch: samples of the voice per sample of the renderer, as a float or (`AXVoiceSrc`) in 16.16 fixed point
         "snd_core.rpl:AXSetVoiceSrcRatio" => |os, _, c| {
-            let v = os.voice_state.entry(c.r[3]).or_default();
-            v.advance();
-            v.ratio = f64::from_bits(c.f[1]);
+            let ratio = f64::from_bits(c.f[1]);
+            os.ax.voice(c.r[3]).set_ratio(ratio);
+            c.r[3] = if ratio < 0.0 { 0xffff_ffff } else { 0 };
         },
         "snd_core.rpl:AXSetVoiceSrc" => |os, g, c| {
-            // the ratio is a fixed-point number with 16 fractional bits
-            let v = os.voice_state.entry(c.r[3]).or_default();
-            v.advance();
-            v.ratio = f64::from(g.u32(c.r[4])) / 65536.0;
+            let v = os.ax.voice(c.r[3]);
+            v.ratio = g.u32(c.r[4]);
+            v.frac = u32::from(g.u16(c.r[4] + 4));
+        },
+        // volumes: the voice's own (`Ve`) and its mix on each channel and bus of a device (1.15 fixed point, with a delta)
+        "snd_core.rpl:AXSetVoiceVe" => |os, g, c| {
+            os.ax.voice(c.r[3]).ve = mh3u_audio::voice::Volume {
+                volume: g.u16(c.r[4]),
+                delta: g.u16(c.r[4] + 2) as i16,
+            };
+        },
+        "snd_core.rpl:AXSetVoiceVeDelta" => |os, _, c| os.ax.voice(c.r[3]).ve.delta = c.r[4] as u16 as i16,
+        "snd_core.rpl:AXSetVoiceDeviceMix" => |os, g, c| {
+            let (voice, device, id, mix) = (c.r[3], c.r[4], c.r[5], c.r[6]);
+            os.ax.set_device_mix(voice, device, id, |channel, bus| {
+                let at = mix + (channel * 16 + bus * 4) as u32;
+                mh3u_audio::voice::Volume {
+                    volume: g.u16(at),
+                    delta: g.u16(at + 2) as i16,
+                }
+            });
+            c.r[3] = 0;
+        },
+        "snd_core.rpl:AXSetDeviceVolume" => |os, _, c| {
+            match c.r[3] {
+                0 => os.ax.tv_volume = c.r[5] as u16,
+                1 => os.ax.drc_volume = c.r[5] as u16,
+                _ => {}
+            }
+            c.r[3] = 0;
+        },
+        "snd_core.rpl:AXGetDeviceVolume" => |os, g, c| {
+            g.put_u16(c.r[5], if c.r[3] == 1 { os.ax.drc_volume } else { os.ax.tv_volume });
+            c.r[3] = 0;
+        },
+        // the ADPCM decoder's coefficients and state, and what it takes up at the loop start
+        "snd_core.rpl:AXSetVoiceAdpcm" => |os, g, c| {
+            let at = c.r[4];
+            let v = os.ax.voice(c.r[3]);
+            for k in 0..16 {
+                v.adpcm.coefs[k] = g.u16(at + 2 * k as u32) as i16;
+            }
+            v.adpcm.pred_scale = g.u16(at + 0x22);
+            v.adpcm.yn1 = g.u16(at + 0x24) as i16;
+            v.adpcm.yn2 = g.u16(at + 0x26) as i16;
+        },
+        "snd_core.rpl:AXSetVoiceAdpcmLoop" => |os, g, c| {
+            let at = c.r[4];
+            os.ax.voice(c.r[3]).adpcm_loop = (g.u16(at), g.u16(at + 2) as i16, g.u16(at + 4) as i16);
         },
         "snd_core.rpl:AXGetDeviceMode" => |_, g, c| {
             // stereo ("surround" is 2)
@@ -418,7 +489,10 @@ pub struct Os {
     /// IPC buffer pools by handle: where the next block comes from and where the pool ends.
     ipc_pools: BTreeMap<u32, (u32, u32)>,
     voices: u32,
-    voice_state: BTreeMap<u32, Voice>,
+    /// `AXVoice`s freed by the game, to be handed out again.
+    free_voices: Vec<u32>,
+    /// The audio system's voices and mixer.
+    pub ax: mh3u_audio::Ax,
     /// The buttons held at the last read of the GamePad (to tell what was just pressed).
     pub pad_before: u32,
     pad_edges: (u32, u32),
@@ -427,57 +501,80 @@ pub struct Os {
     pub started: std::time::Instant,
 }
 
-/// What the game has told the audio system about a voice. Nothing is played yet, but the game watches how far a voice has got (to
-/// know when a sound has ended), so a running voice moves on with the time at the rate of its pitch.
-#[derive(Debug)]
-struct Voice {
-    format: u16,
-    looping: bool,
-    loop_offset: u32,
-    end: u32,
-    current: f64,
-    running: bool,
-    ratio: f64,
-    last: std::time::Instant,
+/// Lines saying which audio functions (`snd_core`, `snd_user` and their newer names) the game imports, done and not done.
+pub fn audio_imports(names: &[String]) -> Vec<String> {
+    let mut out = Vec::new();
+    for lib in ["snd_core", "snd_user", "sndcore2", "snduser2"] {
+        let mine: Vec<&String> = names.iter().filter(|n| n.split(['.', ':']).next() == Some(lib)).collect();
+        if mine.is_empty() {
+            continue;
+        }
+        let short = |n: &&String| n.rsplit(':').next().unwrap_or(n).to_string();
+        let (done, todo): (Vec<&String>, Vec<&String>) = mine.iter().partition(|n| find(n).is_some());
+        out.push(format!(
+            "[audio] {lib}: {} imported, {} done; not done: {}",
+            mine.len(),
+            done.len(),
+            if todo.is_empty() {
+                "none".into()
+            } else {
+                todo.iter().map(short).collect::<Vec<_>>().join(" ")
+            }
+        ));
+    }
+    out
 }
 
-impl Default for Voice {
-    fn default() -> Voice {
-        Voice {
-            format: 0,
-            looping: false,
-            loop_offset: 0,
-            end: 0,
-            current: 0.0,
-            running: false,
-            ratio: 1.0,
-            last: std::time::Instant::now(),
-        }
+/// The size of an `AXVoice`.
+const AX_VOICE_SIZE: u32 = 0x58;
+
+/// `AXSetVoiceOffsets(voice, offsets)` (data from the offsets) and `AXSetVoiceOffsetsEx(voice, offsets, data)`.
+fn set_offsets(os: &mut Os, g: &Guest, voice: u32, at: u32, data: u32) {
+    let v = os.ax.voice(voice);
+    v.set_offsets(g.u16(at), g.u16(at + 2) != 0, g.u32(at + 4), g.u32(at + 8), g.u32(at + 12), data);
+    if std::env::var_os("MH3U_TRACE_AX").is_some() {
+        eprintln!("[ax] voice {voice:#x} offsets {v:?}");
     }
 }
 
-/// The output's sample rate.
-const SAMPLE_RATE: f64 = 48_000.0;
+/// `AXGetVoiceOffsets` (relative to the voice's data) and `AXGetVoiceOffsetsEx` (relative to `data`).
+fn get_offsets(os: &mut Os, g: &Guest, voice: u32, at: u32, data: u32) {
+    let v = os.ax.voice(voice);
+    let rel = |p| mh3u_audio::voice::relative(v.format, data, p);
+    g.put_u16(at, v.format);
+    g.put_u16(at + 2, u16::from(v.looping));
+    g.put_u32(at + 4, rel(v.loop_at));
+    g.put_u32(at + 8, rel(v.end));
+    g.put_u32(at + 12, rel(v.current));
+    g.put_u32(at + 0x10, data);
+}
 
-impl Voice {
-    /// Moves a running voice forward to now.
-    fn advance(&mut self) {
-        let now = std::time::Instant::now();
-        let elapsed = now.duration_since(self.last).as_secs_f64();
-        self.last = now;
-        if !self.running {
-            return;
+enum Which {
+    Current,
+    Loop,
+    End,
+}
+
+/// `AXSetVoice{Current,Loop,End}Offset[Ex]`: one offset, relative to the voice's data or to `data`.
+fn set_offset(os: &mut Os, voice: u32, offset: u32, data: Option<u32>, which: Which) {
+    let v = os.ax.voice(voice);
+    let at = mh3u_audio::voice::absolute(v.format, data.unwrap_or(v.data), offset);
+    match which {
+        Which::Current => {
+            v.current = at;
+            v.restart();
         }
-        self.current += elapsed * SAMPLE_RATE * self.ratio;
-        let end = f64::from(self.end);
-        if self.current >= end {
-            if self.looping && end > f64::from(self.loop_offset) {
-                let length = end - f64::from(self.loop_offset);
-                self.current = f64::from(self.loop_offset) + (self.current - end) % length;
-            } else {
-                self.current = end;
-                self.running = false;
-            }
+        Which::Loop => v.loop_at = at,
+        Which::End => v.end = at,
+    }
+}
+
+impl mh3u_audio::Memory for Guest {
+    fn read(&self, at: u32, out: &mut [u8]) {
+        if u64::from(at) + out.len() as u64 <= 1 << 32 {
+            Guest::read(self, at, out);
+        } else {
+            out.fill(0);
         }
     }
 }
@@ -496,7 +593,8 @@ impl Os {
             next_os: OS_AREA,
             ipc_pools: BTreeMap::new(),
             voices: 0,
-            voice_state: BTreeMap::new(),
+            free_voices: Vec::new(),
+            ax: mh3u_audio::Ax::default(),
             pad_before: 0,
             pad_edges: (0, 0),
             pad_read_at: std::time::Instant::now(),
@@ -674,5 +772,85 @@ mod tests {
         assert_eq!(h.alloc(0x100, 4), 0);
         h.free(a);
         assert_eq!(h.alloc(0x100, 4), a);
+    }
+}
+
+#[cfg(test)]
+mod audio_tests {
+    use super::*;
+
+    #[test]
+    fn the_audio_imports_are_listed_with_those_not_done() {
+        let names: Vec<String> = [
+            "coreinit:memset",
+            "snd_core.rpl:AXSetVoiceVe",
+            "snd_core.rpl:AXSetVoiceLpf",
+            "snd_user.rpl:MIXSetInput",
+        ]
+        .map(String::from)
+        .to_vec();
+        let lines = audio_imports(&names);
+        assert_eq!(
+            lines,
+            [
+                "[audio] snd_core: 2 imported, 1 done; not done: AXSetVoiceLpf",
+                "[audio] snd_user: 1 imported, 0 done; not done: MIXSetInput"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_voice_is_set_up_played_and_read_back_through_the_imports() {
+        let mut memory = crate::memory::GuestMemory::reserve().expect("guest memory");
+        let g = Guest::new(memory.as_mut_ptr());
+        let mut os = Os::new(&g);
+        let call = |os: &mut Os, name: &str, r: &[u32]| -> u32 {
+            let mut c = crate::game::new_ctx(std::ptr::null_mut());
+            c.r[3..3 + r.len()].copy_from_slice(r);
+            let Some(Handler::Simple(h)) = find(name) else { panic!("{name}") };
+            h(os, &g, &mut c);
+            c.r[3]
+        };
+        let v = call(&mut os, "snd_core.rpl:AXAcquireVoice", &[31, 0, 0]);
+        assert_ne!(v, 0);
+        // PCM16 samples at 0x10000: offsets relative to it, the end at sample 99, looping from 10
+        let offsets = 0x1000;
+        g.put_u16(offsets, 0x0a);
+        g.put_u16(offsets + 2, 1);
+        g.put_u32(offsets + 4, 10);
+        g.put_u32(offsets + 8, 99);
+        g.put_u32(offsets + 12, 0);
+        g.put_u32(offsets + 0x10, 0x10000);
+        for k in 0..100u32 {
+            g.put_u16(0x10000 + 2 * k, 1000);
+        }
+        call(&mut os, "snd_core.rpl:AXSetVoiceOffsets", &[v, offsets]);
+        g.put_u16(0x1100, 0x8000);
+        call(&mut os, "snd_core.rpl:AXSetVoiceVe", &[v, 0x1100]);
+        call(&mut os, "snd_core.rpl:AXSetVoiceState", &[v, 1]);
+        assert_eq!(g.u32(v + 4), 1);
+        assert_eq!(call(&mut os, "snd_core.rpl:AXIsVoiceRunning", &[v]), 1);
+        // a frame at 32 kHz moves a voice at pitch 1 on by 96 samples: not yet at its end (sample 99)
+        let (frame, stopped) = os.ax.mix_frame(&g);
+        assert!(stopped.is_empty());
+        assert_eq!(frame.len(), 96);
+        assert!(frame[10][0] > 0.0, "a voice without a mix is heard centred");
+        call(&mut os, "snd_core.rpl:AXGetVoiceOffsets", &[v, 0x1200]);
+        assert_eq!(g.u32(0x1200 + 0x10), 0x10000);
+        let current = g.u32(0x1200 + 12);
+        assert!((10..99).contains(&current), "{current}");
+        assert_eq!(call(&mut os, "snd_core.rpl:AXGetVoiceLoopCount", &[v]), 0);
+        // the next: to the end, then twice round the 90-sample loop (samples 10 to 99)
+        os.ax.mix_frame(&g);
+        assert_eq!(call(&mut os, "snd_core.rpl:AXGetVoiceLoopCount", &[v]), 2);
+        // the current offset relative to another base
+        assert_eq!(
+            call(&mut os, "snd_core.rpl:AXGetVoiceCurrentOffsetEx", &[v, 0x10000 - 0x20]),
+            call(&mut os, "snd_core.rpl:AXGetVoiceCurrentOffsetEx", &[v, 0x10000]) + 0x10
+        );
+        // a freed voice is handed out again
+        call(&mut os, "snd_core.rpl:AXFreeVoice", &[v]);
+        assert_eq!(call(&mut os, "snd_core.rpl:AXAcquireVoice", &[31, 0, 0]), v);
+        assert!(!os.ax.voices[&v].running);
     }
 }

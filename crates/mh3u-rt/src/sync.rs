@@ -140,11 +140,27 @@ pub fn find(name: &str) -> Option<KernelHandler> {
             acquire.sort_by_key(|cb| cb.3);
             Step::Calls(acquire.iter().map(|cb| (cb.1, cb.2)).collect())
         },
-        "snd_core.rpl:AXRegisterFrameCallback" => |k, c| {
-            if k.ax_callbacks.is_empty() {
-                crate::game::spawn_audio(k);
+        // the audio system starts its frames (and the thread that mixes them) when it is set up or given a frame callback
+        "snd_core.rpl:AXInit" | "snd_core.rpl:AXInitEx" => |k, c| {
+            k.os.ax.rate = 32_000;
+            crate::game::spawn_audio(k);
+            done(c, 0)
+        },
+        "snd_core.rpl:AXInitWithParams" => |k, c| {
+            // the renderer's rate: 0 for 32 kHz, 1 for 48 kHz
+            k.os.ax.rate = if k.guest.u32(c.r[3]) == 1 { 48_000 } else { 32_000 };
+            crate::game::spawn_audio(k);
+            done(c, 0)
+        },
+        "snd_core.rpl:AXRegisterFrameCallback" | "snd_core.rpl:AXRegisterAppFrameCallback" => |k, c| {
+            crate::game::spawn_audio(k);
+            if c.r[3] != 0 && !k.ax_callbacks.contains(&c.r[3]) {
+                k.ax_callbacks.push(c.r[3]);
             }
-            k.ax_callbacks.push(c.r[3]);
+            done(c, 0)
+        },
+        "snd_core.rpl:AXDeregisterAppFrameCallback" => |k, c| {
+            k.ax_callbacks.retain(|&cb| cb != c.r[3]);
             done(c, 0)
         },
         "coreinit:OSYieldThread" => |_, _| Step::Yield,

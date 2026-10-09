@@ -477,8 +477,9 @@ Each of these was found by looking at what the game was waiting for, with the de
   stub returning 0 every shader was rejected, silently, so every draw had no shader.
 - **Input**: the game waits at its first screen for a button; see the input notes under "What it draws now". A press is reported once
   per frame (`VPADRead` is called twice a frame, and only the first call may see the edge).
-- **Audio voices** keep what the game tells `AX` (offsets, loop, pitch, state) and a running voice moves on with the time at its pitch's
-  rate: the game polls a voice's position to know when to refill its stream or that a sound ended. Nothing is mixed or played yet.
+- **Audio** (`audio.md`): the `AX` calls feed the mixer in `mh3u-audio`. The audio thread runs the game's frame callbacks and mixes a
+  3 ms frame of the voices, paced by the sound device (`cpal`). A voice's position, which the game polls to refill its streams and to
+  know that a sound ended, moves with what is mixed. `MH3U_AUDIO=off` mixes without playing.
 - **Alarms** (`OSSetAlarm`...) run their handlers on a thread of their own when they are due.
 - **Software keyboard** (`swkbd`, found at run time with `OSDynLoad_FindExport`): its functions still return 0 (`Create` returns 1).
   The character screen's name field shows a notice and then does not move on, with input reaching the game correctly (checked with
@@ -490,6 +491,6 @@ for a library built with `build-game --watch`: `MH3U_WATCH=<addr>,<len>` (every 
 return address), `MH3U_ENTER=<function>` / `MH3U_ENTER_LR=<return address>` (report entries of a function, or of whatever is called
 from a given call site), `MH3U_PROFILE=<s>` (a sampling profile of the translated code). `mh3u-tools disasm` prints readable
 PowerPC (`mh3u_ppc::format`). More: `MH3U_TRACE_FROM=<s>` (trace only after that long), `MH3U_TRACE_DYNAMIC=1` (calls of functions found
-at run time, with arguments and return address), `MH3U_TRACE_PAD=1` (what `VPADRead` returns), `MH3U_TRACE_AX=1` (voice positions),
+at run time, with arguments and return address), `MH3U_TRACE_PAD=1` (what `VPADRead` returns), `MH3U_TRACE_AX=1` (voice offsets and state changes),
 `MH3U_PRESS_DUTY=<percent>` (how long of its period `MH3U_PRESS` holds), `MH3U_PRESS_SWEEP=<s>` and `MH3U_TOUCH_SWEEP=<s>` (press every
 button, or touch a grid of points, in turn from then on), `MH3U_PAD_LAYOUT=nintendo` (gamepad face buttons with A and B, and X and Y, swapped back to the earlier mapping).

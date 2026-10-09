@@ -265,7 +265,7 @@ extern "C" fn watch(c: *mut Ctx, address: u32, value: u64, size: u32) {
     eprintln!("[watch] thread {thread}: {size} bytes at {address:#x} <- {value:#x}   (lr {lr:#x}, sp {r1:#x})");
 }
 
-fn new_ctx(mem: *mut u8) -> Ctx {
+pub(crate) fn new_ctx(mem: *mut u8) -> Ctx {
     Ctx {
         r: [0; 32],
         f: [0; 32],
@@ -303,9 +303,12 @@ pub fn spawn(k: &Kernel, t: usize) {
     });
 }
 
-/// Starts the thread that runs the audio frame callbacks every audio frame (3 ms of sound). It is a guest thread like the others: it
-/// holds the baton while it runs the game's code.
+/// Starts the audio thread (once): every 3 ms frame it runs the game's frame callbacks, then mixes the voices (`mh3u-audio`) and
+/// queues the frame for the sound device, paced by the device (or by the clock when there is none, or with `MH3U_AUDIO=off`).
 pub fn spawn_audio(k: &mut Kernel) {
+    if std::mem::replace(&mut k.audio_started, true) {
+        return;
+    }
     let t = k.threads.len();
     k.threads.push(Thread {
         addr: 0xffff_fff0,
@@ -320,11 +323,36 @@ pub fn spawn_audio(k: &mut Kernel) {
         started: true,
         last: None,
     });
-    let (call, mem) = (k.call, k.memory as usize);
+    let (call, mem, rate) = (k.call, k.memory as usize, k.os.ax.rate);
     std::thread::spawn(move || {
+        // the device is opened before the baton is waited for (it can take a while, and needs nothing of the guest)
+        let mut output = if mh3u_audio::audio_on(std::env::var("MH3U_AUDIO").ok().as_deref()) {
+            match mh3u_audio::output::Output::open(rate) {
+                Ok(o) => {
+                    eprintln!("[audio] playing on {} ({} Hz, {} channels)", o.name, o.rate, o.channels);
+                    Some(o)
+                }
+                Err(e) => {
+                    eprintln!("[audio] no sound: {e}");
+                    None
+                }
+            }
+        } else {
+            eprintln!("[audio] MH3U_AUDIO=off: the voices are mixed but not played");
+            None
+        };
+        let mut pacer = mh3u_audio::output::Pacer::new(std::time::Instant::now());
         let mut guard = kernel::wait_for_baton(lock(), t);
+        let mut wait = std::time::Duration::ZERO;
+        // frames run back to back (at most 8) while the pacer says the next is due already: the device's queue is low
+        let mut in_a_row = 0;
         loop {
-            guard = kernel::sleep_current(guard, std::time::Duration::from_millis(3));
+            if !wait.is_zero() || in_a_row == 8 {
+                // at least a moment, so that the other threads get the baton however far behind the sound is
+                guard = kernel::sleep_current(guard, wait.max(std::time::Duration::from_micros(500)));
+                in_a_row = 0;
+            }
+            in_a_row += 1;
             let callbacks = guard.as_ref().expect("kernel").ax_callbacks.clone();
             drop(guard);
             let mut c = new_ctx(mem as *mut u8);
@@ -334,6 +362,18 @@ pub fn spawn_audio(k: &mut Kernel) {
                 unsafe { call(&mut c, cb) };
             }
             guard = lock();
+            let k = guard.as_mut().expect("kernel");
+            let guest = k.guest;
+            let (frame, stopped) = k.os.ax.mix_frame(&guest);
+            // a voice that played its last sample says so in its `AXVoice`
+            for at in stopped {
+                guest.put_u32(at + 4, 0);
+            }
+            if let Some(o) = output.as_mut() {
+                o.set_renderer_rate(k.os.ax.rate);
+                o.push(&frame);
+            }
+            wait = pacer.wait(std::time::Instant::now(), output.as_ref().map(|o| o.queued()));
         }
     });
 }
@@ -458,6 +498,10 @@ pub fn run(library: &Path, pieces: &[Piece], options: Options) -> Result<Report>
     };
     let by_addr = HashMap::from([(os.thread, 0)]);
     let roots = std::mem::take(&mut options_roots);
+    // which of the audio functions the game imports are done (the to-do list for sound)
+    for line in cafe::audio_imports(&names) {
+        eprintln!("{line}");
+    }
     *lock() = Some(Kernel::new(
         os,
         guest,

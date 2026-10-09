@@ -15,6 +15,7 @@ undocumented_unsafe_blocks = "warn"
 anyhow.workspace = true
 gilrs = "0.11"
 mh3u-formats.workspace = true
+mh3u-audio.workspace = true
 libloading = "0.8"
 
 [target.'cfg(unix)'.dependencies]
