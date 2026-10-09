@@ -404,20 +404,23 @@ pub fn run(library: &Path, pieces: &[Piece], options: Options) -> Result<Report>
     let backend = options.backend.take();
     std::mem::swap(&mut options_roots, &mut options.roots);
     let options = &options;
-    let mut memory = memmap2::MmapOptions::new()
-        .len(1 << 32)
-        .map_anon()
-        .context("reserving the guest's address space")?;
+    let mut memory = crate::memory::GuestMemory::reserve()?;
     for p in pieces {
         let at = p.address as usize;
         let end = at
             .checked_add(p.bytes.len())
             .filter(|&e| e as u64 <= 1 << 32)
             .context("a piece outside the address space")?;
-        memory[at..end].copy_from_slice(&p.bytes);
+        Guest::new(memory.as_mut_ptr()).write(p.address, &p.bytes);
         // the rest is zeros already (a fresh mapping), `zero` is only the length that stays so
         ensure!(end as u64 + u64::from(p.zero) <= 1 << 32, "a piece outside the address space");
     }
+    // a Windows build of the game uses the FMA instructions for the fused multiply-adds (see ppc.h)
+    #[cfg(all(windows, target_arch = "x86_64"))]
+    ensure!(
+        std::arch::is_x86_feature_detected!("fma"),
+        "this processor has no FMA instructions, which the Windows build of the game needs (any x86-64 processor since 2013 has them)"
+    );
     // SAFETY: loading a library runs its initialisers; this one is built from the translated game and has none
     let lib = unsafe { libloading::Library::new(library) }.with_context(|| format!("loading {}", library.display()))?;
     // SAFETY: the symbols are the ones dispatch.c exports, with these signatures

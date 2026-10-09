@@ -4,7 +4,7 @@ A native PC port of Monster Hunter 3 Ultimate (Wii U) for Linux and Windows, in 
 is translated ahead of time into C, built into a library on the owner's machine, and run against a runtime in Rust that stands in for
 the console's system libraries, with the graphics on `wgpu`. It starts, reaches its character screen and the village, draws them with
 translated shaders, and reads keyboard, mouse and gamepads; much of the graphics is incomplete and there is no sound yet. Tested on
-Linux only so far. Read [`docs/pc-port.md`](docs/pc-port.md) for what the project is meant to be, [`docs/spikes.md`](docs/spikes.md)
+Linux; the Windows build is checked from Linux (see [`docs/windows.md`](docs/windows.md) for building and running it there). Read [`docs/pc-port.md`](docs/pc-port.md) for what the project is meant to be, [`docs/spikes.md`](docs/spikes.md)
 for what was measured before it was built, [`docs/performance.md`](docs/performance.md) for measured costs and open performance concerns, and [`docs/translator.md`](docs/translator.md) for how the translator, the runtime and the
 graphics work and what is not done.
 
@@ -34,7 +34,8 @@ cargo run -p mh3u-tools -- imports "/path/to/your/games folder"
 ```
 
 The first four crates started as copies of the readers in the [companion app](https://github.com/glinesbdev/mh3u-companion) (public
-domain, same author); from here on they change on their own. Run `scripts/check.sh` before every commit; there is no CI.
+domain, same author); from here on they change on their own. Run `scripts/check.sh` (on Windows, `scripts\check.ps1`) before every
+commit; there is no CI.
 
 ## Licence
 

@@ -283,6 +283,19 @@ pub struct Run {
     pub after: Vec<St>,
 }
 
+/// Marks the program QEMU is given as executable (QEMU reads it itself, so this is a courtesy where the system has the bit at all).
+#[cfg(unix)]
+fn make_executable(path: &std::path::Path) -> Result<(), String> {
+    let mut perms = std::fs::metadata(path).map_err(|e| e.to_string())?.permissions();
+    std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o755);
+    std::fs::set_permissions(path, perms).map_err(|e| e.to_string())
+}
+
+#[cfg(not(unix))]
+fn make_executable(_path: &std::path::Path) -> Result<(), String> {
+    Ok(())
+}
+
 /// Run `test` on each of the `cases` on QEMU's 750.
 pub fn run_qemu(test: &[u32], cases: &[St], tag: &str) -> Result<Run, String> {
     let (code, _) = stub(test, cases.len());
@@ -291,9 +304,7 @@ pub fn run_qemu(test: &[u32], cases: &[St], tag: &str) -> Result<Run, String> {
     std::fs::File::create(&path)
         .and_then(|mut f| f.write_all(&image))
         .map_err(|e| e.to_string())?;
-    let mut perms = std::fs::metadata(&path).map_err(|e| e.to_string())?.permissions();
-    std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o755);
-    std::fs::set_permissions(&path, perms).map_err(|e| e.to_string())?;
+    make_executable(&path)?;
     let out = Command::new("qemu-ppc-static")
         .args(["-cpu", "750"])
         .arg(&path)
@@ -336,9 +347,7 @@ pub fn run_raw(code: &[u32], cases: &[St], tag: &str) -> Result<(Option<i32>, Ve
     std::fs::File::create(&path)
         .and_then(|mut f| f.write_all(&image))
         .map_err(|e| e.to_string())?;
-    let mut perms = std::fs::metadata(&path).map_err(|e| e.to_string())?.permissions();
-    std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o755);
-    std::fs::set_permissions(&path, perms).map_err(|e| e.to_string())?;
+    make_executable(&path)?;
     let out = Command::new("qemu-ppc-static")
         .args(["-cpu", "750"])
         .arg(&path)

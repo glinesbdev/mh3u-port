@@ -11,6 +11,7 @@ mod guest;
 mod gx2;
 pub mod input;
 mod kernel;
+mod memory;
 mod sync;
 
 pub use fs::Roots;

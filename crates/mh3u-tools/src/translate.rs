@@ -194,12 +194,18 @@ mod tests {
     /// address, and nothing else. Built and run with the system C compiler (skipped without one).
     #[test]
     fn game_call_finds_every_function_and_import_and_nothing_else() {
-        let Some(cc) = ["clang", "cc", "gcc"]
-            .into_iter()
-            .find(|c| Command::new(c).arg("--version").output().is_ok_and(|o| o.status.success()))
-        else {
-            eprintln!("skipped: no C compiler");
-            return;
+        // MH3U_TEST_CFLAGS and MH3U_TEST_RUNNER as in mh3u-testkit's c_diff (such as --target=x86_64-w64-windows-gnu and wine)
+        let extra: Vec<String> = std::env::var("MH3U_TEST_CFLAGS")
+            .unwrap_or_default()
+            .split_whitespace()
+            .map(str::to_string)
+            .collect();
+        let tc = match mh3u_recomp::toolchain::Toolchain::detect(&extra) {
+            Ok(tc) => tc,
+            Err(e) => {
+                eprintln!("skipped: {e}");
+                return;
+            }
         };
         // functions close together, as in the game, and spread out; trampolines after them, one at a function's address
         let mut starts: Vec<u32> = (0..3000u32).map(|k| 0x0200_0020 + 4 * (k * k % 7919 + 3 * k)).collect();
@@ -226,14 +232,17 @@ mod tests {
              while (scanf(\"%x\", &a) == 1) { Ctx c = {0}; int ok = game_call(&c, a); printf(\"%d %x\\n\", ok, c.r[3]); } return 0; }\n",
         );
         std::fs::write(dir.join("main.c"), defs).unwrap();
-        let exe = dir.join(format!("prog{}", std::env::consts::EXE_SUFFIX));
-        let out = Command::new(cc)
-            .args(["-O2", "-w", "-I"])
+        let exe = dir.join(format!("prog{}", tc.exe_suffix()));
+        let out = Command::new(&tc.cc)
+            .args(["-O2", "-w"])
+            .args(&extra)
+            .arg("-I")
             .arg(&dir)
             .arg(dir.join("dispatch.c"))
             .arg(dir.join("main.c"))
             .arg("-o")
             .arg(&exe)
+            .args(tc.link_args())
             .output()
             .unwrap();
         assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
@@ -249,7 +258,17 @@ mod tests {
             *starts.last().unwrap() + 4,
         ]);
         let input: String = queries.iter().map(|q| format!("{q:x}\n")).collect();
-        let mut child = Command::new(&exe)
+        let runner = std::env::var("MH3U_TEST_RUNNER").unwrap_or_default();
+        let mut words = runner.split_whitespace();
+        let mut child = match words.next() {
+            Some(r) => {
+                let mut c = Command::new(r);
+                c.args(words).arg(&exe);
+                c
+            }
+            None => Command::new(&exe),
+        };
+        let mut child = child
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .spawn()

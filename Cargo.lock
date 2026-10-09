@@ -1007,6 +1007,9 @@ version = "0.1.0"
 [[package]]
 name = "mh3u-ppc"
 version = "0.1.0"
+dependencies = [
+ "libm",
+]
 
 [[package]]
 name = "mh3u-recomp"
@@ -1024,6 +1027,7 @@ dependencies = [
  "libloading",
  "memmap2",
  "mh3u-formats",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

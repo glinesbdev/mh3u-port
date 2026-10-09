@@ -6,6 +6,7 @@
 //! hardware's estimate tables for `fres` and `frsqrte` (the exact reciprocal is used: within the hardware's stated error), and paired
 //! singles, which are in `paired.rs`.
 
+use crate::fused::{fma, fmaf};
 use crate::insn::{Insn, Op};
 
 /// What an instruction stopped the program for.
@@ -777,14 +778,14 @@ impl Cpu {
             Fsub => self.set_f(rd, canonical(a - b, &[a, b])),
             Fmul => self.set_f(rd, canonical(a * c, &[a, c])),
             Fdiv => self.set_f(rd, canonical(a / b, &[a, b])),
-            Fmadd => self.set_f(rd, canonical(a.mul_add(c, b), &[a, c, b])),
-            Fmsub => self.set_f(rd, canonical(a.mul_add(c, -b), &[a, c, b])),
+            Fmadd => self.set_f(rd, canonical(fma(a, c, b), &[a, c, b])),
+            Fmsub => self.set_f(rd, canonical(fma(a, c, -b), &[a, c, b])),
             Fnmadd => {
-                let r = canonical(a.mul_add(c, b), &[a, c, b]);
+                let r = canonical(fma(a, c, b), &[a, c, b]);
                 self.set_f(rd, if r.is_nan() { r } else { -r });
             }
             Fnmsub => {
-                let r = canonical(a.mul_add(c, -b), &[a, c, b]);
+                let r = canonical(fma(a, c, -b), &[a, c, b]);
                 self.set_f(rd, if r.is_nan() { r } else { -r });
             }
             Fadds | Fsubs | Fmuls | Fdivs | Fmadds | Fmsubs | Fnmadds | Fnmsubs => {
@@ -795,8 +796,8 @@ impl Cpu {
                     Fsubs => (x - y, vec![x, y]),
                     Fmuls => (x * z, vec![x, z]),
                     Fdivs => (x / y, vec![x, y]),
-                    Fmadds | Fnmadds => (x.mul_add(z, y), vec![x, z, y]),
-                    _ => (x.mul_add(z, -y), vec![x, z, y]),
+                    Fmadds | Fnmadds => (fmaf(x, z, y), vec![x, z, y]),
+                    _ => (fmaf(x, z, -y), vec![x, z, y]),
                 };
                 let r = canonical32(r, &used);
                 let r = if matches!(insn.op, Fnmadds | Fnmsubs) && !r.is_nan() {

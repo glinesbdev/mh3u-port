@@ -1,0 +1,5 @@
+# mul_add calls the C library's fma when the target has no FMA, and Windows' is not exact: use mh3u_ppc::fused instead.
+disallowed-methods = [
+    { path = "f64::mul_add", reason = "not correctly rounded on every platform; use mh3u_ppc::fused::fma" },
+    { path = "f32::mul_add", reason = "not correctly rounded on every platform; use mh3u_ppc::fused::fmaf" },
+]

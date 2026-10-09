@@ -100,6 +100,8 @@ pub struct Gx2 {
     pub(crate) last_tv_source: u32,
     save_every: u32,
     pub(crate) fetch_shaders: HashMap<u32, Vec<crate::draw::AttribStream>>,
+    /// With MH3U_FPS set: when the frame rate was last printed, and the swap count then.
+    fps: Option<(Instant, u32)>,
 }
 
 /// The texture format of a `GX2SurfaceFormat` of a colour buffer.
@@ -230,6 +232,7 @@ impl Gx2 {
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(120),
             fetch_shaders: HashMap::new(),
+            fps: std::env::var_os("MH3U_FPS").map(|_| (Instant::now(), 0)),
         }
     }
 
@@ -763,6 +766,14 @@ impl Gx2 {
             "gx2:GX2SwapScanBuffers" => {
                 self.present();
                 self.swaps += 1;
+                if let Some((since, at)) = self.fps {
+                    // the frame rate, swaps per second, every five seconds (for comparing builds)
+                    let secs = since.elapsed().as_secs_f64();
+                    if secs >= 5.0 {
+                        eprintln!("[fps] {:.1}", f64::from(self.swaps - at) / secs);
+                        self.fps = Some((Instant::now(), self.swaps));
+                    }
+                }
                 if let Some(dir) = std::env::var_os("MH3U_GFX_SAVE").filter(|_| self.swaps.is_multiple_of(self.save_every)) {
                     self.save_tv(std::path::Path::new(&dir));
                 }

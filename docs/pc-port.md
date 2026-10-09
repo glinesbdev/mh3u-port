@@ -58,8 +58,8 @@ Not goals:
 - The recompiled game itself (see below) is generated code, and **it is generated as C**, not Rust. It is made on the owner's machine
   from their own files, so no generated code is ever stored in or shipped from this repository. We measured it (`docs/spikes.md`,
   spike 4): the same code builds about four times faster as C and takes a tenth of the memory, where one Rust crate of the whole game
-  would need about 59 GB to compile. The owner needs a C compiler (`cc` on Linux; on Windows the Visual Studio build tools, which Rust
-  needs anyway). Everything else, including the program that runs the generated code, is Rust.
+  would need about 59 GB to compile. The owner needs a C compiler: clang or gcc on Linux, clang on Windows (a MinGW-style
+  clang such as llvm-mingw, or the LLVM installer's with the Visual Studio build tools; see `docs/windows.md`). Everything else, including the program that runs the generated code, is Rust.
 
 ## Approach
 

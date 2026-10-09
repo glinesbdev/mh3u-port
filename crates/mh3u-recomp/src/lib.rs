@@ -10,6 +10,7 @@
 //! fixed-point exception registers stay in the `Ctx`; `c` is `restrict`, so guest stores (through `c->mem`) are known not to touch it.
 
 pub mod discover;
+pub mod toolchain;
 
 use mh3u_ppc::{Insn, Op};
 use std::collections::{BTreeMap, BTreeSet};

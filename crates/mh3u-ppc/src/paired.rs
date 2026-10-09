@@ -5,6 +5,7 @@
 //! QEMU has none of this, so there is no second implementation to compare with: the meaning is from the architecture manual and the
 //! tests below are values worked out by hand from it. (The translated C is compared with this, which catches slips in either.)
 
+use crate::fused::fmaf;
 use crate::insn::{Insn, Op};
 use crate::interp::{Cpu, Memory, Stop};
 
@@ -150,8 +151,8 @@ impl Cpu {
                         PsSub => (a - b, vec![a, b]),
                         PsMul => (a * c, vec![a, c]),
                         PsDiv => (a / b, vec![a, b]),
-                        PsMadd | PsNmadd => (a.mul_add(c, b), vec![a, c, b]),
-                        _ => (a.mul_add(c, -b), vec![a, c, b]),
+                        PsMadd | PsNmadd => (fmaf(a, c, b), vec![a, c, b]),
+                        _ => (fmaf(a, c, -b), vec![a, c, b]),
                     };
                     let r = canonical32(r, &used);
                     let r = if matches!(insn.op, PsNmadd | PsNmsub) && !r.is_nan() {
@@ -171,7 +172,7 @@ impl Cpu {
                     let (r, used): (f32, Vec<f32>) = if matches!(insn.op, PsMuls0 | PsMuls1) {
                         (a * c, vec![a, c])
                     } else {
-                        (a.mul_add(c, b), vec![a, c, b])
+                        (fmaf(a, c, b), vec![a, c, b])
                     };
                     self.set_half(rd, i, canonical32(r, &used));
                 }

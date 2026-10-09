@@ -35,7 +35,7 @@ memory, see `docs/spikes.md`) is planned.
 
 `mh3u-recomp` writes C for each function: every instruction is a few statements using the helpers of `ppc.h` (the registers in a `Ctx`,
 loads and stores through a base pointer, the carry and overflow rules, the condition register). `tests/c_diff.rs` translates every
-instruction word of the same random cases, compiles them all into one program with the system C compiler (clang, cc or gcc), runs the
+instruction word of the same random cases, compiles them all into one program with the C compiler `build-game` would use, runs the
 program on the same states and compares with the interpreter bit for bit: 1,320 words, every branch form that stays inside a
 function, and the reservation pair. Together with the first part this is a chain: translated C = interpreter = QEMU. Two more tests
 there check what the interpreter cannot: that the registers reach the runtime's hooks (`rt_call`, `rt_jump`, `rt_syscall`, whose test
@@ -103,12 +103,21 @@ before the registers moved into locals). The flags come from `mh3u_recomp::CFlag
 and an add that the PowerPC rounds twice, which it would do on a machine with FMA). Two choices are opt-in: `--native` adds
 `-march=native` (faster on this machine; the library may not run on another), and `--lto` adds `-flto=thin` to the compiles and the
 link (clang and `ld.lld` are needed; the link does the code generation, so it takes longer). `MH3U_CC` picks the compiler (clang,
-then `cc`, then `gcc` otherwise) and `MH3U_CFLAGS` adds flags to every compile and the link. `MH3U_TEST_CFLAGS` adds flags to the
-`c_diff.rs` tests, to check a build such as `-march=native` against the interpreter.
+then `cc`, then `gcc` otherwise; clang, then `gcc` on Windows, where `cl` and `clang-cl` are refused because the C uses clang's
+extensions) and `MH3U_CFLAGS` adds flags to every compile and the link. `mh3u_recomp::toolchain` asks the compiler for its target
+(`-dumpmachine`, so a `--target=` in `MH3U_CFLAGS` cross-compiles) and chooses what the target needs: `-fPIC -fvisibility=hidden` and
+`-lm` for a shared object, nothing of those for `game.dll` (which exports through `GAME_API`) and lld for clang's link. On Windows
+`ppc.h` does the fused multiply-adds with the FMA instruction, because some MinGW C libraries' `fma` is off by a bit
+(mingw-w64's own, in its msvcrt builds); `run` checks for FMA there. The interpreter does them with the `libm` crate's `fma` and
+`fmaf` (`mh3u_ppc::fused`), never `mul_add`, which calls the C library's (`clippy.toml` forbids it). `MH3U_TEST_CFLAGS` adds flags to the `c_diff.rs` tests and the dispatch test, to check a
+build such as `-march=native` against the interpreter, and `MH3U_TEST_RUNNER` starts their programs through another (with
+`MH3U_TEST_CFLAGS=--target=x86_64-w64-windows-gnu` and `MH3U_TEST_RUNNER=wine` they check the Windows build of the C from Linux).
+Building on Windows: `docs/windows.md`.
 
 ## Running it (`mh3u-rt`, `mh3u-tools run`)
 
-`mh3u-rt` is the only crate with `unsafe`. It reserves the guest's 4 GiB address space, puts the executable's sections in it, loads the
+`mh3u-rt` is the only crate with `unsafe`. It reserves the guest's 4 GiB address space (`memory.rs`: one anonymous mapping on Linux;
+on Windows a `VirtualAlloc` reservation whose pages an exception handler commits 64 KiB at a time on first touch), puts the executable's sections in it, loads the
 library, and runs the entry point; every system function the game imports is a handler written in Rust (`cafe.rs` for memory, heaps
 and the C library, `sync.rs` for threads and what they wait on) or, when none is written yet, a stub that returns 0 and shows as
 `(stub)` in the report. `MH3U_TRACE=1` prints every system call with its result.
@@ -208,7 +217,8 @@ drawn but not shown). (Speed is in "Speed" above: draws are batched and their bu
 Looking at what it draws: `MH3U_GFX_SAVE=<folder>` writes the TV picture as a PPM every `MH3U_GFX_SAVE_EVERY` swaps (120 by default),
 `MH3U_GFX_SAVE_IMAGE=<hex image address>` saves a given colour buffer instead; `MH3U_GFX_SOLID=1` makes every pixel red (to see
 where the geometry is); `MH3U_GFX_DUMP=<folder>` writes shader programs and their tables as the game gave them; `MH3U_GFX_LOG=1`
-prints draw counts, the targets drawn into, and why draws were skipped.
+prints draw counts, the targets drawn into, and why draws were skipped. `MH3U_FPS=1` prints the frame rate (swaps per second) every
+five seconds, for comparing builds.
 
 ## The shaders (`mh3u-latte`: `decode.rs`, `ops.rs`, `translate.rs`)
 
