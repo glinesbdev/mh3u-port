@@ -8,6 +8,17 @@
 
 #define AI static inline __attribute__((always_inline))
 
+/* The fused multiply-adds need a correctly rounded fma. Without -mfma the compiler calls the C library's, and not every Windows one is
+   exact (Debian's mingw-w64, against msvcrt, is off by a bit in some cases; llvm-mingw's, against UCRT, is right). On Windows the
+   hardware instruction is used instead, in functions of their own because the rest is not built for FMA (the runtime checks that the
+   processor has it before it loads the library). */
+#if defined(_WIN32) && defined(__x86_64__) && !defined(__FMA__)
+__attribute__((target("fma"), noinline)) static double ppc_fma(double a, double b, double c) { return __builtin_fma(a, b, c); }
+__attribute__((target("fma"), noinline)) static float ppc_fmaf(float a, float b, float c) { return __builtin_fmaf(a, b, c); }
+#define fma ppc_fma
+#define fmaf ppc_fmaf
+#endif
+
 typedef union { uint64_t u; double d; } FR;
 
 typedef struct Ctx {
