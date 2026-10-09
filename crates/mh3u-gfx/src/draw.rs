@@ -3023,6 +3023,29 @@ mod tests {
         assert_eq!(got, [1, 2, 3, 4, 5, 6]);
     }
 
+    /// The character's skinning shader (`vs-1697a580`, fetch shader `0x1d526d50`, run 7 draw 188) reads bone set 1 from R6
+    /// (`INT_TO_FLT R0.w <- R6.x`, uint8x4 location 5), sets 2 to 4 from R7, R8, R9 (uint8x4 locations 7, 8, 9) and morph deltas from
+    /// R10, R11 (sint16x4 locations 10, 11): location 6 (a signed 8-bit tangent) is not in R7. As `location + 1` R7 held the tangent,
+    /// read as bone indices (negative ones too), and vertices weighted to those bones were pulled toward the world origin.
+    #[test]
+    fn the_skinned_characters_bone_sets_skip_the_tangent() {
+        let order = [0u32, 1, 4, 5, 6, 7, 8, 9, 10, 11, 2, 3];
+        let fetch: Vec<AttribStream> = order.iter().map(|&l| stream(l, 0, 0x10a)).collect();
+        // the table the listing implies: R1..R11 <- 0, 1, 2, 3, 4, 5, 7, 8, 9, 10, 11
+        let table = Some(vec![0, 1, 2, 3, 4, 5, 7, 8, 9, 10, 11]);
+        let gpr_of = |location: u32| {
+            vertex_attributes(&table, &fetch)
+                .iter()
+                .find(|a| fetch[a.stream as usize].location == location)
+                .map(|a| a.gpr)
+        };
+        assert_eq!(gpr_of(5), Some(6));
+        assert_eq!(gpr_of(7), Some(7));
+        assert_eq!(gpr_of(9), Some(9));
+        assert_eq!(gpr_of(11), Some(11));
+        assert_eq!(gpr_of(6), None, "the tangent is not loaded");
+    }
+
     #[test]
     fn uniform_blocks_are_readable_to_the_next_256_bytes() {
         assert_eq!(readable_bytes(0), 0);

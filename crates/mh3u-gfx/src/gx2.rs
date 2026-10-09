@@ -166,6 +166,7 @@ struct Out { @builtin(position) position: vec4<f32>, @location(0) uv: vec2<f32> 
 
 impl Gx2 {
     pub fn new(d: Display) -> Gx2 {
+        eprintln!("[gfx] build {}", crate::BUILD);
         let size = d
             .window
             .as_ref()

@@ -201,6 +201,15 @@ pipelines; with no table it is `location + 1` as before. The characters' shaders
 is why they were right. `draws.txt` now shows each draw's semantic table, the registers the attributes go to, the vertex output
 semantics and which output each pixel input takes.
 
+**3j. Run 7: the dump was not made by 0204bae, and the streaks.** Run 7's `draws.txt` has no "vertex semantic table" lines, which
+0204bae writes for every draw, so the binary that made it predates the fix (it does have c5d6ec1's uniform blocks). The streaks
+toward the world origin come from the same register mapping: the character's skinning shader `vs-1697a580` (draw 188, fetch
+shader `0x1d526d50`: locations 0, 1, 4, 5, 6, 7, 8, 9, 10, 11, 2, 3) reads bone indices and weights from R6 to R9
+(`INT_TO_FLT`, then `x 3` and `+6..+8` as rows of uniform block 1 fetched by index) and morph deltas from R10/R11; as
+`location + 1` R7 held location 6, a signed 8-bit tangent, so the second bone set used indices from it (negative ones clamp to the
+end of the block, which reads zero rows) and those vertices went to (0, 0, 0). The builds now print their commit (`[gfx] build
+<hash>` at start, and the first line of `draws.txt`), so a run can be matched to its code.
+
 ## 4. Does the generated code compile in a reasonable time? (done: as C yes, as one Rust crate no)
 
 `mh3u-tools codegen-bench <dump> <out> --lang rust|c --functions N` translates an even sample of the game's functions (found as the

@@ -302,6 +302,8 @@ with their text and the cloth background, upright, in the right places (the hunt
     its sampler's settings, marks a texture that is a buffer drawn earlier in the frame (`[the colour buffer of draws a-b of this
     frame]`), and shows its uniform blocks (the pixel shader's first 32 vec4s, the vertex shader's first 16, as floats and as hex
     words); `targets.txt` is the frame's render-target chain (each image drawn into, by which draws, and which draws sampled it).
+  - **Build stamp**: the log's `[gfx] build <commit>` line and the first line of each `draws.txt` name the commit the binary was
+    built from (`+changes` when the working tree differed).
   - **Pixel shader override**: `MH3U_GFX_DEBUG_PS=<mode>` replaces what pixel shaders put out (after the program, with no alpha test),
     to tell apart where a wrong picture comes from; `MH3U_GFX_DEBUG_PS_ONLY=<hex addresses>` limits it to those shaders. Modes:
     `white` (the geometry: what is covered), `alpha1` (the program's colour made opaque: a picture that appears means the alpha was

@@ -319,6 +319,7 @@ impl Diagnostics {
             let _ = std::fs::create_dir_all(self.dump_dir.join("shaders"));
             let _ = std::fs::create_dir_all(self.dump_dir.join("textures"));
             self.draws_text.clear();
+            let _ = writeln!(self.draws_text, "build {}", crate::BUILD);
             self.targets_written.clear();
             self.targets_sampled.clear();
             self.draw_index = 0;
