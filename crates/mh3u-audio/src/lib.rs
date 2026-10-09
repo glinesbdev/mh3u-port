@@ -8,6 +8,7 @@
 //! the game's frame callbacks have run.
 
 pub mod adpcm;
+pub mod fx;
 pub mod mixer;
 pub mod output;
 pub mod voice;

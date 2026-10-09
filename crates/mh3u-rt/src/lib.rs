@@ -4,6 +4,7 @@
 //! code indexes with 32-bit guest addresses) and the calls into the translated library. Everything the game is made of comes from the
 //! owner's own files at run time; nothing of it is in this repository.
 
+mod axfx;
 mod cafe;
 mod fs;
 mod game;

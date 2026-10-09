@@ -58,6 +58,9 @@ pub struct Voice {
     /// Whether the game ever gave it a device mix (a voice without one is played centred: see `Ax::mix_frame`).
     pub mixed: bool,
     pub loops: u32,
+    /// The one-pole low-pass filter (`AXSetVoiceLpf`): on, its coefficients (Q15: y = a0 x + b0 y1) and its last output.
+    pub lpf: Option<(u16, u16)>,
+    pub lpf_y: f32,
     /// The samples either side of the read position (the output is between them, at `frac`), and whether they were read.
     prev: i16,
     next: i16,
@@ -101,6 +104,8 @@ impl Default for Voice {
             drc: [[Volume::default(); BUSES]; DRC_CHANNELS],
             mixed: false,
             loops: 0,
+            lpf: None,
+            lpf_y: 0.0,
             prev: 0,
             next: 0,
             primed: false,
@@ -189,9 +194,9 @@ impl Voice {
         Some(s)
     }
 
-    /// One frame of the voice: `out.len()` samples at the renderer's rate, at its pitch (linear between samples) and with its Ve
-    /// volume. Zeros once it has stopped.
-    pub fn render(&mut self, m: &impl Memory, out: &mut [f32]) {
+    /// One frame of the voice: `out.len()` samples at the renderer's rate, at its pitch (linear between samples), through its low-pass
+    /// filter (with `fx`) and with its Ve volume. Zeros once it has stopped.
+    pub fn render(&mut self, m: &impl Memory, out: &mut [f32], fx: bool) {
         out.fill(0.0);
         if !self.running {
             return;
@@ -209,7 +214,11 @@ impl Voice {
                 break;
             }
             let f = self.frac as f32 / 65536.0;
-            let s = f32::from(self.prev) + (f32::from(self.next) - f32::from(self.prev)) * f;
+            let mut s = f32::from(self.prev) + (f32::from(self.next) - f32::from(self.prev)) * f;
+            if fx && let Some((a0, b0)) = self.lpf {
+                s = (f32::from(a0) * s + f32::from(b0) * self.lpf_y) / 32768.0;
+                self.lpf_y = s;
+            }
             let gain = (f32::from(ve.volume) + f32::from(ve.delta) * i as f32).clamp(0.0, 65535.0) / 32768.0;
             *o = s * gain;
             self.frac += self.ratio;
@@ -281,7 +290,7 @@ pub(crate) mod tests {
         v.ve = unity();
         v.running = true;
         let mut out = [0f32; 8];
-        v.render(&m, &mut out);
+        v.render(&m, &mut out, true);
         // the first output sample is between nothing (0) and the first sample, at fraction 0
         assert_eq!(out, [0.0, 100.0, 200.0, 300.0, 400.0, 0.0, 0.0, 0.0]);
         assert!(!v.running);
@@ -295,7 +304,7 @@ pub(crate) mod tests {
         v.ve = unity();
         v.running = true;
         let mut out = [0f32; 9];
-        v.render(&m, &mut out);
+        v.render(&m, &mut out, true);
         assert_eq!(out, [0.0, 1.0, 2.0, 3.0, 4.0, 3.0, 4.0, 3.0, 4.0]);
         assert!(v.running);
         assert_eq!(v.loops, 4);
@@ -311,7 +320,7 @@ pub(crate) mod tests {
         v.running = true;
         v.set_ratio(0.5);
         let mut out = [0f32; 6];
-        v.render(&m, &mut out);
+        v.render(&m, &mut out, true);
         assert_eq!(out, [0.0, 0.0, 0.0, 500.0, 1000.0, 1500.0]);
         let mut v2 = Voice::new();
         v2.set_offsets(PCM16, false, 0, 7, 0, 0);
@@ -319,7 +328,7 @@ pub(crate) mod tests {
         v2.running = true;
         v2.set_ratio(2.0);
         let mut out = [0f32; 4];
-        v2.render(&m, &mut out);
+        v2.render(&m, &mut out, true);
         assert_eq!(out, [0.0, 1000.0, 3000.0, 5000.0]);
     }
 
@@ -331,7 +340,7 @@ pub(crate) mod tests {
         v.ve = unity();
         v.running = true;
         let mut out = [0f32; 4];
-        v.render(&m, &mut out);
+        v.render(&m, &mut out, true);
         assert_eq!(out, [0.0, 32512.0, -32768.0, 256.0]);
     }
 
@@ -347,7 +356,7 @@ pub(crate) mod tests {
         v.ve = unity();
         v.running = true;
         let mut out = [0f32; 30];
-        v.render(&m, &mut out);
+        v.render(&m, &mut out, true);
         assert!(out[1..15].iter().all(|&s| s == 1.0), "{out:?}");
         // the second frame's header (scale 1): nibble 2 doubled
         assert!(out[15..29].iter().all(|&s| s == 4.0), "{out:?}");
@@ -368,9 +377,31 @@ pub(crate) mod tests {
         v.ve = unity();
         v.running = true;
         let mut out = [0f32; 5];
-        v.render(&m, &mut out);
+        v.render(&m, &mut out, true);
         // first pass: 1, 1; after the loop the history is the loop context's 100: 101, 101
         assert_eq!(out, [0.0, 1.0, 1.0, 101.0, 101.0]);
+    }
+
+    #[test]
+    fn the_low_pass_filter_is_one_pole_and_off_without_effects() {
+        let m = pcm16(&[10000; 8], 0);
+        let make = || {
+            let mut v = Voice::new();
+            v.set_offsets(PCM16, true, 0, 7, 0, 0);
+            v.ve = unity();
+            v.running = true;
+            // a0 = 0.25, b0 = 0.75
+            v.lpf = Some((0x2000, 0x6000));
+            v
+        };
+        let mut v = make();
+        let mut out = [0f32; 4];
+        v.render(&m, &mut out, true);
+        // the step through the filter: 0 (the first output is between nothing and the first sample), then 2500, 4375, 5781.25
+        assert_eq!(out, [0.0, 2500.0, 4375.0, 5781.25]);
+        let mut v = make();
+        v.render(&m, &mut out, false);
+        assert_eq!(out, [0.0, 10000.0, 10000.0, 10000.0]);
     }
 
     #[test]
@@ -384,7 +415,7 @@ pub(crate) mod tests {
             delta: 0x100,
         };
         let mut out = [0f32; 4];
-        v.render(&m, &mut out);
+        v.render(&m, &mut out, true);
         assert_eq!(out[1], 1000.0 * (0x4100 as f32 / 32768.0));
         assert_eq!(v.ve.volume, 0x4400);
     }

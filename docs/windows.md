@@ -59,7 +59,7 @@ take paths as they are, brackets and all.
   finite product plus an infinity. Nothing of the port calls it: the C uses the instruction and the Rust interpreter uses the `libm`
   crate's exact `fma`, `mh3u_ppc::fused`.)
 - **A sound device** (any; WASAPI's default output is used). Nothing to install for it. `$env:MH3U_AUDIO = 'off'` runs without
-  sound (see `audio.md`).
+  sound, and `$env:MH3U_AUDIO_FX = 'off'` without the reverbs and the low-pass filter (see `audio.md`).
 - **Your dump** of the game, base game and update (see the first section of `pc-port.md`).
 
 ## Build, translate, run

@@ -76,6 +76,57 @@ offset units) come from the decaf-emu sources, read for facts only: no code is t
 - **What is missing** is therefore the reverb (caves and big areas sound dry) and the low-pass filter (sounds meant to be muffled,
   such as underwater, are not).
 
+## Effects (PR #10): the low-pass filter, the auxiliary buses, the reverbs
+
+`MH3U_AUDIO_FX=off` turns the filter off and makes every reverb silent (the dry sound is unchanged), to compare.
+
+- **The voices' low-pass filter.** `AXSetVoiceLpf` takes an `AXPBLPF` (on, last output, `a0`, `b0`; the layout of the Wii's SDK,
+  which decaf does not describe), `AXSetVoiceLpfCoefs` the two coefficients. The filter is the hardware's one-pole kind,
+  `y = a0·x + b0·y₁` in Q15, after the resampling and before the voice's volume. **Exact in form**: the console's arithmetic
+  (rounding, where it saturates) is not known, so it is done in floating point. `AXComputeLpfCoefs(cutoff)` comes from a table on
+  the console. Here it is the one-pole filter 3 dB down at the cutoff at the renderer's rate, with `a0 = 1 - b0`. Close, but not
+  bit-exact.
+- **The auxiliary buses.** The mixer now keeps the TV's six channels on the main bus and on buses A, B and C, as the voices' device
+  mixes give them. The steps of each 3 ms frame:
+  1. The audio thread hands each bus whose callback the game registered (`AXRegisterAuxCallback`, read back with `AXGetAuxCallback`)
+     to that callback, as the hardware does (facts from decaf): a pointer to six channels of 32-bit samples of 16-bit range, the user
+     data, and `{channels, samples}`. The guest lock is released for the call, as for the frame callbacks.
+  2. What comes back is mixed into the main bus at the bus's return volume (1.0, or what `AXSetAuxReturnVolume` sets). A bus with no
+     callback goes back as it is (as in decaf).
+  3. `AXRegisterDeviceFinalMixCallback` is honoured for the TV: the main bus is handed over the same way before the fold-down to
+     stereo.
+
+  The GamePad's callbacks are kept but not run, because the GamePad has no output of its own.
+- **The `AXFX` reverbs**, all 37 of the game's `snd_user` imports, native in Rust (`mh3u_audio::fx`, `mh3u-rt/src/axfx.rs`).
+  - **How they are reached.** The game registers a reverb's `Callback` import as a bus's aux callback, with its reverb structure as
+    the user data. The audio thread calls that address like any callback, and the translated code's dispatch table already sends an
+    import's address to its handler. So the callback runs natively, with nothing done in the guest. `AXFXSetHooks` (the delay lines'
+    allocator) is not needed: the delay lines are the host's.
+  - **The settings** are read from the game's structure at `Init` and `Settings`:
+    - `ReverbHi`/`ReverbStd`: coloration, mix, time, damping, pre-delay (and crosstalk for Hi).
+    - The `Exp` kinds: pre-delay, fused (late) time, coloration, damping, crosstalk, early, fused and output gains.
+  - **The offsets are inferred**, not documented. decaf gives each structure's size and one offset (the pre-delay). The rest follow
+    from the Wii SDK's field order, which fits those exactly. Every value read is range-checked. If a set is not all finite and in
+    range, a default room is used. The first `Init` of each kind logs a line, so the log shows which reverbs the game uses and what
+    it set:
+    - `[audio fx] HiExp at 0x…: Params { pre_delay: …, time: … }`, the settings read;
+    - `… does not look like settings …; a default room`, when the offsets were wrong.
+  - **The `Dpl2` kinds** (four channels) use the same offsets, which may be wrong for them; the check catches that.
+    **`MultiChReverb`**'s parameters are not known at all: it is a default room on the TV's six channels.
+  - **The algorithm is approximate.** Nintendo's is not described anywhere, so this is a classic reverb driven by the same
+    parameters:
+    1. a pre-delay;
+    2. four early reflections (7–23 ms) at `early_gain`;
+    3. four damped comb filters (30–44 ms) whose feedback makes the tail fall 60 dB over `time`, with `damping` the low-pass in their
+       loop, at `late_gain`;
+    4. two allpasses whose coefficient is `coloration`;
+    5. `crosstalk` between left and right, and the output gain ("mix" or "outGain").
+
+    Each channel's delays are 2.3% longer than the previous one's, so the channels decorrelate. The output is the reverberation
+    alone, as the game expects: its dry sound is on the main bus. So the rooms are the game's, but the timbre is not Nintendo's.
+  - **Cost:** three six-channel reverbs, the most the buses can carry, take 73 µs a 3 ms frame in a release build (2.4% of one core
+    on the audio thread). In practice it is one or two stereo reverbs.
+
 ## Building
 
 - Windows: nothing more (WASAPI is part of Windows).
@@ -86,9 +137,10 @@ offset units) come from the decaf-emu sources, read for facts only: no code is t
 ## Not done yet (the plan)
 
 1. **The import list** is known (run 23, above).
-2. **The low-pass filter and the reverbs** (`AXSetVoiceLpf*`, the auxiliary buses and their callbacks, the `AXFX` reverbs): PR #10.
+2. **The low-pass filter and the reverbs**: PR #10 (above). To check in its first run: the `[audio fx]` lines (were the settings read,
+   or are the rooms the default?).
 3. **The GamePad's speaker.** Its mix is used only for voices with no TV mix. A setting could send it to the same device.
-4. **Filters and effects:** the low-pass and biquad filters per voice, then the effects.
+4. **The biquad filter** per voice (`AXSetVoiceBiquad*`), if a later import list shows the game uses it (run 23's does not).
 5. **Better resampling** if linear sounds dull at high pitches. `AXSetVoiceSrcType` asks for 4-tap filtering for some voices.
 6. **Streams and movies:** music is streamed by the game into looping voices, which should work as it is. The `h264` movies have no
    sound path yet.
