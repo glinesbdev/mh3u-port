@@ -101,12 +101,9 @@ impl Gx2 {
         }?;
         let (es, gst, copy, max_vertices) = (&entry.es, &entry.gs, entry.copy.clone(), entry.max_vertices);
         let (es_pipeline, gs_pipeline) = (&entry.es_pipeline, &entry.gs_pipeline);
-        let device = self.d.device.clone();
         let total = first + count;
-        // the vertex streams, as for any vertex shader
-        let (stream_data, meta) = self.decode_streams(g, st, fetch, 0, total.min(1 << 22), 1);
-        let va = self.arena_write(&stream_data, stream_data.len() as u64);
-        let meta_buffer = self.arena_write(&meta.iter().flatten().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>(), 256);
+        // the vertex streams, as for any vertex shader (and from the same cache: decoded and uploaded again only when they change)
+        let (va, meta_buffer) = self.cached_streams(g, st, fetch, 0, total.min(1 << 22), 1);
         let ring_in = self.arena_alloc(Role::RingIn, u64::from(total) * u64::from(es_vec4) * 16);
         // what the geometry shader does not write must read as zero (an empty triangle)
         let ring_out = self.arena_alloc(Role::Out, u64::from(count) * u64::from(max_vertices) * u64::from(gs_vec4) * 16);
@@ -114,88 +111,44 @@ impl Gx2 {
         let indices = self.arena_alloc(Role::Out, u64::from(index_count) * 4);
         let es_params = self.arena_write(&[total.to_le_bytes(), 0u32.to_le_bytes(), [0; 4], [0; 4]].concat(), 16);
         let gs_params = self.arena_write(&[count.to_le_bytes(), first.to_le_bytes(), [0; 4], [0; 4]].concat(), 16);
-        // uniform blocks of each stage
-        let mut keep: Vec<BufRef> = Vec::new();
+        // uniform blocks of each stage, and the bind groups (kept, like a draw's)
+        let mut es_consts = Vec::with_capacity(es.interface.banks.len());
         for (&bank, &len) in &es.interface.banks {
-            keep.push(self.uniform_buffer(g, &st.vertex_blocks[(bank as usize).min(15)], len));
+            es_consts.push((
+                bank,
+                self.uniform_buffer(g, &st.vertex_blocks[(bank as usize).min(15)], len).bound(),
+            ));
         }
-        let es_banks = keep.len();
+        let mut gs_consts = Vec::with_capacity(gst.interface.banks.len());
         for (&bank, &len) in &gst.interface.banks {
-            keep.push(self.uniform_buffer(g, &st.geometry_blocks[(bank as usize).min(15)], len));
+            gs_consts.push((
+                bank,
+                self.uniform_buffer(g, &st.geometry_blocks[(bank as usize).min(15)], len).bound(),
+            ));
         }
-        let es_consts: Vec<wgpu::BindGroupEntry> = es
-            .interface
-            .banks
-            .keys()
-            .enumerate()
-            .map(|(i, &bank)| wgpu::BindGroupEntry {
-                binding: bank,
-                resource: keep[i].binding(),
-            })
-            .collect();
-        let gs_consts: Vec<wgpu::BindGroupEntry> = gst
-            .interface
-            .banks
-            .keys()
-            .enumerate()
-            .map(|(i, &bank)| wgpu::BindGroupEntry {
-                binding: bank,
-                resource: keep[es_banks + i].binding(),
-            })
-            .collect();
-        let bind = |p: &wgpu::ComputePipeline, group: u32, entries: &[wgpu::BindGroupEntry]| {
-            device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: None,
-                layout: &p.get_bind_group_layout(group),
-                entries,
-            })
-        };
-        let es_g0 = bind(es_pipeline, 0, &es_consts);
-        let es_g1 = bind(
-            es_pipeline,
-            1,
-            &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: va.binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: meta_buffer.binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: ring_in.binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 5,
-                    resource: es_params.binding(),
-                },
+        let es_g0 = self.bind_group(&entry.es_layouts[0], es_consts, true);
+        let es_g1 = self.bind_group(
+            &entry.es_layouts[1],
+            vec![
+                (0, va.bound()),
+                (1, meta_buffer.bound()),
+                (2, ring_in.bound()),
+                (5, es_params.bound()),
             ],
+            true,
         );
-        let gs_g0 = bind(gs_pipeline, 0, &gs_consts);
-        let gs_g1 = bind(
-            gs_pipeline,
-            1,
-            &[
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: ring_in.binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 3,
-                    resource: ring_out.binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 4,
-                    resource: indices.binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 5,
-                    resource: gs_params.binding(),
-                },
+        let gs_g0 = self.bind_group(&entry.gs_layouts[0], gs_consts, true);
+        let gs_g1 = self.bind_group(
+            &entry.gs_layouts[1],
+            vec![
+                (2, ring_in.bound()),
+                (3, ring_out.bound()),
+                (4, indices.bound()),
+                (5, gs_params.bound()),
             ],
+            true,
         );
+        let device = self.d.device.clone();
         let enc = self
             .batch
             .pre
@@ -309,6 +262,8 @@ impl Gx2 {
                 };
                 let (es_module, gs_module, copy_module) = (module("es", es.wgsl), module("gs", gst.wgsl), module("copy", copy.wgsl));
                 let (es_pipeline, gs_pipeline) = (self.compute(&es_module), self.compute(&gs_module));
+                let es_layouts = [es_pipeline.get_bind_group_layout(0), es_pipeline.get_bind_group_layout(1)];
+                let gs_layouts = [gs_pipeline.get_bind_group_layout(0), gs_pipeline.get_bind_group_layout(1)];
                 Some(Arc::new(GeometryEntry {
                     es: Arc::new(Compiled {
                         module: es_module,
@@ -325,6 +280,8 @@ impl Gx2 {
                     max_vertices,
                     es_pipeline,
                     gs_pipeline,
+                    es_layouts,
+                    gs_layouts,
                 }))
             }
             Err(e) => {

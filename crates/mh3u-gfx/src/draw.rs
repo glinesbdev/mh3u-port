@@ -55,6 +55,9 @@ pub struct GeometryEntry {
     pub max_vertices: u32,
     pub es_pipeline: wgpu::ComputePipeline,
     pub gs_pipeline: wgpu::ComputePipeline,
+    /// The layouts of their bind groups 0 and 1, asked for once.
+    pub es_layouts: [wgpu::BindGroupLayout; 2],
+    pub gs_layouts: [wgpu::BindGroupLayout; 2],
 }
 
 /// A fetch shader's streams, shared (see `Gx2::fetch_shaders`).
@@ -914,7 +917,7 @@ impl Gx2 {
 
     /// The decoded streams of a draw on the GPU: made again only when the layout or the vertex bytes are not what they were (the bytes
     /// are hashed, so a game that changes its vertex data without telling the GPU is still followed).
-    fn cached_streams(
+    pub(crate) fn cached_streams(
         &mut self,
         g: &Guest,
         st: &State,
@@ -1169,8 +1172,11 @@ impl Gx2 {
         }
         lap.mark("target and kinds");
         let geometry = st.geometry_shader != 0 && st.shader_mode == 2;
+        // only the draws with a geometry shader have this pass, and only they are timed as it
         let geo = if geometry {
-            match self.geometry_pass(g, &st, &fetch, primitive, count, first, indexed, instances) {
+            let geo = self.geometry_pass(g, &st, &fetch, primitive, count, first, indexed, instances);
+            lap.mark("geometry pass");
+            match geo {
                 Some(x) => Some(x),
                 None => {
                     *self.caches.skipped.entry("geometry pipeline not drawn").or_default() += 1;
@@ -1180,7 +1186,6 @@ impl Gx2 {
         } else {
             None
         };
-        lap.mark("geometry pass");
         let vs = match &geo {
             Some(x) => x.copy.clone(),
             None => {
@@ -1929,14 +1934,6 @@ pub(crate) struct BufRef {
 impl BufRef {
     pub(crate) fn bound(&self) -> Bound {
         Bound::Buffer(self.buffer.clone(), self.offset, self.size)
-    }
-
-    pub(crate) fn binding(&self) -> wgpu::BindingResource<'_> {
-        wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-            buffer: &self.buffer,
-            offset: self.offset,
-            size: std::num::NonZeroU64::new(self.size),
-        })
     }
 
     pub(crate) fn slice(&self) -> wgpu::BufferSlice<'_> {
