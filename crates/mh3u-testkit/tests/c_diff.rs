@@ -5,7 +5,7 @@
 
 use mh3u_ppc::Op::{self, *};
 use mh3u_ppc::{Insn, interp::Stop};
-use mh3u_recomp::{RUNTIME_H, emit_function, function_name};
+use mh3u_recomp::{CFlags, RUNTIME_H, emit_function, function_name};
 use mh3u_testkit::harness::*;
 use mh3u_testkit::*;
 use std::collections::BTreeSet;
@@ -104,8 +104,12 @@ fn compile(src: &str, entries: &[String], tag: &str) -> Result<std::path::PathBu
     std::fs::write(dir.join("gen.c"), src).map_err(|e| e.to_string())?;
     std::fs::write(dir.join("main.c"), MAIN).map_err(|e| e.to_string())?;
     let exe = dir.join("prog");
+    // the flags the library is built with (MH3U_TEST_CFLAGS adds more, such as -march=native, to check a build for this machine)
+    let extra = std::env::var("MH3U_TEST_CFLAGS").unwrap_or_default();
     let out = Command::new(cc)
-        .args(["-O1", "-w", "-fno-strict-aliasing", "-I"])
+        .args(CFlags::default().args())
+        .args(extra.split_whitespace())
+        .args(["-w", "-I"])
         .arg(&dir)
         .arg(dir.join("gen.c"))
         .arg(dir.join("main.c"))

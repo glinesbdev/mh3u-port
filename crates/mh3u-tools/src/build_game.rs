@@ -1,7 +1,11 @@
 //! Compiling the C of `translate` into a shared library, one file at a time on every core. A C compiler must be installed (clang is the
-//! one the translated code is tested with; `cc` and `gcc` are tried after it).
+//! one the translated code is tested with; `cc` and `gcc` are tried after it; `MH3U_CC` names another).
+//!
+//! The flags that decide speed and meaning come from `mh3u_recomp::CFlags` (`-O2` by default; `--native` and `--lto` opt in), the
+//! same ones the tests compile the translated C with. `MH3U_CFLAGS` adds more, split at spaces, to every compile and to the link.
 
 use anyhow::{Context, Result, bail};
+use mh3u_recomp::CFlags;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Mutex;
@@ -11,15 +15,42 @@ pub const LIBRARY: &str = "game.dll";
 #[cfg(not(windows))]
 pub const LIBRARY: &str = "libgame.so";
 
-fn compiler() -> Result<&'static str> {
+fn works(cc: &str) -> bool {
+    Command::new(cc).arg("--version").output().is_ok_and(|o| o.status.success())
+}
+
+fn compiler() -> Result<String> {
+    if let Ok(cc) = std::env::var("MH3U_CC") {
+        return if works(&cc) { Ok(cc) } else { bail!("MH3U_CC={cc} does not run") };
+    }
     ["clang", "cc", "gcc"]
         .into_iter()
-        .find(|c| Command::new(c).arg("--version").output().is_ok_and(|o| o.status.success()))
+        .find(|c| works(c))
+        .map(str::to_string)
         .context("no C compiler found (install clang)")
 }
 
-pub fn run(dir: &Path, opt: u8, watch: bool) -> Result<()> {
+/// Whether `cc` is clang (thin LTO needs it).
+fn is_clang(cc: &str) -> bool {
+    Command::new(cc)
+        .arg("--version")
+        .output()
+        .is_ok_and(|o| String::from_utf8_lossy(&o.stdout).contains("clang"))
+}
+
+pub fn run(dir: &Path, flags: CFlags, watch: bool) -> Result<()> {
     let cc = compiler()?;
+    if flags.lto && !is_clang(&cc) {
+        bail!("--lto needs clang (and lld); {cc} is not clang");
+    }
+    let extra: Vec<String> = std::env::var("MH3U_CFLAGS")
+        .unwrap_or_default()
+        .split_whitespace()
+        .map(str::to_string)
+        .collect();
+    let mut args = flags.args();
+    args.extend(extra.iter().cloned());
+    println!("compiling with {cc} {}", args.join(" "));
     let mut sources: Vec<PathBuf> = std::fs::read_dir(dir)?
         .filter_map(|e| e.ok().map(|e| e.path()))
         .filter(|p| p.extension().is_some_and(|e| e == "c"))
@@ -38,15 +69,9 @@ pub fn run(dir: &Path, opt: u8, watch: bool) -> Result<()> {
                     // the lock is let go before the compiler runs, or the files would be built one at a time
                     let next = queue.lock().expect("queue").pop();
                     let Some(src) = next else { break };
-                    let out = Command::new(cc)
-                        .args([
-                            "-w",
-                            "-fPIC",
-                            "-fvisibility=hidden",
-                            "-fno-strict-aliasing",
-                            "-c",
-                            &format!("-O{opt}"),
-                        ])
+                    let out = Command::new(&cc)
+                        .args(["-w", "-fPIC", "-fvisibility=hidden", "-c"])
+                        .args(&args)
                         .args(if watch { vec!["-DMH3U_WATCH"] } else { vec![] })
                         .arg("-I")
                         .arg(dir)
@@ -77,8 +102,13 @@ pub fn run(dir: &Path, opt: u8, watch: bool) -> Result<()> {
         );
     }
     println!("compiled {} files in {:.0?}", sources.len(), started.elapsed());
-    let mut link = Command::new(cc);
+    let started = std::time::Instant::now();
+    let mut link = Command::new(&cc);
     link.arg("-shared").arg("-o").arg(dir.join(LIBRARY));
+    if flags.lto {
+        // the code is made at the link: it needs the optimisation flags again, and lld (which runs it on every core)
+        link.arg("-fuse-ld=lld").args(&args);
+    }
     for s in &sources {
         link.arg(s.with_extension("o"));
     }
@@ -89,6 +119,6 @@ pub fn run(dir: &Path, opt: u8, watch: bool) -> Result<()> {
             String::from_utf8_lossy(&out.stderr).chars().take(2000).collect::<String>()
         );
     }
-    println!("linked {}", dir.join(LIBRARY).display());
+    println!("linked {} in {:.0?}", dir.join(LIBRARY).display(), started.elapsed());
     Ok(())
 }

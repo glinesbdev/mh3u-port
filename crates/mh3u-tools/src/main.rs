@@ -69,11 +69,17 @@ enum Tool {
     BuildGame {
         c_dir: PathBuf,
         /// The optimisation level of the C compiler (0 builds fastest).
-        #[arg(long, default_value_t = 1)]
+        #[arg(long, default_value_t = 2)]
         opt: u8,
         /// Build with the store watch (for `run --watch`); slower.
         #[arg(long)]
         watch: bool,
+        /// Compile for this machine's processor only (`-march=native`): faster here, may not run on another machine.
+        #[arg(long)]
+        native: bool,
+        /// Optimise across files when linking (`-flto=thin`); needs clang and lld (`ld.lld`), and the link takes longer.
+        #[arg(long)]
+        lto: bool,
     },
     /// Run the game's entry point from the library built by `build-game`, and list the system functions it calls.
     Run {
@@ -252,7 +258,13 @@ fn main() -> Result<()> {
             println!("{} functions, {} files, {} bytes", r.functions, r.files, r.bytes);
             Ok(())
         }
-        Tool::BuildGame { c_dir, opt, watch } => build_game::run(&c_dir, opt, watch),
+        Tool::BuildGame {
+            c_dir,
+            opt,
+            watch,
+            native,
+            lto,
+        } => build_game::run(&c_dir, mh3u_recomp::CFlags { opt, native, lto }, watch),
         Tool::Run {
             game_dir,
             c_dir,

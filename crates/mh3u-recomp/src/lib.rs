@@ -18,6 +18,43 @@ use std::fmt::Write as _;
 /// The C header the generated code includes.
 pub const RUNTIME_H: &str = include_str!("ppc.h");
 
+/// How the generated C is compiled: the optimisation level, and two opt-in choices that make a library for this machine only
+/// (`-march=native`) or optimise across files at link time (`-flto=thin`, which needs clang and lld).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CFlags {
+    pub opt: u8,
+    pub native: bool,
+    pub lto: bool,
+}
+
+impl Default for CFlags {
+    fn default() -> CFlags {
+        CFlags {
+            opt: 2,
+            native: false,
+            lto: false,
+        }
+    }
+}
+
+impl CFlags {
+    /// The flags that decide what the generated C means and how fast it is, for compiling and (with LTO) linking. The library build
+    /// and the tests that check the C against the interpreter both use these, so what is tested is what is built.
+    ///
+    /// `-fno-strict-aliasing`: guest memory is reached through byte pointers of every type. `-ffp-contract=off`: the compiler must not
+    /// fuse a multiply and an add that the PowerPC does as two roundings (it would on a machine with FMA, so with `-march=native`).
+    pub fn args(&self) -> Vec<String> {
+        let mut v = vec![format!("-O{}", self.opt), "-fno-strict-aliasing".into(), "-ffp-contract=off".into()];
+        if self.native {
+            v.push("-march=native".into());
+        }
+        if self.lto {
+            v.push("-flto=thin".into());
+        }
+        v
+    }
+}
+
 /// What the translator needs to know about the function it is translating.
 pub struct Function<'a> {
     pub start: u32,

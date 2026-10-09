@@ -89,7 +89,14 @@ The 82,209 functions become 412 C files of 200 functions (247 MB, written in 2 s
 30,605 indirect calls and the indirect tail jumps), the table of import trampolines (an import called through a pointer reaches the
 host as an import), and the hooks that route `rt_*` to the host. Every file passes `clang -fsyntax-only`.
 
-`build-game` compiles the files on every core into a shared library (`libgame.so` / `game.dll`): 41 s at `-O0` on 24 cores.
+`build-game` compiles the files on every core into a shared library (`libgame.so` / `game.dll`): 41 s at `-O0` on 24 cores (measured
+before the registers moved into locals). The flags come from `mh3u_recomp::CFlags`, which the tests in `c_diff.rs` compile with too:
+`-O2` by default (`--opt N` changes it), `-fno-strict-aliasing`, and `-ffp-contract=off` (so that the compiler never fuses a multiply
+and an add that the PowerPC rounds twice, which it would do on a machine with FMA). Two choices are opt-in: `--native` adds
+`-march=native` (faster on this machine; the library may not run on another), and `--lto` adds `-flto=thin` to the compiles and the
+link (clang and `ld.lld` are needed; the link does the code generation, so it takes longer). `MH3U_CC` picks the compiler (clang,
+then `cc`, then `gcc` otherwise) and `MH3U_CFLAGS` adds flags to every compile and the link. `MH3U_TEST_CFLAGS` adds flags to the
+`c_diff.rs` tests, to check a build such as `-march=native` against the interpreter.
 
 ## Running it (`mh3u-rt`, `mh3u-tools run`)
 
