@@ -250,7 +250,25 @@ with their text and the cloth background, upright, in the right places (the hunt
     - Translating is limited to `MH3U_GFX_SHADER_BUDGET_MS` a frame (5 by default; `0` or `off`: no limit). The first
       translation of a frame always goes ahead. A draw that needs another is not drawn that frame (counted as "shader
       translated in a later frame"), and nothing is kept for it, so the next frame asks again. Geometry pipelines are not on
-      disk and not limited.
+      disk and not limited by it. With `MH3U_GFX_ASYNC_DECODE` on (the default), a new one is translated and its modules and
+      compute pipelines are made on a decode worker (`decode.rs`), from copies of its programs. Its draws are not drawn until it is
+      back ("geometry pipeline made in a later frame").
+  - *Decoding on workers* (`decode.rs`): first-seen texture and vertex-stream decodes may take `MH3U_GFX_DECODE_BUDGET_MS` a frame
+    on the render thread (2 by default). Past that, and for any texture with 256 KB or more of source, they go to the decode
+    workers. A worker never reads guest memory: the render thread copies what the decode reads into a `Snapshot` (for a texture,
+    `texture::sources`: the image and levels at least as big as the header says and as laid out), and the worker decodes from that.
+    A read outside the copy gives zeros and is counted ("texture reads outside what was copied"). The worker makes the GPU texture
+    too. Results are taken in at the swap (`collect_decodes`).
+    - A draw waiting for a new texture or new streams is not drawn ("texture decoded in a later frame", "vertex streams decoded in
+      a later frame"). A changed texture is drawn as it was until its new decode is back.
+    - `GX2Invalidate` over a texture being decoded marks the job stale. The result is dropped ("texture decodes dropped as
+      stale"), and that texture is decoded on the render thread from then on. A texture that cannot be read is too.
+    - A job that panics is counted ("decode jobs that panicked"). A texture or geometry pipeline whose job panics is reported as
+      not read or not translated.
+    - Streams' keys hash the bytes that are copied, so a worker's streams are always what their key names. Streams from workers
+      that age out before they are drawn are counted ("vertex streams from workers never drawn").
+    - `MH3U_GFX_ASYNC_DECODE=off` (or `0`) decodes everything on the render thread, as before. The tests do too, unless they
+      turn the workers on.
   - *Uploads*: what a batch's draws read (uniform blocks, indices, geometry parameters) is written into a copy of the arena in memory
     and uploaded with one write per arena when the batch is flushed. The vertex streams' start table lives with the cached streams,
     and the geometry draws use the stream cache too.
@@ -322,8 +340,11 @@ with their text and the cloth background, upright, in the right places (the hunt
   times]` per part of a draw, where "geometry pass" counts only the draws with a geometry shader), and `[draw counts]`: hits, checks
   and misses of the shader caches, bind groups and uniform uploads, texture decodes (and bytes), textures invalidated and
   invalidations of textures found unchanged, and the display list calls replayed and left out; "uniform bytes uploaded" and
-  "uniform blocks read by index" (the 64 KiB banks), "index list hits" and "misses", and "vertex bytes hashed". "texture decode (in
-  texture views)" and "texture upload and hash (in texture views)" are timed inside "texture views", not added to it. "index list"
+  "uniform blocks read by index" (the 64 KiB banks), "index list hits" and "misses", and "vertex bytes hashed"; and "textures
+  decoded on workers", "vertex streams decoded on workers", "geometry pipelines made on workers" and the decode counters above.
+  "texture copy and hash (in texture views)", "texture decode (in texture views)" and "texture upload and hash (in texture views)"
+  are timed inside "texture views", not added to it. "stream miss: copy for a worker" is the copy of a stream handed to a worker,
+  and "decodes from workers taken in (at the swap)" is the swap's share. "index list"
   covers the whole index path (found or made, and uploaded), and "decode streams" only the vertex streams (the indices used to be
   made relative to the lowest vertex inside it).
   `cargo test -p mh3u-gfx --release draw_bench -- --nocapture` times the same parts on wgpu's no-op device with a synthetic frame shaped
@@ -340,7 +361,9 @@ with their text and the cloth background, upright, in the right places (the hunt
   result: the text and the cloth only come out right with it. Every mip level is read (level 1 at the mip pointer, level n at the pointer plus
   the n-th offset of the header) and the sampler's filters and level-of-detail range are used. A cube map is a texture of six layers, read as
   an array: the `CUBE` instruction (which turns a direction into a face number and the face's own coordinates) is done in the shader, so the
-  lookup uses the face and coordinates as the hardware does.
+  lookup uses the face and coordinates as the hardware does. A texture is decoded from a copy of its image and levels (`decode` takes
+  any `decode::Memory`; `decode_guest` copies and decodes). Each level of 256 KB or more is split by rows between up to 8 threads,
+  and the result is the same as on one (a test checks it).
 
 - **Input** (`mh3u-rt/src/input.rs`): `VPADRead` returns what the player presses: the keyboard and mouse (window events) and gamepads
   (`gilrs`, on a thread of their own), combined in one shared state. Keys are named by position: WASD is the left stick, the arrow keys the

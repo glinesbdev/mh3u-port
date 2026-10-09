@@ -235,6 +235,36 @@ move the village on its own.
 
      These are what PR #8 (decoding on workers) is for.
 
+   **PR #8 (perf/async-decode, not yet measured in the game):** first-seen decoding moves off the render thread. This replaces
+   PR #6's choice to keep texture decodes there.
+   - *The budget.* First-seen texture and vertex-stream decodes may take `MH3U_GFX_DECODE_BUDGET_MS` a frame on the render thread
+     (2 by default). Past it, they go to decode workers (half the cores, 1 to 4 threads). Data the game rewrites every frame stays
+     inside the budget, so it is still drawn in the frame it is made. A texture with 256 KB or more of image and levels always goes
+     to a worker.
+   - *Copies, not guest memory.* The render thread copies what the decode reads (the texture's image and levels, as laid out, or
+     the vertex bytes it just hashed) and hands the copy to a worker. The worker decodes it and makes the texture (`create_texture`
+     and `write_texture` work from any thread; the writes reach the GPU at the next submit). Results are taken in once a frame, at
+     the swap.
+   - *While it is pending,* a draw needing a new texture or new streams is not drawn ("texture decoded in a later frame", "vertex
+     streams decoded in a later frame"), as with new pipelines and shaders. A texture whose memory changed keeps drawing with the
+     old texture until the new one is back.
+   - *Stale results.* `GX2Invalidate` over a texture's memory while a worker decodes it marks the job stale. Its result is dropped,
+     and that texture is decoded on the render thread from then on, so a texture the game keeps rewriting is not left waiting
+     forever. Vertex streams are keyed by a hash of the bytes copied, so a result always matches its key.
+   - *Large textures on several threads.* Each level of 256 KB or more is split by rows (all slices of it) between up to 8
+     threads, on the render thread too. This is for the loading screens' 177–179 ms of decoding 3 textures.
+   - *Geometry pipelines on workers.* With the toggle on, a new geometry pipeline is translated and its modules and two compute
+     pipelines made on a worker. Its draws wait for it ("geometry pipeline made in a later frame"). This is for frame 71's
+     36 ms `geometry pass`. A disk cache for them is left for later: the worker takes them off the frame either way.
+   - `MH3U_GFX_ASYNC_DECODE=off` puts all of this back on the render thread (the parallel decode of big levels stays).
+   - The risk is pop-in: a new area's objects and textures can appear a frame or two late, and a geometry pipeline's draws a little
+     later on a first visit.
+   - To check it: run twice (`scripts\win-run.ps1 -Fps`). `[draw counts]` should show `textures decoded on workers` and `vertex
+     streams decoded on workers` around area entries, and the `[gfx slow frame]` lines after an entry should no longer be mostly
+     `decode streams` or `texture views`. The loading screens should lose most of their ~200 ms frames, and frame 71's `geometry
+     pass` should be small. `texture decodes dropped as stale` should be rare, and `texture reads outside what was copied` and
+     `decode jobs that panicked` 0. For a comparison, run once with `$env:MH3U_GFX_ASYNC_DECODE = 'off'`.
+
 ## Fixed (for the record)
 
 - Field slowdown while standing still (runs 11–13): vertex streams made every frame were kept until 1 GiB, and wgpu's per-pass

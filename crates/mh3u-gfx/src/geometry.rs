@@ -28,17 +28,6 @@ impl Gx2 {
         code
     }
 
-    fn compute(&self, module: &wgpu::ShaderModule) -> wgpu::ComputePipeline {
-        self.d.device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some("geometry stage"),
-            layout: None,
-            module,
-            entry_point: Some("main"),
-            compilation_options: Default::default(),
-            cache: None,
-        })
-    }
-
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn geometry_pass(
         &mut self,
@@ -91,7 +80,11 @@ impl Gx2 {
         let entry = match found {
             Some((entry, _)) => entry,
             None => {
-                let entry = self.geometry_slow(g, st, fetch, ranges, es_vec4, gs_vec4);
+                let Some(entry) = self.geometry_slow(g, st, fetch, ranges, es_vec4, gs_vec4) else {
+                    // being made on a worker
+                    self.caches.waiting = Some("geometry pipeline made in a later frame");
+                    return None;
+                };
                 let hash = hash_ranges(g, &ranges);
                 self.caches
                     .geometry_front
@@ -103,7 +96,7 @@ impl Gx2 {
         let (es_pipeline, gs_pipeline) = (&entry.es_pipeline, &entry.gs_pipeline);
         let total = first + count;
         // the vertex streams, as for any vertex shader (and from the same cache: decoded and uploaded again only when they change)
-        let streams = self.cached_streams(g, st, fetch, 0, total.min(1 << 22), 1);
+        let streams = self.cached_streams(g, st, fetch, 0, total.min(1 << 22), 1)?;
         let (va, meta_buffer) = (streams.data, streams.meta);
         let ring_in = self.arena_alloc(Role::RingIn, u64::from(total) * u64::from(es_vec4) * 16);
         // what the geometry shader does not write must read as zero (an empty triangle)
@@ -185,7 +178,9 @@ impl Gx2 {
         })
     }
 
-    /// The geometry pipeline from its program bytes: translated once for each set of programs and inputs.
+    /// The geometry pipeline from its program bytes: translated once for each set of programs and inputs. None while it is made on a
+    /// worker (with `MH3U_GFX_ASYNC_DECODE` on, a new one always is: translating it and making its two compute pipelines took 36 ms
+    /// on the render thread in runs 19 and 20); Some(None) when it cannot be made.
     fn geometry_slow(
         &mut self,
         g: &Guest,
@@ -194,11 +189,12 @@ impl Gx2 {
         ranges: [(u32, u32); 3],
         es_vec4: u32,
         gs_vec4: u32,
-    ) -> Option<Arc<GeometryEntry>> {
+    ) -> Option<Option<Arc<GeometryEntry>>> {
         let (vs, gs) = (st.vertex_shader, st.geometry_shader);
         let es_code = Self::read_program(g, ranges[0]);
         let gs_code = Self::read_program(g, ranges[1]);
         let copy_code = Self::read_program(g, ranges[2]);
+        let semantics = crate::draw::vertex_semantics(g, vs);
         let key = (
             vs,
             gs,
@@ -210,68 +206,49 @@ impl Gx2 {
                 st.half_z,
                 es_vec4,
                 gs_vec4,
-                crate::draw::vertex_semantics(g, vs),
+                &semantics,
             )),
         );
         if let Some(e) = self.caches.geometry.get(&key) {
-            return e.clone();
+            return Some(e.clone());
+        }
+        if self.caches.geometry_jobs.contains(&key) {
+            return None;
         }
         self.caches.work.translated += 1;
-        let result = (|| {
-            let es_d = decode(&es_code).map_err(|e| format!("vertex shader: {e}"))?;
-            let gs_d = decode(&gs_code).map_err(|e| format!("geometry shader: {e}"))?;
-            let copy_d = decode(&copy_code).map_err(|e| format!("copy shader: {e}"))?;
-            let max_vertices = ring_extent(&gs_d).div_ceil(gs_vec4 * 4).max(1);
-            let ring = RingConfig {
-                es_vec4,
-                gs_vec4,
-                max_vertices,
-            };
-            let ctx = Context::new(&|_| TexKind::D2);
-            let attributes = crate::draw::vertex_attributes(&crate::draw::vertex_semantics(g, vs), fetch);
-            let inputs = VertexInputs {
-                attributes,
-                half_z: st.half_z,
-                ring_out_vec4: 0,
-            };
-            let es = translate_es(&es_d, &inputs, ring, &ctx).map_err(|e| format!("vertex shader: {e}"))?;
-            let gst = translate_gs(&gs_d, ring, &ctx).map_err(|e| format!("geometry shader: {e}"))?;
-            let copy_inputs = VertexInputs {
-                attributes: Vec::new(),
-                half_z: st.half_z,
-                ring_out_vec4: gs_vec4,
-            };
-            let copy = translate_vertex(&copy_d, &copy_inputs, &ctx).map_err(|e| format!("copy shader: {e}"))?;
-            Ok::<_, String>((es, gst, copy, max_vertices))
-        })();
+        let half_z = st.half_z;
+        let inputs = GeometryInputs {
+            es_code,
+            gs_code,
+            copy_code,
+            fetch: fetch.to_vec(),
+            semantics,
+            half_z,
+            es_vec4,
+            gs_vec4,
+        };
+        if self.caches.async_decode {
+            let device = self.d.device.clone();
+            self.caches.geometry_jobs.insert(key);
+            self.caches.decodes.get_or_insert_with(crate::decode::Pool::new).submit(move || {
+                crate::decode::Done::Geometry(GeometryDone {
+                    key,
+                    result: crate::decode::caught(|| make_geometry(&device, &inputs)).map(Arc::new),
+                })
+            });
+            crate::draw::Lap::count("geometry pipelines made on workers", 1);
+            return None;
+        }
+        let result = make_geometry(&self.d.device, &inputs).map(Arc::new);
+        Some(self.geometry_made(key, result))
+    }
+
+    /// Keeps a geometry pipeline (made here or on a worker), or says why it could not be made.
+    fn geometry_made(&mut self, key: (u32, u32, u64), result: Result<Arc<GeometryEntry>, String>) -> Option<Arc<GeometryEntry>> {
         let entry = match result {
-            Ok((es, gst, copy, max_vertices)) => {
-                let module = |label: &str, wgsl: String| {
-                    self.d.device.create_shader_module(wgpu::ShaderModuleDescriptor {
-                        label: Some(label),
-                        source: wgpu::ShaderSource::Wgsl(wgsl.into()),
-                    })
-                };
-                let (es_module, gs_module, copy_module) = (
-                    module("es", es.wgsl.clone()),
-                    module("gs", gst.wgsl.clone()),
-                    module("copy", copy.wgsl.clone()),
-                );
-                let (es_pipeline, gs_pipeline) = (self.compute(&es_module), self.compute(&gs_module));
-                let es_layouts = [es_pipeline.get_bind_group_layout(0), es_pipeline.get_bind_group_layout(1)];
-                let gs_layouts = [gs_pipeline.get_bind_group_layout(0), gs_pipeline.get_bind_group_layout(1)];
-                Some(Arc::new(GeometryEntry {
-                    es: Arc::new(Compiled::new(es_module, es.interface, es.wgsl)),
-                    gs: Arc::new(Compiled::new(gs_module, gst.interface, gst.wgsl)),
-                    copy: Arc::new(Compiled::new(copy_module, copy.interface, copy.wgsl)),
-                    max_vertices,
-                    es_pipeline,
-                    gs_pipeline,
-                    es_layouts,
-                    gs_layouts,
-                }))
-            }
+            Ok(e) => Some(e),
             Err(e) => {
+                let gs = key.1;
                 self.diag.untranslated(format!("geometry pipeline {gs:#x}"), &e);
                 self.caches_report(format!("geometry pipeline {gs:#x} not translated: {e}"));
                 None
@@ -280,4 +257,90 @@ impl Gx2 {
         self.caches.geometry.insert(key, entry.clone());
         entry
     }
+
+    pub(crate) fn geometry_done(&mut self, d: GeometryDone) {
+        self.caches.geometry_jobs.remove(&d.key);
+        self.geometry_made(d.key, d.result);
+    }
+}
+
+/// What a geometry pipeline is made from: copies of its programs and of what the draw tells about its inputs (so that a worker can make
+/// it without reading guest memory).
+struct GeometryInputs {
+    es_code: Vec<u8>,
+    gs_code: Vec<u8>,
+    copy_code: Vec<u8>,
+    fetch: Vec<AttribStream>,
+    semantics: Option<Vec<u32>>,
+    half_z: bool,
+    es_vec4: u32,
+    gs_vec4: u32,
+}
+
+/// A geometry pipeline made on a worker.
+pub(crate) struct GeometryDone {
+    key: (u32, u32, u64),
+    result: Result<Arc<GeometryEntry>, String>,
+}
+
+fn compute(device: &wgpu::Device, module: &wgpu::ShaderModule) -> wgpu::ComputePipeline {
+    device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+        label: Some("geometry stage"),
+        layout: None,
+        module,
+        entry_point: Some("main"),
+        compilation_options: Default::default(),
+        cache: None,
+    })
+}
+
+/// Translates a geometry pipeline's three programs and makes its shader modules and compute pipelines (on any thread).
+fn make_geometry(device: &wgpu::Device, i: &GeometryInputs) -> Result<GeometryEntry, String> {
+    let es_d = decode(&i.es_code).map_err(|e| format!("vertex shader: {e}"))?;
+    let gs_d = decode(&i.gs_code).map_err(|e| format!("geometry shader: {e}"))?;
+    let copy_d = decode(&i.copy_code).map_err(|e| format!("copy shader: {e}"))?;
+    let max_vertices = ring_extent(&gs_d).div_ceil(i.gs_vec4 * 4).max(1);
+    let ring = RingConfig {
+        es_vec4: i.es_vec4,
+        gs_vec4: i.gs_vec4,
+        max_vertices,
+    };
+    let ctx = Context::new(&|_| TexKind::D2);
+    let inputs = VertexInputs {
+        attributes: crate::draw::vertex_attributes(&i.semantics, &i.fetch),
+        half_z: i.half_z,
+        ring_out_vec4: 0,
+    };
+    let es = translate_es(&es_d, &inputs, ring, &ctx).map_err(|e| format!("vertex shader: {e}"))?;
+    let gst = translate_gs(&gs_d, ring, &ctx).map_err(|e| format!("geometry shader: {e}"))?;
+    let copy_inputs = VertexInputs {
+        attributes: Vec::new(),
+        half_z: i.half_z,
+        ring_out_vec4: i.gs_vec4,
+    };
+    let copy = translate_vertex(&copy_d, &copy_inputs, &ctx).map_err(|e| format!("copy shader: {e}"))?;
+    let module = |label: &str, wgsl: String| {
+        device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some(label),
+            source: wgpu::ShaderSource::Wgsl(wgsl.into()),
+        })
+    };
+    let (es_module, gs_module, copy_module) = (
+        module("es", es.wgsl.clone()),
+        module("gs", gst.wgsl.clone()),
+        module("copy", copy.wgsl.clone()),
+    );
+    let (es_pipeline, gs_pipeline) = (compute(device, &es_module), compute(device, &gs_module));
+    let es_layouts = [es_pipeline.get_bind_group_layout(0), es_pipeline.get_bind_group_layout(1)];
+    let gs_layouts = [gs_pipeline.get_bind_group_layout(0), gs_pipeline.get_bind_group_layout(1)];
+    Ok(GeometryEntry {
+        es: Arc::new(Compiled::new(es_module, es.interface, es.wgsl)),
+        gs: Arc::new(Compiled::new(gs_module, gst.interface, gst.wgsl)),
+        copy: Arc::new(Compiled::new(copy_module, copy.interface, copy.wgsl)),
+        max_vertices,
+        es_pipeline,
+        gs_pipeline,
+        es_layouts,
+        gs_layouts,
+    })
 }

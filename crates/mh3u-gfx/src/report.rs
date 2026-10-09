@@ -525,7 +525,7 @@ impl Diagnostics {
         if !self.written_textures.insert(h.image) {
             return format!("textures/{name}.png");
         }
-        match crate::texture::decode(g, h) {
+        match crate::texture::decode_guest(g, h) {
             Ok(d) => match d.levels.first().and_then(|l| to_rgba(d.format, l.width, l.height, &l.data)) {
                 Some(rgba) => {
                     let w = d.levels[0].width;

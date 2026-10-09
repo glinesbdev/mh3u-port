@@ -318,7 +318,26 @@ fn info(format: u32) -> Option<Info> {
 }
 
 /// Reads a texture, every level, from the guest's memory.
-pub fn decode(g: &Guest, h: &Header) -> Result<Decoded, String> {
+/// A level's laid-out place: where it starts and its size in bytes, by the same rules the game's own size calculation used (the
+/// address library's).
+struct LevelPlace {
+    base: u32,
+    laid: tiling::Info,
+    w: u32,
+    h: u32,
+    slices: u32,
+}
+
+/// What `decode` needs to know before reading: the format, the tile mode and every level's place.
+struct Plan {
+    info: Info,
+    volume: bool,
+    layers: u32,
+    height: u32,
+    places: Vec<LevelPlace>,
+}
+
+fn plan(h: &Header) -> Result<Plan, String> {
     let Some(info) = info(h.format) else {
         return Err(format!("the texture format {:#x}", h.format));
     };
@@ -336,19 +355,13 @@ pub fn decode(g: &Guest, h: &Header) -> Result<Decoded, String> {
     };
     let height = if h.dim == 0 { 1 } else { h.height.max(1) };
     let block = info.block;
-    let (pipe_swizzle, bank_swizzle) = tiling::swizzles(h.swizzle);
-    let elem_bytes = (info.bits / 8) as usize;
     let max_levels = 32 - h.width.max(height).max(if volume { layers } else { 1 }).leading_zeros();
     let count = h.mips.clamp(1, max_levels);
-    let mut levels = Vec::new();
-    let mut element = vec![0u8; elem_bytes];
-    let mut laid_pitch = 0;
+    let mut places = Vec::new();
     for level in 0..count {
         let (w, hgt) = ((h.width >> level).max(1), (height >> level).max(1));
         // a volume's slices halve with the levels; an array's layers do not
         let slices = if volume { (layers >> level).max(1) } else { layers };
-        let (bw, bh) = (w.div_ceil(block), hgt.div_ceil(block));
-        // the size as laid out, by the same rules the game's own size calculation used (the address library's)
         let laid = tiling::surface_info(&tiling::Request {
             mode,
             bits_per_element: info.bits,
@@ -362,9 +375,6 @@ pub fn decode(g: &Guest, h: &Header) -> Result<Decoded, String> {
             depth: false,
             display: false,
         });
-        if level == 0 {
-            laid_pitch = laid.pitch;
-        }
         let base = match level {
             0 => h.image,
             1 => h.mip_ptr,
@@ -373,44 +383,132 @@ pub fn decode(g: &Guest, h: &Header) -> Result<Decoded, String> {
         if base == 0 {
             break;
         }
+        places.push(LevelPlace {
+            base,
+            laid,
+            w,
+            h: hgt,
+            slices,
+        });
+    }
+    Ok(Plan {
+        info,
+        volume,
+        layers,
+        height,
+        places,
+    })
+}
+
+/// The guest ranges a decode of `h` reads, for a [`crate::decode::Snapshot`]: the image and the smaller levels, each at least as big
+/// as the header says (what the source hash covers) and as the levels laid out in it (at most 256 MiB each).
+pub fn sources(h: &Header) -> Vec<(u32, usize)> {
+    let cap = |n: u64| n.min(1 << 28) as usize;
+    let mut image = u64::from(h.image_size);
+    let mut mips = u64::from(h.mip_size);
+    if let Ok(p) = plan(h) {
+        for (n, l) in p.places.iter().enumerate() {
+            match n {
+                0 => image = image.max(l.laid.size),
+                _ => mips = mips.max(u64::from(l.base.wrapping_sub(h.mip_ptr)) + l.laid.size),
+            }
+        }
+    }
+    let mut out = vec![(h.image, cap(image))];
+    if h.mip_ptr != 0 {
+        out.push((h.mip_ptr, cap(mips)));
+    }
+    out
+}
+
+/// Levels at least this big (decoded bytes) are split between threads.
+const PARALLEL_BYTES: usize = 256 << 10;
+
+/// Decodes the texture `h` describes from `m` (a snapshot of `sources(h)`), splitting each big level's rows between up to `threads`
+/// threads.
+pub fn decode<M: crate::decode::Memory + Sync>(m: &M, h: &Header, threads: usize) -> Result<Decoded, String> {
+    let p = plan(h)?;
+    let info = &p.info;
+    let block = info.block;
+    let (pipe_swizzle, bank_swizzle) = tiling::swizzles(h.swizzle);
+    let elem_bytes = (info.bits / 8) as usize;
+    let mut levels = Vec::new();
+    let laid_pitch = p.places.first().map_or(0, |l| l.laid.pitch);
+    for l in &p.places {
+        let (bw, bh) = (l.w.div_ceil(block), l.h.div_ceil(block));
         let surface = Surface {
-            mode: laid.mode,
+            mode: l.laid.mode,
             bits_per_element: info.bits,
-            pitch: laid.pitch,
-            height: laid.height,
+            pitch: l.laid.pitch,
+            height: l.laid.height,
             samples: 1,
             depth: false,
             pipe_swizzle,
             bank_swizzle,
         };
-        let mut data = Vec::new();
-        for layer in 0..slices {
-            for y in 0..bh {
+        // rows (layer, y) in order; each part of them is decoded on its own and the parts joined
+        let rows = (l.slices * bh) as usize;
+        let rows_of = |from: usize, to: usize| {
+            let mut data = Vec::with_capacity((to - from) * bw as usize * elem_bytes);
+            let mut element = vec![0u8; elem_bytes];
+            for r in from..to {
+                let (layer, y) = (r as u32 / bh, r as u32 % bh);
                 for x in 0..bw {
-                    let offset = tiling::address(&surface, x, y, layer, 0);
-                    g.read(base.wrapping_add(offset as u32), &mut element);
+                    let at = l.base.wrapping_add(tiling::address(&surface, x, y, layer, 0) as u32);
+                    m.read(at, &mut element);
                     (info.convert)(&element, &mut data);
                 }
             }
-        }
-        let texel_bytes = data.len() / (bw * bh * slices) as usize;
+            data
+        };
+        let bytes = rows * bw as usize * elem_bytes;
+        let parts = if threads > 1 && bytes >= PARALLEL_BYTES && rows > 1 {
+            threads.min(rows)
+        } else {
+            1
+        };
+        let data = if parts == 1 {
+            rows_of(0, rows)
+        } else {
+            let per = rows.div_ceil(parts);
+            std::thread::scope(|scope| {
+                let handles: Vec<_> = (0..parts)
+                    .map(|k| {
+                        let (from, to) = ((k * per).min(rows), ((k + 1) * per).min(rows));
+                        scope.spawn(move || rows_of(from, to))
+                    })
+                    .collect();
+                let mut data = Vec::new();
+                for part in handles {
+                    data.extend(part.join().unwrap_or_default());
+                }
+                data
+            })
+        };
+        let texel_bytes = data.len() / (bw * bh * l.slices).max(1) as usize;
         levels.push(Level {
             width: bw * block,
             height: bh * block,
-            depth: slices,
+            depth: l.slices,
             bytes_per_row: bw * texel_bytes as u32,
             data,
         });
     }
     Ok(Decoded {
         width: h.width.next_multiple_of(block),
-        height: height.next_multiple_of(block),
-        layers,
-        volume,
+        height: p.height.next_multiple_of(block),
+        layers: p.layers,
+        volume: p.volume,
         format: info.format,
         laid_pitch,
         levels,
     })
+}
+
+/// Decodes the texture at `h` straight from guest memory (copied first), on this thread and its helpers.
+pub fn decode_guest(g: &Guest, h: &Header) -> Result<Decoded, String> {
+    let snapshot = crate::decode::Snapshot::take(g, &sources(h));
+    decode(&snapshot, h, crate::decode::texture_threads())
 }
 
 /// A sampler's description, as the game's `GX2InitSampler*` calls put it into the three words of a `GX2Sampler` (this backend's own
@@ -456,6 +554,77 @@ impl Sampler {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A 512x512 RGBA8 texture tiled 2D (mode 4) with three levels, in a 4 MiB guest filled with a pattern.
+    fn big_texture(m: &mut [u8]) -> Header {
+        for (k, b) in m.iter_mut().enumerate() {
+            *b = (k.wrapping_mul(2_654_435_761) >> 13) as u8;
+        }
+        Header {
+            dim: 1,
+            width: 512,
+            height: 512,
+            depth: 1,
+            mips: 3,
+            format: 0x1a,
+            image: 0x10_0000,
+            image_size: 0,
+            tile_mode: 4,
+            swizzle: 0,
+            pitch: 512,
+            mip_ptr: 0x20_0000,
+            mip_size: 0,
+            mip_offsets: [0, 0x4_0000, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+            select: [0, 1, 2, 3],
+        }
+    }
+
+    #[test]
+    fn a_texture_decoded_on_several_threads_is_the_one_decoded_on_one() {
+        let mut m = vec![0u8; 0x40_0000];
+        let h = big_texture(&mut m);
+        let g = Guest::new(m.as_mut_ptr());
+        let snapshot = crate::decode::Snapshot::take(&g, &sources(&h));
+        let one = decode(&snapshot, &h, 1).expect("decoded");
+        let many = decode(&snapshot, &h, 4).expect("decoded");
+        assert_eq!(one.levels.len(), 3);
+        assert_eq!(one.levels[0].data.len(), 512 * 512 * 4);
+        for (a, b) in one.levels.iter().zip(&many.levels) {
+            assert!(a.data == b.data && a.bytes_per_row == b.bytes_per_row);
+        }
+        // and the copy held everything the decode read
+        assert_eq!(snapshot.outside(), 0);
+        // straight from guest memory, as the render thread does it, the same again
+        assert!(decode_guest(&g, &h).expect("decoded").levels[2].data == one.levels[2].data);
+    }
+
+    #[test]
+    fn the_bytes_copied_for_a_decode_cover_the_levels_as_laid_out() {
+        let mut m = vec![0u8; 0x40_0000];
+        let h = big_texture(&mut m);
+        // the header says nothing of the sizes: they come from the layout
+        let s = sources(&h);
+        assert_eq!(s[0].0, 0x10_0000);
+        assert!(s[0].1 >= 512 * 512 * 4);
+        assert_eq!(s[1].0, 0x20_0000);
+        assert!(s[1].1 >= 0x4_0000 + 128 * 128 * 4);
+        // the header's sizes, when bigger, are what is copied (the source hash covers them)
+        let bigger = Header {
+            image_size: 0x18_0000,
+            ..h
+        };
+        assert_eq!(sources(&bigger)[0].1, 0x18_0000);
+        // no smaller levels: one range
+        assert_eq!(
+            sources(&Header {
+                mip_ptr: 0,
+                mips: 1,
+                ..big_texture(&mut m)
+            })
+            .len(),
+            1
+        );
+    }
 
     fn run(f: fn(&[u8], &mut Vec<u8>), bytes: &[u8]) -> Vec<u8> {
         let mut out = Vec::new();
