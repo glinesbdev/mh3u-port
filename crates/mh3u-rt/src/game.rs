@@ -18,6 +18,7 @@ struct Host {
     syscall: extern "C" fn(*mut Ctx),
     enter: extern "C" fn(*mut Ctx, u32),
     watch: extern "C" fn(*mut Ctx, u32, u64, u32),
+    hook: extern "C" fn(*mut Ctx, u32),
 }
 
 /// A variable the loader fills in for the executable (data imported from a system library).
@@ -649,6 +650,7 @@ pub fn run(library: &Path, pieces: &[Piece], options: Options) -> Result<Report>
         syscall,
         enter,
         watch,
+        hook: crate::hooks::on_hook,
     };
     // `host` is copied by the library
     // SAFETY: the library reads the struct during the call and keeps a copy

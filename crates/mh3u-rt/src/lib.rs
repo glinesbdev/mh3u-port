@@ -10,6 +10,7 @@ mod fs;
 mod game;
 mod guest;
 mod gx2;
+pub mod hooks;
 pub mod input;
 mod kernel;
 mod memory;

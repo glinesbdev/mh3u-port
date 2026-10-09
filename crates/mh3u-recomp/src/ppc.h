@@ -41,6 +41,7 @@ typedef struct Host {
     void (*syscall)(Ctx *c);
     void (*enter)(Ctx *c, uint32_t function);
     void (*watch)(Ctx *c, uint32_t address, uint64_t value, uint32_t size); /* only called by a build made with MH3U_WATCH */
+    void (*hook)(Ctx *c, uint32_t function); /* a hooked function was entered (mods/hooks.txt, docs/hooks.md) */
 } Host;
 
 #ifdef _WIN32
@@ -54,6 +55,7 @@ void rt_syscall(Ctx *c);
 void rt_trap(Ctx *c, uint32_t word);
 void rt_unsupported(Ctx *c, uint32_t word);
 void rt_call(Ctx *c, uint32_t target);     /* a call through a register or to an address the translator does not know */
+void rt_hook(Ctx *c, uint32_t function);   /* a hooked function's entry (docs/hooks.md) */
 void rt_import(Ctx *c, uint32_t number);   /* a call to a system function; the number is its place in `imports.h` */
 void rt_jump(Ctx *c, uint32_t target);     /* a jump through a register */
 

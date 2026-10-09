@@ -3,7 +3,7 @@
 //! working tree.
 
 use anyhow::{Result, bail};
-use mh3u_recomp::{RUNTIME_H, discover, emit_function_with, function_name};
+use mh3u_recomp::{RUNTIME_H, discover, emit_function_hooked, function_name};
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::path::Path;
@@ -24,6 +24,8 @@ pub struct Input<'a> {
     /// The names of the imports, and where the calls to each go.
     pub imports: &'a [String],
     pub targets: &'a BTreeMap<u32, u32>,
+    /// The hooks list (`docs/hooks.md`): functions that call `rt_hook` on entry.
+    pub hooks: &'a BTreeMap<u32, String>,
 }
 
 pub fn run(input: &Input, out: &Path, per_file: usize) -> Result<Report> {
@@ -40,6 +42,7 @@ pub fn run(input: &Input, out: &Path, per_file: usize) -> Result<Report> {
         entry,
         imports,
         targets,
+        hooks,
     } = *input;
     let functions = discover::functions(base, words, pointers, entry);
     let starts: Vec<u32> = functions.iter().copied().collect();
@@ -58,6 +61,12 @@ pub fn run(input: &Input, out: &Path, per_file: usize) -> Result<Report> {
     }
     names.push_str("};\n");
     std::fs::write(out.join("imports.h"), names)?;
+    // the runtime reads the hooks' names from the build
+    let list: String = hooks.iter().map(|(a, n)| format!("{a:#010x} {n}\n")).collect();
+    std::fs::write(out.join("hooks.txt"), list)?;
+    if let Some(a) = hooks.keys().find(|a| !functions.contains(a)) {
+        eprintln!("[hooks] {a:#x} is not the start of a function the translator found; it is not hooked");
+    }
     let end = base + 4 * words.len() as u32;
     let mut bytes = header.len();
     let mut files = 0;
@@ -66,7 +75,7 @@ pub fn run(input: &Input, out: &Path, per_file: usize) -> Result<Report> {
         for &s in chunk {
             let next = functions.range(s + 4..).next().copied().unwrap_or(end);
             let body = &words[((s - base) / 4) as usize..((next - base) / 4) as usize];
-            src.push_str(&emit_function_with(s, body, &functions, targets));
+            src.push_str(&emit_function_hooked(s, body, &functions, targets, hooks.contains_key(&s)));
         }
         bytes += src.len();
         std::fs::write(out.join(format!("part_{n:04}.c")), src)?;
@@ -171,6 +180,7 @@ pub fn dispatch_c(starts: &[u32], targets: &BTreeMap<u32, u32>) -> String {
          void rt_call(Ctx *c, uint32_t t) { if (!game_call(c, t)) host.unknown_call(c, t); }\n\
          void rt_jump(Ctx *c, uint32_t t) { if (!game_call(c, t)) host.unknown_call(c, t); }\n\
          void rt_import(Ctx *c, uint32_t n) { host.import(c, n); }\n\
+         void rt_hook(Ctx *c, uint32_t f) { host.hook(c, f); }\n\
          void rt_trap(Ctx *c, uint32_t w) { host.trap(c, w); }\n\
          void rt_unsupported(Ctx *c, uint32_t w) { host.unsupported(c, w); }\n\
          void rt_syscall(Ctx *c) { host.syscall(c); }\n",

@@ -38,9 +38,9 @@ HR), not the code. Hooks need the functions that change that data. Find them by 
 ## Plan
 
 1. Write this doc. **(done)**
-2. Translator: the hooks list parser, and `rt_hook` emitted at the listed entries; tests for both.
-3. ABI: `host.hook` in `ppc.h`, the dispatch file and `game.rs`; the list copied to the build.
-4. Runtime: `hooks.rs` (registry, `Hook` view, the `log` example, `MH3U_HOOK_LOG`); tests.
+2. Translator: the hooks list parser, and `rt_hook` emitted at the listed entries; tests for both. **(done)**
+3. ABI: `host.hook` in `ppc.h`, the dispatch file and `game.rs`; the list copied to the build. **(done)**
+4. Runtime: `hooks.rs` (registry, `Hook` view, the `log` example, `MH3U_HOOK_LOG`); tests. **(done)**
 5. Find the first real addresses (item add, quest start) with watch builds, and list them in `mods/hooks.txt`.
 6. Exit hooks through a return trampoline.
 7. An overlay feature that uses a hook, e.g. a "craftable now" toast fired by the item-add hook instead of polling.
@@ -49,5 +49,8 @@ HR), not the code. Hooks need the functions that change that data. Find them by 
 
 See the bottom of this file. It is updated with each commit of PR #13.
 
-- Status: step 1 (this doc) is done.
-- Next: step 2, on the branch `mods/hooks` (draft PR #13).
+- Status: steps 1–4 are done (draft PR #13), which is milestone 1. The translator emits `rt_hook` at the entries listed in
+  `mods/hooks.txt` (none listed yet). The runtime registry runs callbacks, and `MH3U_HOOK_LOG=1` logs every hook. Tests and
+  check.sh pass.
+- Next: step 5. Find a real address (item add): run a watch build on an item slot of the live save, and take the writing
+  function from the `[watch]` line's lr. Until then, any function address from an `[enter]` line shows the mechanism working.

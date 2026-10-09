@@ -1,0 +1,5 @@
+# Translation-time hooks (docs/hooks.md): one `0xADDRESS name` a line, the entry of a guest function.
+# Re-run `mh3u-tools translate` (scripts/win-build.ps1) after editing; MH3U_HOOK_LOG=1 logs every call of each hook.
+# No real addresses yet (step 5 of the plan finds them). To try the mechanism, list any function the translator found, e.g. one
+# from an [enter] or [watch] log line:
+# 0x02000000 example

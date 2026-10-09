@@ -994,6 +994,37 @@ pub fn emit_function(start: u32, words: &[u32], functions: &BTreeSet<u32>) -> St
 
 /// The same, with the import trampolines known: a call to one is `rt_import(c, number)`.
 pub fn emit_function_with(start: u32, words: &[u32], functions: &BTreeSet<u32>, imports: &BTreeMap<u32, u32>) -> String {
+    emit_function_hooked(start, words, functions, imports, false)
+}
+
+/// The hooks list (`mods/hooks.txt`, see `docs/hooks.md`): one `0xADDRESS name` a line, `#` starting a comment. Gives address ->
+/// name, or the first bad line.
+pub fn parse_hooks(text: &str) -> Result<BTreeMap<u32, String>, String> {
+    let mut out = BTreeMap::new();
+    for (n, line) in text.lines().enumerate() {
+        let line = line.split('#').next().unwrap_or("").trim();
+        if line.is_empty() {
+            continue;
+        }
+        let mut it = line.split_whitespace();
+        let (Some(a), Some(name), None) = (it.next(), it.next(), it.next()) else {
+            return Err(format!("line {}: want `0xADDRESS name`, got {line:?}", n + 1));
+        };
+        let address = u32::from_str_radix(a.trim_start_matches("0x").trim_start_matches("0X"), 16)
+            .map_err(|_| format!("line {}: {a:?} is not a hex address", n + 1))?;
+        if address % 4 != 0 {
+            return Err(format!("line {}: {a} is not word-aligned", n + 1));
+        }
+        if out.insert(address, name.to_string()).is_some() {
+            return Err(format!("line {}: {a} is listed twice", n + 1));
+        }
+    }
+    Ok(out)
+}
+
+/// As `emit_function_with`; with `hooked`, the function calls `rt_hook(c, start)` on entry, before its registers are loaded into
+/// locals (so the hook sees and may change the arguments).
+pub fn emit_function_hooked(start: u32, words: &[u32], functions: &BTreeSet<u32>, imports: &BTreeMap<u32, u32>, hooked: bool) -> String {
     let end = start + 4 * words.len() as u32;
     let tables = switch_tables(start, words);
     let mut labels = block_starts(start, words);
@@ -1056,6 +1087,9 @@ pub fn emit_function_with(start: u32, words: &[u32], functions: &BTreeSet<u32>, 
     let _ = writeln!(out, "void {}(Ctx *restrict c) {{", function_name(start));
     out.push_str(&decls);
     let _ = writeln!(out, "    ENTER(c, {});", hex(start));
+    if hooked {
+        let _ = writeln!(out, "    rt_hook(c, {});", hex(start));
+    }
     out.push_str("    FILL();\n");
     out.push_str(&body);
     out.push_str("}\n#undef SPILL\n#undef FILL\n");
@@ -1120,6 +1154,23 @@ fn localize(body: &str) -> (String, Vec<(Reg, u32, bool)>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hooks_are_parsed_and_emitted_only_at_listed_entries() {
+        let h = parse_hooks("# items\n0x02001000 item_add  # comment\n\n0X02002000 quest_start\n").unwrap();
+        assert_eq!(h.len(), 2);
+        assert_eq!(h[&0x0200_1000], "item_add");
+        assert!(parse_hooks("0x02001002 x").unwrap_err().contains("aligned"));
+        assert!(parse_hooks("zz x").unwrap_err().contains("hex"));
+        assert!(parse_hooks("0x10 a\n0x10 b").unwrap_err().contains("twice"));
+        assert!(parse_hooks("0x10").unwrap_err().contains("line 1"));
+        let words = [0x4e80_0020]; // blr
+        let f: BTreeSet<u32> = [0x0200_1000].into();
+        let hooked = emit_function_hooked(0x0200_1000, &words, &f, &BTreeMap::new(), true);
+        let at = hooked.find(&format!("rt_hook(c, {});", hex(0x0200_1000))).expect("hooked");
+        assert!(at > hooked.find("ENTER(").unwrap() && at < hooked.find("FILL();").unwrap());
+        assert!(!emit_function_with(0x0200_1000, &words, &f, &BTreeMap::new()).contains("rt_hook"));
+    }
 
     #[test]
     fn a_switch_table_after_the_bctr_is_found_and_bounded() {

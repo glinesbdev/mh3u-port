@@ -246,6 +246,15 @@ fn main() -> Result<()> {
             patch_import_addresses(&data, &mut words, &imports)?;
             let end = TEXT_ADDRESS + 4 * words.len() as u32;
             pointers.extend(rpx::relocation_targets(&data, TEXT_ADDRESS, end)?);
+            // the hooks list (docs/hooks.md): MH3U_HOOKS, or mods/hooks.txt when there is one
+            let hooks_path = std::env::var_os("MH3U_HOOKS").map_or_else(|| PathBuf::from("mods/hooks.txt"), PathBuf::from);
+            let hooks = match std::fs::read_to_string(&hooks_path) {
+                Ok(t) => mh3u_recomp::parse_hooks(&t).map_err(|e| anyhow::anyhow!("{}: {e}", hooks_path.display()))?,
+                Err(_) => Default::default(),
+            };
+            if !hooks.is_empty() {
+                println!("{} hooks from {}", hooks.len(), hooks_path.display());
+            }
             let r = translate::run(
                 &translate::Input {
                     words: &words,
@@ -254,6 +263,7 @@ fn main() -> Result<()> {
                     entry,
                     imports: &imports.names,
                     targets: &imports.targets,
+                    hooks: &hooks,
                 },
                 &out,
                 per_file,
@@ -901,6 +911,17 @@ fn run_game(dump: &Dump, c_dir: &Path, max_imports: u64, save: PathBuf, window: 
         });
     }
     let library = c_dir.join(build_game::LIBRARY);
+    // the hooks the build was translated with (docs/hooks.md); MH3U_HOOK_LOG=1 logs them all
+    if let Ok(t) = std::fs::read_to_string(c_dir.join("hooks.txt"))
+        && let Ok(list) = mh3u_recomp::parse_hooks(&t)
+        && !list.is_empty()
+    {
+        let mut registry = mh3u_rt::hooks::Registry::new(&list);
+        if std::env::var("MH3U_HOOK_LOG").is_ok_and(|v| v.trim() == "1") {
+            registry.log_all();
+        }
+        mh3u_rt::hooks::install(registry);
+    }
     let text = rpx::section_at(&data, TEXT_ADDRESS)?;
     let mut content: Vec<PathBuf> = Vec::new();
     if let Some(u) = &dump.update {
