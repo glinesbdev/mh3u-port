@@ -294,6 +294,9 @@ impl Gx2 {
                 } else {
                     crate::draw::shader_budget(std::env::var("MH3U_GFX_SHADER_BUDGET_MS").ok().as_deref())
                 },
+                // the tests decode on the render thread unless they turn the workers on
+                async_decode: !cfg!(test) && crate::decode::async_decode(std::env::var("MH3U_GFX_ASYNC_DECODE").ok().as_deref()),
+                decode_budget: crate::decode::decode_budget(std::env::var("MH3U_GFX_DECODE_BUDGET_MS").ok().as_deref()),
                 ..Default::default()
             },
             last_tv_source: 0,

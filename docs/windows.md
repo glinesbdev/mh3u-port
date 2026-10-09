@@ -173,6 +173,11 @@ translating, making shader modules, decoding textures, and the game. `[gfx slow 
 (`$env:MH3U_GFX_SLOW_MS` changes that) by its longest steps. `$env:MH3U_GFX_TIMES = 'calls'` times only the calls and frames,
 which adds the least to what is measured. `[draw times]` also has `render pass end`, `arena uploads`, `command encoding (finish)` and `submit` (wgpu's own work, which used to be the untimed part of
 `GX2DirectCallDisplayList`). `[gfx caches]` shows `vertex streams N (X MB)`, which should stay roughly flat while standing still.
+First-seen textures, vertex streams and geometry pipelines past `$env:MH3U_GFX_DECODE_BUDGET_MS` a frame (2 ms by default; big
+textures always) are decoded on worker threads. Their draws wait a frame or two ("… decoded in a later frame" in the skipped
+draws), so a new area's objects can pop in slightly late. `$env:MH3U_GFX_ASYNC_DECODE = 'off'` decodes them with the draw waiting,
+as before, for comparing. `[draw counts]` shows `textures decoded on workers`, `vertex streams decoded on workers`, `geometry
+pipelines made on workers` and `texture decodes dropped as stale`.
 Leave `MH3U_GFX_DUMP_FRAME` unset when timing: writing the frame takes about 0.6 s and shows as the window's slowest frame.
 
 **Sampling profilers and the Rust side.** A `-gnullvm` build's PDB (`-C link-arg=-Wl,--pdb=`) holds only the public symbols

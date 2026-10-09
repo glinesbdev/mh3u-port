@@ -9,7 +9,7 @@ use mh3u_latte::translate::{
     Context, IDENTITY_SELECT, Interface, PixelInputs, TexKind, VertexAttribute, VertexInputs, translate_pixel, translate_vertex,
 };
 use mh3u_rt::Guest;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 use std::time::Instant;
@@ -198,11 +198,106 @@ pub struct CachedTexture {
     pub used: u32,
 }
 
+/// A GPU texture holding a decoded texture's levels (on the render thread or a worker: wgpu's device and queue may be used from any
+/// thread, and the writes reach the GPU before the next submit, which is before any draw that can read the texture).
+pub(crate) fn make_texture(device: &wgpu::Device, queue: &wgpu::Queue, d: &crate::texture::Decoded) -> wgpu::Texture {
+    let texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("game texture"),
+        size: wgpu::Extent3d {
+            width: d.width,
+            height: d.height,
+            depth_or_array_layers: d.layers,
+        },
+        mip_level_count: d.levels.len() as u32,
+        sample_count: 1,
+        dimension: if d.volume {
+            wgpu::TextureDimension::D3
+        } else {
+            wgpu::TextureDimension::D2
+        },
+        format: d.format,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+    let block = d.format.block_dimensions();
+    for (n, l) in d.levels.iter().enumerate() {
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                mip_level: n as u32,
+                ..texture.as_image_copy()
+            },
+            &l.data,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(l.bytes_per_row),
+                rows_per_image: Some(l.height.div_ceil(block.1)),
+            },
+            wgpu::Extent3d {
+                width: l.width,
+                height: l.height,
+                depth_or_array_layers: l.depth,
+            },
+        );
+    }
+    texture
+}
+
+/// The vertex data of a draw, decoded (from guest memory, or on a worker from a copy of the bytes the draw's hash covered): one stream of `vec4` per fetch shader element, laid out one after the other.
+pub(crate) fn decode_streams<M: crate::decode::Memory>(
+    g: &M,
+    buffers: &[crate::state::AttribBuffer; 16],
+    fetch: &[AttribStream],
+    start: u32,
+    vertices: u32,
+    instances: u32,
+) -> (Vec<u8>, [[u32; 4]; 16]) {
+    let mut data: Vec<u8> = Vec::new();
+    let mut meta = [[0u32; 4]; 16];
+    for (i, a) in fetch.iter().enumerate().take(16) {
+        meta[i][0] = (data.len() / 16) as u32;
+        let b = &buffers[(a.buffer as usize).min(15)];
+        let (first_item, items) = if a.per_instance {
+            (0, instances.div_ceil(a.divisor.max(1)))
+        } else {
+            (start, vertices)
+        };
+        let size = attribute_size(a.format);
+        let mut bytes = vec![0u8; size as usize];
+        for item in first_item..first_item + items {
+            let at = b.address.wrapping_add(a.offset).wrapping_add(item.wrapping_mul(b.stride));
+            if b.address != 0 && item.wrapping_mul(b.stride).saturating_add(a.offset).saturating_add(size) <= b.size.max(1) {
+                g.read(at, &mut bytes);
+            } else {
+                bytes.iter_mut().for_each(|x| *x = 0);
+            }
+            let v = decode_attribute(a.format, a.endian, &bytes);
+            let one = 1.0f32.to_bits();
+            let pick = |s: u32| match s {
+                0..=3 => v[s as usize],
+                5 => one,
+                _ => 0,
+            };
+            for k in 0..4 {
+                data.extend_from_slice(&pick(a.select[k]).to_le_bytes());
+            }
+        }
+    }
+    if data.is_empty() {
+        data.resize(16, 0);
+    }
+    (data, meta)
+}
+
 /// The words of a `GX2Texture` header that decoding reads (`texture::Header::read` reads up to 0x88).
 const TEXTURE_HEADER_BYTES: usize = 0x88;
 
 /// A hash of what a texture is decoded from: its header's words and the bytes of its image and of its smaller levels.
 fn texture_source_hash(g: &Guest, t: u32, h: &crate::texture::Header) -> u64 {
+    texture_source_hash_from(g, t, h, None)
+}
+
+/// The same, taking the image and level bytes from `snapshot` where it has them (the same bytes, so the same hash).
+fn texture_source_hash_from(g: &Guest, t: u32, h: &crate::texture::Header, snapshot: Option<&crate::decode::Snapshot>) -> u64 {
     let mut buf = vec![0u8; TEXTURE_HEADER_BYTES];
     g.read(t, &mut buf);
     let mut hash = hash_fast(&buf, 0x7e);
@@ -210,7 +305,12 @@ fn texture_source_hash(g: &Guest, t: u32, h: &crate::texture::Header) -> u64 {
         if at == 0 || size == 0 {
             continue;
         }
-        buf.resize(size.min(1 << 28) as usize, 0);
+        let len = size.min(1 << 28) as usize;
+        if let Some(bytes) = snapshot.and_then(|s| s.get(at, len)) {
+            hash = hash_fast(bytes, hash);
+            continue;
+        }
+        buf.resize(len, 0);
         g.read(at, &mut buf);
         hash = hash_fast(&buf, hash);
     }
@@ -274,7 +374,7 @@ pub struct DrawCaches {
     /// How many draws went to each colour buffer (by image address), for the log.
     pub drawn_into: HashMap<u32, u64>,
     /// Textures made from the guest's, by the address of their image and what they were read as, with the memory they cover.
-    pub textures: HashMap<(u32, u32, u32, u32, u32), CachedTexture>,
+    pub textures: HashMap<TexKey, CachedTexture>,
     /// Samplers by the three words of the `GX2Sampler` they were made from, and the two that are not the game's.
     pub samplers: HashMap<[u32; 3], wgpu::Sampler>,
     pub default_sampler: Option<wgpu::Sampler>,
@@ -316,7 +416,61 @@ pub struct DrawCaches {
     pub spent: std::time::Duration,
     /// Set when a shader was left for a later frame (the draw that asked is not drawn, and says why).
     pub deferred: bool,
+    /// Decodes on worker threads (`decode.rs`): the pool (made when the first decode is handed out), whether decodes may go there
+    /// (`MH3U_GFX_ASYNC_DECODE`; off in the tests unless a test turns it on), how long first-seen decodes may take on the render
+    /// thread in a frame (`MH3U_GFX_DECODE_BUDGET_MS`) and how long they have this frame.
+    pub decodes: Option<crate::decode::Pool>,
+    pub async_decode: bool,
+    pub decode_budget: std::time::Duration,
+    pub decode_spent: std::time::Duration,
+    /// Textures being decoded on a worker, by key.
+    pub texture_jobs: HashMap<TexKey, TextureJob>,
+    /// Textures decoded on the render thread from now on: one whose memory changed while a worker decoded it (the game rewrites it,
+    /// so a worker's result would always be stale), or one that could not be read.
+    pub sync_textures: HashSet<TexKey>,
+    /// Vertex streams and geometry pipelines being made on a worker.
+    pub stream_jobs: HashSet<(u64, u64)>,
+    pub geometry_jobs: HashSet<(u32, u32, u64)>,
+    /// Set when something a draw needs is still being made on a worker: why the draw is not drawn this frame.
+    pub waiting: Option<&'static str>,
+    pub next_job: u64,
 }
+
+/// What a game texture is cached by: its image address, width, height, format, and tile mode with its dimension.
+pub type TexKey = (u32, u32, u32, u32, u32);
+
+/// A texture being decoded on a worker: which job it is, the memory it was read from, and whether `GX2Invalidate` covered that memory
+/// since (then the result is stale and dropped).
+pub struct TextureJob {
+    token: u64,
+    range: (u32, u32),
+    mips: (u32, u32),
+    stale: bool,
+}
+
+/// A texture decoded and uploaded on a worker.
+pub(crate) struct TextureDone {
+    key: TexKey,
+    token: u64,
+    header: crate::texture::Header,
+    /// What it was decoded from (see `texture_source_hash`).
+    hash: u64,
+    /// The texture, its layers, its base level's laid pitch and its block width; or why it could not be read.
+    result: Result<(wgpu::Texture, u32, u32, u32), String>,
+    /// Reads outside what was copied for it (none expected).
+    outside: u64,
+}
+
+/// Vertex streams decoded on a worker (the streams, and where each starts).
+pub(crate) struct StreamsDone {
+    pub key: (u64, u64),
+    pub data: Vec<u8>,
+    pub meta: Vec<u8>,
+}
+
+/// First-seen textures whose image and smaller levels are at least this big go to a worker (and are decoded there on several threads),
+/// whatever the frame's budget: the loading screens' textures took 21 to 179 ms on the render thread (runs 19 and 20).
+const ASYNC_TEXTURE_BYTES: usize = 256 << 10;
 
 /// The default of `MH3U_GFX_SHADER_BUDGET_MS`.
 const SHADER_BUDGET_MS: u64 = 5;
@@ -1152,30 +1306,58 @@ impl Gx2 {
             g.u32(t + 0x14),
             g.u32(t + 0x30) ^ (g.u32(t) << 8),
         );
-        let found = match self.caches.textures.get_mut(&key) {
-            Some(cached) if cached.dirty => {
-                let h = crate::texture::Header::read(g, t);
-                if texture_source_hash(g, t, &h) == cached.hash {
-                    Lap::count("texture invalidations of unchanged textures", 1);
-                    cached.dirty = false;
+        // None: found; Some(replacing): to be decoded, replacing a texture whose memory changed or not
+        let decode = if self.caches.texture_jobs.contains_key(&key) {
+            // being decoded on a worker: drawn with the texture it replaces meanwhile, or not drawn this frame
+            match self.caches.textures.get_mut(&key) {
+                Some(cached) => {
                     cached.used = self.swaps;
-                    true
-                } else {
-                    self.caches.textures.remove(&key);
-                    false
+                    None
+                }
+                None => {
+                    self.caches.waiting = Some("texture decoded in a later frame");
+                    return None;
                 }
             }
-            Some(cached) => {
-                cached.used = self.swaps;
-                true
+        } else {
+            match self.caches.textures.get_mut(&key) {
+                Some(cached) if cached.dirty => {
+                    let h = crate::texture::Header::read(g, t);
+                    if texture_source_hash(g, t, &h) == cached.hash {
+                        Lap::count("texture invalidations of unchanged textures", 1);
+                        cached.dirty = false;
+                        cached.used = self.swaps;
+                        None
+                    } else {
+                        cached.used = self.swaps;
+                        Some(true)
+                    }
+                }
+                Some(cached) => {
+                    cached.used = self.swaps;
+                    None
+                }
+                None => Some(false),
             }
-            None => false,
         };
-        if !found {
+        if let Some(replacing) = decode {
             let started = Instant::now();
             let made = self.decode_texture(g, t, key);
             self.caches.work.decode_ms += started.elapsed().as_secs_f64() * 1000.0;
-            made?;
+            match made {
+                // decoded now: the new texture replaced the old
+                Some(true) => {}
+                // handed to a worker: the old texture is drawn with meanwhile (kept marked, the job stops it being hashed again)
+                Some(false) if replacing => {}
+                Some(false) => {
+                    self.caches.waiting = Some("texture decoded in a later frame");
+                    return None;
+                }
+                None => {
+                    self.caches.textures.remove(&key);
+                    return None;
+                }
+            }
         }
         let cached = self.caches.textures.get_mut(&key)?;
         let slot = &mut cached.views[usize::from(kind == TexKind::Cube)];
@@ -1204,104 +1386,184 @@ impl Gx2 {
         Some(view)
     }
 
-    /// Decodes the texture at `t` and keeps it under `key`; None if it cannot be read.
+    /// Decodes the texture at `t` and keeps it under `key`: Some(true) when it was decoded now, Some(false) when it was handed to a
+    /// worker (big, or past the frame's budget), None if it cannot be read.
     #[inline(never)]
-    fn decode_texture(&mut self, g: &Guest, t: u32, key: (u32, u32, u32, u32, u32)) -> Option<()> {
+    fn decode_texture(&mut self, g: &Guest, t: u32, key: TexKey) -> Option<bool> {
         static TEXDUMP: std::sync::OnceLock<Option<std::ffi::OsString>> = std::sync::OnceLock::new();
         let texdump = TEXDUMP.get_or_init(|| std::env::var_os("MH3U_GFX_TEXDUMP")).as_ref();
         let mut lap = Lap::new();
         let h = crate::texture::Header::read(g, t);
-        {
-            if let Some(dir) = texdump {
-                let dir = std::path::Path::new(&dir);
-                let _ = std::fs::create_dir_all(dir);
-                let mut raw = vec![0u8; h.image_size.min(1 << 26) as usize];
-                g.read(h.image, &mut raw);
-                let mut header = vec![0u8; 0x9c];
-                g.read(t, &mut header);
-                let name = format!("tex-{:08x}-{}x{}-f{:x}-m{}", h.image, h.width, h.height, h.format, h.tile_mode);
-                let _ = std::fs::write(dir.join(format!("{name}.image")), raw);
-                let _ = std::fs::write(dir.join(format!("{name}.header")), header);
-            }
-            let decoded = crate::texture::decode(g, &h);
-            lap.mark("texture decode (in texture views)");
-            match decoded {
-                Ok(d) => {
-                    self.diag.decoded(&h, d.laid_pitch, d.format.block_dimensions().0);
-                    if let Some(dir) = texdump {
-                        let name = format!(
-                            "tex-{:08x}-{}x{}-f{:x}-m{}.decoded",
-                            h.image, d.width, d.height, h.format, h.tile_mode
-                        );
-                        let _ = std::fs::write(std::path::Path::new(&dir).join(name), &d.levels[0].data);
-                    }
-                    let texture = self.d.device.create_texture(&wgpu::TextureDescriptor {
-                        label: Some("game texture"),
-                        size: wgpu::Extent3d {
-                            width: d.width,
-                            height: d.height,
-                            depth_or_array_layers: d.layers,
-                        },
-                        mip_level_count: d.levels.len() as u32,
-                        sample_count: 1,
-                        dimension: if d.volume {
-                            wgpu::TextureDimension::D3
-                        } else {
-                            wgpu::TextureDimension::D2
-                        },
-                        format: d.format,
-                        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-                        view_formats: &[],
-                    });
-                    let block = d.format.block_dimensions();
-                    for (n, l) in d.levels.iter().enumerate() {
-                        self.d.queue.write_texture(
-                            wgpu::TexelCopyTextureInfo {
-                                mip_level: n as u32,
-                                ..texture.as_image_copy()
-                            },
-                            &l.data,
-                            wgpu::TexelCopyBufferLayout {
-                                offset: 0,
-                                bytes_per_row: Some(l.bytes_per_row),
-                                rows_per_image: Some(l.height.div_ceil(block.1)),
-                            },
-                            wgpu::Extent3d {
-                                width: l.width,
-                                height: l.height,
-                                depth_or_array_layers: l.depth,
-                            },
-                        );
-                    }
-                    self.caches.textures.insert(
-                        key,
-                        CachedTexture {
-                            texture,
-                            layers: d.layers,
-                            range: (h.image, h.image.saturating_add(h.image_size)),
-                            mips: (h.mip_ptr, h.mip_ptr.saturating_add(h.mip_size)),
-                            views: [None, None],
-                            hash: texture_source_hash(g, t, &h),
-                            dirty: false,
-                            used: self.swaps,
-                        },
+        if let Some(dir) = texdump {
+            let dir = std::path::Path::new(&dir);
+            let _ = std::fs::create_dir_all(dir);
+            let mut raw = vec![0u8; h.image_size.min(1 << 26) as usize];
+            g.read(h.image, &mut raw);
+            let mut header = vec![0u8; 0x9c];
+            g.read(t, &mut header);
+            let name = format!("tex-{:08x}-{}x{}-f{:x}-m{}", h.image, h.width, h.height, h.format, h.tile_mode);
+            let _ = std::fs::write(dir.join(format!("{name}.image")), raw);
+            let _ = std::fs::write(dir.join(format!("{name}.header")), header);
+        }
+        // what the decode reads, copied (a worker never reads guest memory), and the hash of it the texture is kept with
+        let sources = crate::texture::sources(&h);
+        let source_bytes: usize = sources.iter().map(|r| r.1).sum();
+        let to_worker = self.caches.async_decode
+            && texdump.is_none()
+            && !self.caches.sync_textures.contains(&key)
+            && (source_bytes >= ASYNC_TEXTURE_BYTES || self.caches.decode_spent >= self.caches.decode_budget);
+        let started = Instant::now();
+        let snapshot = crate::decode::Snapshot::take(g, &sources);
+        let hash = texture_source_hash_from(g, t, &h, Some(&snapshot));
+        lap.mark("texture copy and hash (in texture views)");
+        Lap::count("texture bytes decoded", u64::from(h.image_size) + u64::from(h.mip_size));
+        if to_worker {
+            let token = self.caches.next_job;
+            self.caches.next_job += 1;
+            self.caches.texture_jobs.insert(
+                key,
+                TextureJob {
+                    token,
+                    range: (h.image, h.image.saturating_add(h.image_size)),
+                    mips: (h.mip_ptr, h.mip_ptr.saturating_add(h.mip_size)),
+                    stale: false,
+                },
+            );
+            let (device, queue) = (self.d.device.clone(), self.d.queue.clone());
+            let header = h.clone();
+            self.caches.decodes.get_or_insert_with(crate::decode::Pool::new).submit(move || {
+                let result = crate::decode::caught(|| {
+                    crate::texture::decode(&snapshot, &header, crate::decode::texture_threads()).map(|d| {
+                        let texture = make_texture(&device, &queue, &d);
+                        (texture, d.layers, d.laid_pitch, d.format.block_dimensions().0)
+                    })
+                });
+                crate::decode::Done::Texture(TextureDone {
+                    key,
+                    token,
+                    header,
+                    hash,
+                    result,
+                    outside: snapshot.outside(),
+                })
+            });
+            Lap::count("textures decoded on workers", 1);
+            self.caches.decode_spent += started.elapsed();
+            return Some(false);
+        }
+        let decoded = crate::texture::decode(&snapshot, &h, crate::decode::texture_threads());
+        lap.mark("texture decode (in texture views)");
+        let made = match decoded {
+            Ok(d) => {
+                self.diag.decoded(&h, d.laid_pitch, d.format.block_dimensions().0);
+                if let Some(dir) = texdump {
+                    let name = format!(
+                        "tex-{:08x}-{}x{}-f{:x}-m{}.decoded",
+                        h.image, d.width, d.height, h.format, h.tile_mode
                     );
-                    lap.mark("texture upload and hash (in texture views)");
-                    Lap::count("texture decodes", 1);
-                    self.caches.work.decoded += 1;
-                    Lap::count("texture bytes decoded", u64::from(h.image_size) + u64::from(h.mip_size));
-                    Some(())
+                    let _ = std::fs::write(std::path::Path::new(&dir).join(name), &d.levels[0].data);
                 }
-                Err(e) => {
-                    self.diag.decode_failed(&h, &e);
-                    self.report(format!(
-                        "texture {t:#x} (format {:#x}, {}x{}, tile mode {}) not read: {e}",
-                        h.format, h.width, h.height, h.tile_mode
-                    ));
-                    None
-                }
+                let texture = make_texture(&self.d.device, &self.d.queue, &d);
+                self.keep_texture(key, &h, texture, d.layers, hash);
+                lap.mark("texture upload and hash (in texture views)");
+                Some(true)
+            }
+            Err(e) => {
+                self.texture_unreadable(t, &h, &e);
+                None
+            }
+        };
+        if snapshot.outside() > 0 {
+            Lap::count("texture reads outside what was copied", snapshot.outside());
+        }
+        self.caches.decode_spent += started.elapsed();
+        made
+    }
+
+    fn keep_texture(&mut self, key: TexKey, h: &crate::texture::Header, texture: wgpu::Texture, layers: u32, hash: u64) {
+        self.caches.textures.insert(
+            key,
+            CachedTexture {
+                texture,
+                layers,
+                range: (h.image, h.image.saturating_add(h.image_size)),
+                mips: (h.mip_ptr, h.mip_ptr.saturating_add(h.mip_size)),
+                views: [None, None],
+                hash,
+                dirty: false,
+                used: self.swaps,
+            },
+        );
+        Lap::count("texture decodes", 1);
+        self.caches.work.decoded += 1;
+    }
+
+    fn texture_unreadable(&mut self, t: u32, h: &crate::texture::Header, e: &str) {
+        self.diag.decode_failed(h, e);
+        self.report(format!(
+            "texture {t:#x} (format {:#x}, {}x{}, tile mode {}) not read: {e}",
+            h.format, h.width, h.height, h.tile_mode
+        ));
+    }
+
+    /// Takes in what the workers have finished (at every swap; `wait` waits for all of it, for the tests).
+    pub(crate) fn collect_decodes(&mut self, wait: bool) {
+        let Some(pool) = self.caches.decodes.as_mut() else { return };
+        if pool.outstanding == 0 {
+            return;
+        }
+        for done in pool.finished(wait) {
+            match done {
+                crate::decode::Done::Texture(d) => self.texture_done(d),
+                crate::decode::Done::Streams(d) => self.streams_done(d),
+                crate::decode::Done::Geometry(d) => self.geometry_done(d),
+                crate::decode::Done::Lost => Lap::count("decode jobs that panicked", 1),
             }
         }
+    }
+
+    fn texture_done(&mut self, d: TextureDone) {
+        let Some(job) = self.caches.texture_jobs.remove(&d.key).filter(|j| j.token == d.token) else {
+            return;
+        };
+        if d.outside > 0 {
+            Lap::count("texture reads outside what was copied", d.outside);
+        }
+        match d.result {
+            Ok(_) if job.stale => {
+                // its memory changed while it was decoded: dropped, and decoded on the render thread from now on (the texture it was to
+                // replace, if any, stays marked and is checked again at its next use)
+                Lap::count("texture decodes dropped as stale", 1);
+                self.caches.sync_textures.insert(d.key);
+            }
+            Ok((texture, layers, laid_pitch, block)) => {
+                self.diag.decoded(&d.header, laid_pitch, block);
+                self.keep_texture(d.key, &d.header, texture, layers, d.hash);
+            }
+            Err(e) => {
+                self.texture_unreadable(d.header.image, &d.header, &e);
+                self.caches.textures.remove(&d.key);
+                self.caches.sync_textures.insert(d.key);
+            }
+        }
+    }
+
+    fn streams_done(&mut self, d: StreamsDone) {
+        self.caches.stream_jobs.remove(&d.key);
+        if self.caches.streams.contains_key(&d.key) {
+            return;
+        }
+        self.caches.streams.insert(
+            d.key,
+            StreamEntry {
+                own: None,
+                size: d.data.len() as u64,
+                pending: Some((d.data, d.meta)),
+                placed: None,
+                used: self.swaps,
+                reused: false,
+            },
+        );
     }
 
     /// `GX2Invalidate` of shader memory: the translations made from programs there are looked up by their bytes again.
@@ -1351,6 +1613,12 @@ impl Gx2 {
         for t in self.caches.textures.values_mut() {
             if !((t.range.1 <= address || t.range.0 >= end) && (t.mips.1 <= address || t.mips.0 >= end)) {
                 t.dirty = true;
+                marked += 1;
+            }
+        }
+        for j in self.caches.texture_jobs.values_mut() {
+            if !((j.range.1 <= address || j.range.0 >= end) && (j.mips.1 <= address || j.mips.0 >= end)) {
+                j.stale = true;
                 marked += 1;
             }
         }
@@ -1597,53 +1865,6 @@ impl Gx2 {
         self.d.queue.submit([enc.finish()]);
     }
 
-    /// The vertex data of the draw, decoded: one stream of `vec4` per fetch shader element, laid out one after the other.
-    pub(crate) fn decode_streams(
-        &self,
-        g: &Guest,
-        st: &State,
-        fetch: &[AttribStream],
-        start: u32,
-        vertices: u32,
-        instances: u32,
-    ) -> (Vec<u8>, [[u32; 4]; 16]) {
-        let mut data: Vec<u8> = Vec::new();
-        let mut meta = [[0u32; 4]; 16];
-        for (i, a) in fetch.iter().enumerate().take(16) {
-            meta[i][0] = (data.len() / 16) as u32;
-            let b = &st.attrib_buffers[(a.buffer as usize).min(15)];
-            let (first_item, items) = if a.per_instance {
-                (0, instances.div_ceil(a.divisor.max(1)))
-            } else {
-                (start, vertices)
-            };
-            let size = attribute_size(a.format);
-            let mut bytes = vec![0u8; size as usize];
-            for item in first_item..first_item + items {
-                let at = b.address.wrapping_add(a.offset).wrapping_add(item.wrapping_mul(b.stride));
-                if b.address != 0 && item.wrapping_mul(b.stride).saturating_add(a.offset).saturating_add(size) <= b.size.max(1) {
-                    g.read(at, &mut bytes);
-                } else {
-                    bytes.iter_mut().for_each(|x| *x = 0);
-                }
-                let v = decode_attribute(a.format, a.endian, &bytes);
-                let one = 1.0f32.to_bits();
-                let pick = |s: u32| match s {
-                    0..=3 => v[s as usize],
-                    5 => one,
-                    _ => 0,
-                };
-                for k in 0..4 {
-                    data.extend_from_slice(&pick(a.select[k]).to_le_bytes());
-                }
-            }
-        }
-        if data.is_empty() {
-            data.resize(16, 0);
-        }
-        (data, meta)
-    }
-
     /// The decoded streams of a draw on the GPU: made again only when the layout or the vertex bytes are not what they were (the bytes
     /// are hashed, so a game that changes its vertex data without telling the GPU is still followed). New streams go into the batch's
     /// arena; they get buffers of their own when they are drawn again in a later frame.
@@ -1655,7 +1876,7 @@ impl Gx2 {
         start: u32,
         vertices: u32,
         instances: u32,
-    ) -> Streams {
+    ) -> Option<Streams> {
         let mut lap = Lap::new();
         let (mut h1, mut h2) = (0x1234_5678_9abc_def0u64, 0x0fed_cba9_8765_4321u64);
         let mut mix = |v: u64| {
@@ -1699,6 +1920,7 @@ impl Gx2 {
             }
         }
         let mut bytes_hashed = 0;
+        let mut copy: Vec<(u32, usize)> = Vec::new();
         for &(buffer, first, items, end) in &spans[..n_spans] {
             let b = &st.attrib_buffers[(buffer as usize).min(15)];
             mix(u64::from(b.address != 0));
@@ -1715,6 +1937,7 @@ impl Gx2 {
                 xxhash_rust::xxh3::xxh3_64(raw)
             }));
             bytes_hashed += len;
+            copy.push((b.address.wrapping_add(from as u32), len as usize));
         }
         Lap::count("vertex bytes hashed", bytes_hashed);
         let key = (h1, h2);
@@ -1729,7 +1952,7 @@ impl Gx2 {
             e.used = swaps;
             let size = e.size;
             if let Some((buffer, meta)) = &e.own {
-                return Streams {
+                return Some(Streams {
                     data: BufRef {
                         buffer: buffer.clone(),
                         offset: 0,
@@ -1741,16 +1964,16 @@ impl Gx2 {
                         size: 256,
                     },
                     kept: true,
-                };
+                });
             }
             if let Some((at, data, meta)) = &e.placed
                 && *at == generation
             {
-                return Streams {
+                return Some(Streams {
                     data: data.clone(),
                     meta: meta.clone(),
                     kept: false,
-                };
+                });
             }
             let reused = e.reused;
             let (data, meta) = e.pending.take().expect("a stream without buffers of its own keeps its bytes");
@@ -1762,9 +1985,34 @@ impl Gx2 {
                 self.place_streams(key, data, meta)
             };
             lap.mark("stream miss: buffers and upload");
-            return streams;
+            return Some(streams);
         }
-        let (data, meta) = self.decode_streams(g, st, fetch, start, vertices, instances);
+        if self.caches.stream_jobs.contains(&key) {
+            self.caches.waiting = Some("vertex streams decoded in a later frame");
+            return None;
+        }
+        let started = Instant::now();
+        if self.caches.async_decode && self.caches.decode_spent >= self.caches.decode_budget {
+            // past this frame's budget: decoded on a worker from a copy of the bytes just hashed, and drawn when it is back
+            let snapshot = crate::decode::Snapshot::take(g, &copy);
+            let (buffers, fetch) = (st.attrib_buffers.clone(), fetch.to_vec());
+            self.caches.stream_jobs.insert(key);
+            self.caches.decodes.get_or_insert_with(crate::decode::Pool::new).submit(move || {
+                let (data, meta) = decode_streams(&snapshot, &buffers, &fetch, start, vertices, instances);
+                crate::decode::Done::Streams(StreamsDone {
+                    key,
+                    data,
+                    meta: meta.iter().flatten().flat_map(|v| v.to_le_bytes()).collect(),
+                })
+            });
+            Lap::count("vertex streams decoded on workers", 1);
+            self.caches.decode_spent += started.elapsed();
+            lap.mark("stream miss: copy for a worker");
+            self.caches.waiting = Some("vertex streams decoded in a later frame");
+            return None;
+        }
+        let (data, meta) = decode_streams(g, &st.attrib_buffers, fetch, start, vertices, instances);
+        self.caches.decode_spent += started.elapsed();
         lap.mark("stream miss: decode");
         if std::env::var_os("MH3U_TRACE_STREAMS").is_some() {
             eprintln!(
@@ -1788,7 +2036,7 @@ impl Gx2 {
         );
         let streams = self.place_streams(key, data, meta_bytes);
         lap.mark("stream miss: buffers and upload");
-        streams
+        Some(streams)
     }
 
     /// Puts a stream entry's bytes into this batch's arena (they go up with the arena when the batch is handed to the GPU) and keeps
@@ -2080,15 +2328,27 @@ impl Gx2 {
     /// invalidated textures not drawn in that time.
     pub(crate) fn prune(&mut self) {
         self.caches.spent = std::time::Duration::ZERO;
+        self.caches.decode_spent = std::time::Duration::ZERO;
         let swaps = self.swaps;
         let mut lap = Lap::new();
+        // what the workers finished is taken in here, between frames: the next frame draws with it
+        self.collect_decodes(false);
+        lap.mark("decodes from workers taken in (at the swap)");
         // bind groups and vertex streams hold GPU objects, whose destruction (in the driver) is spread over the frames: what has gone
         // unused goes every frame, not 60 frames' worth at once (run 18: 26 ms frames every 60 frames in the field)
         let before = self.caches.bind_groups.len();
         self.caches.bind_groups.retain(|_, e| e.1 + 60 >= swaps);
         Lap::count("bind groups aged out", (before - self.caches.bind_groups.len()) as u64);
         let before = self.caches.streams.len();
-        self.caches.streams.retain(|_, e| keep_stream(e.used, e.reused, swaps));
+        let mut never_drawn = 0;
+        self.caches.streams.retain(|_, e| {
+            let keep = keep_stream(e.used, e.reused, swaps);
+            never_drawn += u64::from(!keep && e.own.is_none() && e.placed.is_none());
+            keep
+        });
+        if never_drawn > 0 {
+            Lap::count("vertex streams from workers never drawn", never_drawn);
+        }
         if self.caches.streams.len() != before {
             self.caches.stream_bytes = own_stream_bytes(&self.caches.streams);
             Lap::count("vertex streams aged out", (before - self.caches.streams.len()) as u64);
@@ -2118,6 +2378,7 @@ impl Gx2 {
 
     pub(crate) fn draw_call(&mut self, g: &Guest, primitive: u32, count: u32, indexed: Option<(u32, u32)>, first: u32, instances: u32) {
         let mut lap = Lap::new();
+        self.caches.waiting = None;
         let st = self.contexts.entry(self.current).or_default().clone();
         lap.mark("state clone");
         if st.vertex_shader == 0 || st.pixel_shader == 0 || count == 0 {
@@ -2176,6 +2437,10 @@ impl Gx2 {
             match geo {
                 Some(x) => Some(x),
                 None => {
+                    if let Some(why) = self.caches.waiting.take() {
+                        *self.caches.skipped.entry(why).or_default() += 1;
+                        return;
+                    }
                     self.diag.skipped_for(format!("geometry pipeline {:#x}", st.geometry_shader));
                     *self.caches.skipped.entry("geometry pipeline not drawn").or_default() += 1;
                     return;
@@ -2242,6 +2507,11 @@ impl Gx2 {
                 lap.mark("index list");
                 let streams = self.cached_streams(g, &st, &fetch, lowest, vertices.min(1 << 22), instances);
                 lap.mark("decode streams");
+                let Some(streams) = streams else {
+                    // decoded on a worker: drawn from the frame it is back in
+                    *self.caches.skipped.entry("vertex streams decoded in a later frame").or_default() += 1;
+                    return;
+                };
                 streams_kept = streams.kept;
                 (streams.data, streams.meta, index_buffer, index_count, topology)
             };
@@ -2393,6 +2663,11 @@ impl Gx2 {
                 (r, self.fallback_texture(k))
             })
             .collect();
+        if let Some(why) = self.caches.waiting.take() {
+            // a texture seen for the first time is decoded on a worker: the draw waits for it (a frame or two) rather than be drawn white
+            *self.caches.skipped.entry(why).or_default() += 1;
+            return;
+        }
         let sampler_for = |this: &mut Gx2, unit: u32| -> wgpu::Sampler {
             let at = st.pixel_samplers.get(unit as usize).copied().unwrap_or(0);
             if at == 0 {
@@ -3638,10 +3913,10 @@ mod tests {
             gx2.swaps = frame;
             // the same static mesh every frame, and a mesh whose bytes change every frame
             st.attrib_buffers[0].address = 0x1000;
-            gx2.cached_streams(&g, &st, &fetch, 0, 64, 1);
+            gx2.cached_streams(&g, &st, &fetch, 0, 64, 1).unwrap();
             g.put_u32(0x4000, frame);
             st.attrib_buffers[0].address = 0x4000;
-            let changing = gx2.cached_streams(&g, &st, &fetch, 0, 64, 1);
+            let changing = gx2.cached_streams(&g, &st, &fetch, 0, 64, 1).unwrap();
             assert!(!changing.kept, "vertex data rewritten every frame stays in the arena");
             gx2.flush_draws();
             gx2.prune();
@@ -3652,8 +3927,8 @@ mod tests {
         assert_eq!(gx2.caches.streams.values().filter(|e| e.own.is_some()).count(), 1);
         // the static mesh is still the one given buffers in its second frame
         st.attrib_buffers[0].address = 0x1000;
-        let a = gx2.cached_streams(&g, &st, &fetch, 0, 64, 1);
-        let b = gx2.cached_streams(&g, &st, &fetch, 0, 64, 1);
+        let a = gx2.cached_streams(&g, &st, &fetch, 0, 64, 1).unwrap();
+        let b = gx2.cached_streams(&g, &st, &fetch, 0, 64, 1).unwrap();
         assert!(a.kept && b.kept && a.data.buffer == b.data.buffer && a.data.offset == 0);
         let kept: u64 = gx2.caches.streams.values().map(|e| e.size).sum();
         gx2.swaps += 60 - gx2.swaps % 60;
@@ -3678,15 +3953,15 @@ mod tests {
             g.put_u32(0x1000 + k * 4, (k as f32).to_bits());
         }
         gx2.swaps = 10;
-        let first = gx2.cached_streams(&g, &st, &fetch, 0, 64, 1);
+        let first = gx2.cached_streams(&g, &st, &fetch, 0, 64, 1).unwrap();
         assert!(!first.kept);
         // the same batch: the same place in the arena
-        let again = gx2.cached_streams(&g, &st, &fetch, 0, 64, 1);
+        let again = gx2.cached_streams(&g, &st, &fetch, 0, 64, 1).unwrap();
         assert!(again.data.buffer == first.data.buffer && again.data.offset == first.data.offset);
         assert!(again.meta.buffer == first.meta.buffer && again.meta.offset == first.meta.offset);
         // another batch of the same frame: written into the arena again, still no buffer of its own
         gx2.flush_draws();
-        let later_batch = gx2.cached_streams(&g, &st, &fetch, 0, 64, 1);
+        let later_batch = gx2.cached_streams(&g, &st, &fetch, 0, 64, 1).unwrap();
         assert!(!later_batch.kept);
         assert!(gx2.caches.streams.values().all(|e| e.own.is_none() && e.pending.is_some()));
         // the arena's bytes are the decoded streams
@@ -3701,12 +3976,12 @@ mod tests {
         gx2.flush_draws();
         gx2.swaps += 1;
         gx2.prune();
-        let next = gx2.cached_streams(&g, &st, &fetch, 0, 64, 1);
+        let next = gx2.cached_streams(&g, &st, &fetch, 0, 64, 1).unwrap();
         assert!(next.kept && next.data.offset == 0 && next.data.size == data.len() as u64);
         assert!(gx2.caches.streams[&key].pending.is_none());
         assert_eq!(gx2.caches.stream_bytes, data.len() as u64);
         gx2.swaps += 1;
-        let after = gx2.cached_streams(&g, &st, &fetch, 0, 64, 1);
+        let after = gx2.cached_streams(&g, &st, &fetch, 0, 64, 1).unwrap();
         assert!(after.kept && after.data.buffer == next.data.buffer);
     }
 
@@ -3797,5 +4072,138 @@ mod tests {
             changed[at] ^= 0x10;
             assert_ne!(hash(&mut changed), first, "a change at {at:#x}");
         }
+    }
+
+    /// A 64x64 RGBA8 texture laid out linearly (tile mode 1), its header at 0x100 and its image at 0x1_0000.
+    fn small_texture(m: &mut [u8]) {
+        let mut put = |at: usize, v: u32| m[at..at + 4].copy_from_slice(&v.to_be_bytes());
+        put(0x100, 1);
+        put(0x100 + 4, 64);
+        put(0x100 + 8, 64);
+        put(0x100 + 0xc, 1);
+        put(0x100 + 0x10, 1);
+        put(0x100 + 0x14, 0x1a);
+        put(0x100 + 0x20, 64 * 64 * 4);
+        put(0x100 + 0x24, 0x1_0000);
+        put(0x100 + 0x30, 1);
+        put(0x100 + 0x3c, 64);
+        put(0x100 + 0x84, 0x0001_0203);
+    }
+
+    /// A backend that hands every first-seen decode to the workers.
+    fn async_gx2() -> Gx2 {
+        let mut gx2 = Gx2::new(crate::Display::noop());
+        gx2.caches.async_decode = true;
+        gx2.caches.decode_budget = std::time::Duration::ZERO;
+        gx2
+    }
+
+    #[test]
+    fn a_texture_decoded_on_a_worker_is_waited_for_then_drawn() {
+        let mut gx2 = async_gx2();
+        let mut m = vec![0u8; 0x2_0000];
+        small_texture(&mut m);
+        let g = Guest::new(m.as_mut_ptr());
+        assert!(gx2.texture_view(&g, 0x100, TexKind::D2).is_none());
+        assert_eq!(gx2.caches.waiting, Some("texture decoded in a later frame"));
+        assert_eq!(gx2.caches.texture_jobs.len(), 1);
+        // asked for again before it is back: still one job
+        gx2.caches.waiting = None;
+        assert!(gx2.texture_view(&g, 0x100, TexKind::D2).is_none());
+        assert_eq!(gx2.caches.texture_jobs.len(), 1);
+        gx2.collect_decodes(true);
+        assert!(gx2.caches.texture_jobs.is_empty());
+        gx2.caches.waiting = None;
+        assert!(gx2.texture_view(&g, 0x100, TexKind::D2).is_some());
+        assert_eq!(gx2.caches.waiting, None);
+        // kept with the hash of what it was decoded from: unchanged bytes are not decoded again
+        let h = crate::texture::Header::read(&g, 0x100);
+        let cached = gx2.caches.textures.values().next().expect("kept");
+        assert_eq!(cached.hash, texture_source_hash(&g, 0x100, &h));
+    }
+
+    #[test]
+    fn a_texture_changed_while_a_worker_decoded_it_is_dropped_and_decoded_here_from_then_on() {
+        let mut gx2 = async_gx2();
+        let mut m = vec![0u8; 0x2_0000];
+        small_texture(&mut m);
+        let g = Guest::new(m.as_mut_ptr());
+        assert!(gx2.texture_view(&g, 0x100, TexKind::D2).is_none());
+        // the game rewrites the image and says so before the worker's result is taken in
+        g.put_u32(0x1_0040, 0xdead_beef);
+        gx2.invalidate_textures(0x1_0000, 0x100);
+        gx2.collect_decodes(true);
+        assert!(gx2.caches.textures.is_empty(), "the stale result is not kept");
+        assert_eq!(gx2.caches.sync_textures.len(), 1);
+        // decoded on the render thread now, from the bytes as they are
+        gx2.caches.waiting = None;
+        assert!(gx2.texture_view(&g, 0x100, TexKind::D2).is_some());
+        assert!(gx2.caches.texture_jobs.is_empty());
+        let h = crate::texture::Header::read(&g, 0x100);
+        assert_eq!(
+            gx2.caches.textures.values().next().expect("kept").hash,
+            texture_source_hash(&g, 0x100, &h)
+        );
+        // memory elsewhere does not touch a job
+        let mut other = async_gx2();
+        assert!(other.texture_view(&g, 0x100, TexKind::D2).is_none());
+        other.invalidate_textures(0x2_0000, 0x100);
+        other.collect_decodes(true);
+        assert_eq!(other.caches.textures.len(), 1);
+    }
+
+    #[test]
+    fn a_changed_texture_is_drawn_as_it_was_while_a_worker_decodes_it_again() {
+        let mut gx2 = Gx2::new(crate::Display::noop());
+        let mut m = vec![0u8; 0x2_0000];
+        small_texture(&mut m);
+        let g = Guest::new(m.as_mut_ptr());
+        assert!(gx2.texture_view(&g, 0x100, TexKind::D2).is_some());
+        let first = gx2.caches.textures.values().next().expect("kept").hash;
+        gx2.caches.async_decode = true;
+        gx2.caches.decode_spent = std::time::Duration::from_secs(1);
+        g.put_u32(0x1_0040, 0xdead_beef);
+        gx2.invalidate_textures(0x1_0000, 0x100);
+        // the old texture meanwhile, and no draw waits
+        assert!(gx2.texture_view(&g, 0x100, TexKind::D2).is_some());
+        assert_eq!(gx2.caches.waiting, None);
+        assert_eq!(gx2.caches.texture_jobs.len(), 1);
+        gx2.collect_decodes(true);
+        let now = gx2.caches.textures.values().next().expect("kept");
+        assert!(now.hash != first && !now.dirty);
+    }
+
+    #[test]
+    fn vertex_streams_decoded_on_a_worker_are_the_ones_decoded_here() {
+        let mut m = vec![0u8; 0x1_0000];
+        let g = Guest::new(m.as_mut_ptr());
+        for k in 0..64 * 3 {
+            g.put_u32(0x1000 + k * 4, (k as f32).to_bits());
+        }
+        let fetch = [stream(0, 0, 0x811)];
+        let mut st = State::default();
+        st.attrib_buffers[0] = crate::state::AttribBuffer {
+            address: 0x1000,
+            size: 12 * 64,
+            stride: 12,
+        };
+        let mut here = Gx2::new(crate::Display::noop());
+        here.cached_streams(&g, &st, &fetch, 0, 64, 1).expect("decoded here");
+        let mut gx2 = async_gx2();
+        assert!(gx2.cached_streams(&g, &st, &fetch, 0, 64, 1).is_none());
+        assert_eq!(gx2.caches.waiting, Some("vertex streams decoded in a later frame"));
+        // the guest's bytes change after the copy: the worker decodes what was hashed (and what the key names)
+        g.put_u32(0x1000, 7);
+        gx2.collect_decodes(true);
+        assert!(gx2.caches.stream_jobs.is_empty());
+        let (key, e) = gx2.caches.streams.iter().next().expect("kept");
+        assert_eq!(here.caches.streams[key].pending, e.pending);
+        g.put_u32(0x1000, 0);
+        let drawn = gx2.cached_streams(&g, &st, &fetch, 0, 64, 1).expect("back from the worker");
+        assert!(!drawn.kept, "in the arena in the frame it came back in");
+        gx2.flush_draws();
+        gx2.swaps += 1;
+        gx2.prune();
+        assert!(gx2.cached_streams(&g, &st, &fetch, 0, 64, 1).expect("kept").kept);
     }
 }
