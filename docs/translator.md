@@ -309,6 +309,8 @@ with their text and the cloth background, upright, in the right places (the hunt
     lookup's coordinates as red/green, `fract`ed: flat colour means the coordinates are wrong), `inputN` (input register N as it
     arrives from the vertex shader, e.g. `input1` the vertex colour of many shaders: black means the vertex stream or the vertex
     shader) and `normalN`/`normals` (the same mapped from -1..1). Magenta: the shader has no such lookup or input.
+  - **Uniform blocks** are read to the next 256 bytes past the size the game gives (`SQ_ALU_CONST_BUFFER_SIZE` is in 256-byte units),
+    as the hardware does; the village's scenery reads its material colour and UV transform there.
   - **Shadow maps drawn as colour**: a buffer drawn into as colour (the village's 1024x1024 `r32f`) and read with a comparison
     (`SAMPLE_C`) is copied into a depth texture (first component, clamped to 0..1) when it has changed since the last copy, and the
     comparison is the sampler's own (`GX2InitSamplerDepthCompare`; less or equal when none was set). Before, such a lookup read a

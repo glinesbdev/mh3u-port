@@ -184,6 +184,15 @@ fog table and shadow lookups and are right, which leaves the scenery's own input
 `INT_TO_FLT` path, texture 1, block 1's packed material bytes). `MH3U_GFX_DEBUG_PS` and the per-draw uniform blocks are there to
 settle it in one run.
 
+**3h. Why the scenery was black (debug runs on c5d6ec1).** With `MH3U_GFX_DEBUG_PS` on the two scenery pixel shaders: `alpha1` and
+`input1` black, `tex` the whole village in flat texture colours, `uv` black. So the vertex colour was zero and every texture was read
+at one texel (uv (0, 1): black under `fract`). In the scenery's vertex shaders (`vs-169eee80`, `vs-169eb340`) the colour is
+constant 10 of block 1 (`MOV R1 <- KC0[10]`, or the decoded vertex colour times it), and the texture coordinates are the UV stream
+times constants 8 and 9 (`DOT4 R4.x <- R2.x, KC0[8].x`...); position uses constants 0 to 7 and was right. The upload read only
+`size` bytes of the block, and the hardware reads to the next 256 bytes (`GX2Set*UniformBlock` gives `SQ_ALU_CONST_BUFFER_SIZE` as
+`(size + 255) >> 8`): a block given as 8 vec4s still has 16. Constants past the given size are now uploaded up to that rounding.
+The integer colour path (`uint 8_8_8_8`, 0x10a, kept as integers for `INT_TO_FLT`) was checked and is right.
+
 ## 4. Does the generated code compile in a reasonable time? (done: as C yes, as one Rust crate no)
 
 `mh3u-tools codegen-bench <dump> <out> --lang rust|c --functions N` translates an even sample of the game's functions (found as the

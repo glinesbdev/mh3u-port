@@ -626,6 +626,14 @@ fn stencil_face(f: [u32; 4]) -> wgpu::StencilFaceState {
     }
 }
 
+/// How much of a uniform block the shader can read: `GX2Set*UniformBlock` gives the hardware the size in 256-byte units, rounded up
+/// (`SQ_ALU_CONST_BUFFER_SIZE`, 9 bits), so a block given as 0x80 bytes still reads 16 vec4s. The village's scenery shaders read
+/// constants 8 to 13 of block 1 (texture-coordinate transform and material colour) past the size the game gives; read as zero, the
+/// scenery was black with every texture read at one texel.
+pub(crate) fn readable_bytes(size: u32) -> u32 {
+    (size.div_ceil(256) & 0x1ff) * 256
+}
+
 /// The program that writes a colour texture's first component as depth: one triangle over the target.
 pub(crate) const DEPTH_COPY_WGSL: &str = "
 @group(0) @binding(0) var src: texture_2d<f32>;
@@ -1675,7 +1683,7 @@ impl Gx2 {
     pub(crate) fn uniform_buffer(&mut self, g: &Guest, block: &crate::state::UniformBlock, vec4s: u32) -> BufRef {
         let size = u64::from(vec4s.max(1)) * 16;
         let have = if block.address != 0 {
-            (block.size as usize).min(size as usize)
+            (readable_bytes(block.size) as usize).min(size as usize)
         } else {
             0
         };
@@ -2944,6 +2952,47 @@ mod tests {
         gx2.refresh_depth_copy(image);
         assert_eq!(gx2.caches.depth_copies[&image].2, 1);
         gx2.end_pass();
+    }
+
+    #[test]
+    fn uniform_blocks_are_readable_to_the_next_256_bytes() {
+        assert_eq!(readable_bytes(0), 0);
+        assert_eq!(readable_bytes(0x80), 0x100);
+        assert_eq!(readable_bytes(0x100), 0x100);
+        assert_eq!(readable_bytes(0x101), 0x200);
+        assert_eq!(readable_bytes(0x1_0000), 0x1_0000);
+        // what the scenery's vertex shader reads: block 1 given as 8 vec4s, the material colour at constant 10 is uploaded
+        let mut gx2 = Gx2::new(crate::Display::noop());
+        let mut m = vec![0u8; 0x2_0000];
+        let g = Guest::new(m.as_mut_ptr());
+        g.put_u32(0x1000 + 16 * 10, 0.5f32.to_bits());
+        let block = crate::state::UniformBlock {
+            address: 0x1000,
+            size: 0x80,
+        };
+        let _ = gx2.uniform_buffer(&g, &block, 14);
+        // all 14 vec4s the shader declares were read from the guest, not the 8 the size says
+        assert!(gx2.caches.uniforms.contains_key(&(0x1000, 14, 14 * 16)));
+        let words = uniform_as_before(
+            &g,
+            &crate::state::UniformBlock {
+                address: 0x1000,
+                size: readable_bytes(0x80),
+            },
+            14,
+        );
+        assert_eq!(f32::from_le_bytes(words[160..164].try_into().unwrap()), 0.5);
+        gx2.end_pass();
+    }
+
+    /// The scenery's vertex colour: a `uint 8_8_8_8` attribute (format 0x10a) reaches the shader as integers, which its
+    /// `INT_TO_FLT` and `x 1/255` turn into the colour (not normalised first, which would make it about 1/255 of itself).
+    #[test]
+    fn an_integer_colour_attribute_becomes_its_colour_through_int_to_flt() {
+        let raw = decode_attribute(0x10a, 3, &[255, 128, 0, 51]);
+        assert_eq!(raw, [255, 128, 0, 51]);
+        let colour: Vec<f32> = raw.iter().map(|&v| (v as i32) as f32 * 0.003_921_569).collect();
+        assert!((colour[0] - 1.0).abs() < 1e-6 && (colour[1] - 0.502).abs() < 1e-3 && colour[2] == 0.0 && (colour[3] - 0.2).abs() < 1e-6);
     }
 
     #[test]
