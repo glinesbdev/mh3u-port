@@ -245,6 +245,18 @@ Send back `Desktop\session.log` with your notes (the order of the steps, and whi
 - **Logs:** no `[hook]` lines (the watch build's folder was translated without them; harmless). The end of this log is
   UTF-16; `*>` in PowerShell mixes encodings. Use `| Out-File -Encoding utf8` in the steps instead.
 
+#### Run 36 (user): the confirmation run
+
+- **Old build:** it ran `3cf9b05`, not `01bf289`, so neither the exact counts nor `MH3U_WATCH_AT` were in it (the log says
+  `[calldiff] on: press F9`, the sampling mode). Also, the exact counts need `win-build.ps1 -Watch -Translate`: the counting
+  is in the translated `dispatch.c` and `ppc.h`.
+- **The quest's working save is not where items are used:** the village F10 watched the block at `0x2e66bd1c` (pouch
+  `0x2e66bdec`) through the whole quest. The only writes were the quest-load memset and two runtime copies of the whole save
+  (31232 bytes at `0x2e66bd44`), at quest start and at quest end. The game made no stores to it, so using items on a quest
+  does not write it.
+- **Next lead:** `0x30297908`, the other copy the in-quest F10 found in run 35. It is next to the quest data `quest_accept`
+  passes (`0x30297390`). Press F10 on the quest with `MH3U_WATCH_COPY=1`.
+
 ## Plan
 
 1. Write this doc. **(done)**
@@ -259,6 +271,7 @@ Send back `Desktop\session.log` with your notes (the order of the steps, and whi
 
 See the bottom of this file. It is updated with each commit of PR #13.
 
-- Status: run 35. The quest's working save is at `0x2e66bd1c`; exact call counts are in watch builds (PR #17). The item-use
-  writer and the menu hook are not found yet.
-- Next: a short run with `MH3U_WATCH_AT=0x2e66bd1c` (use items on a quest) and exact-count F9 windows around opening a menu.
+- Status: run 36 ran an old build. The quest's working save is ruled out for item use. The lead is `0x30297908`. No item-use
+  or menu hook yet (PR #17).
+- Next: a run on `01bf289` or later, translated again: exact-count F9 around opening a menu, and on a quest, F10 with
+  `MH3U_WATCH_COPY=1`, then use items.
