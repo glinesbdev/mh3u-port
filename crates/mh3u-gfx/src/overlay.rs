@@ -112,7 +112,13 @@ pub struct Overlay {
     filter: String,
     /// The last input (see `next_input`).
     last_input: egui::RawInput,
+    /// When the live save is read (on hook events, see `events`), and the last events, for the feed.
+    refresh: crate::events::Refresh,
+    feed: std::collections::VecDeque<String>,
 }
+
+/// How many events the feed shows.
+const FEED: usize = 8;
 
 impl Overlay {
     /// The overlay with the game's data read from the dump's base folder (on a thread of its own: it takes a moment) and the wishlist
@@ -159,6 +165,8 @@ impl Overlay {
             kind: 5,
             filter: String::new(),
             last_input: egui::RawInput::default(),
+            refresh: crate::events::Refresh::new(),
+            feed: Default::default(),
         }
     }
 
@@ -266,6 +274,25 @@ impl Overlay {
             }
             Save::At(at, name, save) => {
                 let at = *at;
+                let events = crate::events::drain();
+                if !events.is_empty() {
+                    let data = self.data.lock().unwrap_or_else(|e| e.into_inner());
+                    let name_of = |id: u16| match data.as_ref() {
+                        Some(Ok(d)) => d.item_name(id).to_string(),
+                        _ => format!("item {id}"),
+                    };
+                    for e in &events {
+                        if let Some(line) = crate::events::describe(e, &name_of) {
+                            if self.feed.len() == FEED {
+                                self.feed.pop_front();
+                            }
+                            self.feed.push_back(line);
+                        }
+                    }
+                }
+                if !self.refresh.due(Instant::now(), crate::events::hooked(), !events.is_empty()) {
+                    return;
+                }
                 let snap = mods::latest();
                 let Some(bytes) = snap.bytes(at, live::LEN as usize) else { return };
                 match live::parse(bytes, at, Some(name)) {
@@ -570,6 +597,13 @@ impl Overlay {
                 }
             });
         drop(guard);
+        if !self.feed.is_empty() {
+            egui::Window::new("Events").default_pos([560.0, 300.0]).show(ctx, |ui| {
+                for line in self.feed.iter().rev() {
+                    ui.label(line);
+                }
+            });
+        }
         let controls = CONTROLS.lock().unwrap_or_else(|e| e.into_inner()).clone();
         egui::Window::new("Controls")
             .default_pos([560.0, 24.0])

@@ -4,6 +4,7 @@ mod decode;
 mod draw;
 #[cfg(test)]
 mod draw_bench;
+pub mod events;
 mod geometry;
 mod gx2;
 pub mod kbm;

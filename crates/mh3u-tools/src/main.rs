@@ -920,6 +920,11 @@ fn run_game(dump: &Dump, c_dir: &Path, max_imports: u64, save: PathBuf, window: 
         if std::env::var("MH3U_HOOK_LOG").is_ok_and(|v| v.trim() == "1") {
             registry.log_all();
         }
+        // the overlay's events (item gains, money, crafts, quest ends; docs/overlay.md)
+        let n = mh3u_gfx::events::register(&mut registry);
+        if n > 0 {
+            eprintln!("[overlay] {n} hooks feed the overlay; the live save is read on their events and every 2 s");
+        }
         mh3u_rt::hooks::install(registry);
     }
     let text = rpx::section_at(&data, TEXT_ADDRESS)?;

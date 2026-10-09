@@ -200,13 +200,6 @@ The confidence is medium; a callback can switch on `h.ctx.lr`. `mods/hooks.txt` 
 
 See the bottom of this file. It is updated with each commit of PR #13.
 
-- Status: PR #15 is merged. Confirmed hooks: money_add, item_gain (destination by lr), craft_jewel, craft_equipment,
-  upgrade_equipment, quest_accept, quest_end, quest_reward. `item_to_box` and `item_to_pouch` are added, not yet confirmed.
-- Next:
-  1. Confirm `item_to_box` and `item_to_pouch` (pick up an item in the field; get quest reward items).
-  2. Item use (consume): use a potion with `MH3U_HOOK_LOG=1`. If no hook fires, run `MH3U_WATCH=live` on that pouch slot;
-     the writer (or its lr) gives the hook.
-  3. Menu open: `MH3U_PROFILE` with a menu open versus closed, or `MH3U_ENTER_LR` around the menu sound's call; no save
-     field marks it.
-  4. Overlay: drive the wishlist from hooks (refresh and toast on `item_gain` and `money_add`, instead of polling the save
-     every frame).
+- Status: PR #16 wires `item_gain`, `pouch_remove_slot`, `money_add`, the craft hooks and `quest_end` into the overlay
+  (events, feed, read on events plus every 2 s; `overlay.md`). `item_to_box` and `item_to_pouch` are not confirmed yet.
+- Next: item use (consume), menu open, and confirming the caller hooks (see the steps above).

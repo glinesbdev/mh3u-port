@@ -11,6 +11,11 @@ mod game;
 mod guest;
 mod gx2;
 pub mod hooks;
+
+/// A zeroed context with no guest memory, for tests of hook callbacks elsewhere.
+pub fn new_test_ctx() -> Ctx {
+    game::new_ctx(std::ptr::null_mut())
+}
 pub mod input;
 mod kernel;
 mod memory;
