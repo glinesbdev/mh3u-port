@@ -127,7 +127,21 @@ offset units) come from the decaf-emu sources, read for facts only: no code is t
   - **Cost:** three six-channel reverbs, the most the buses can carry, take 73 µs a 3 ms frame in a release build (2.4% of one core
     on the audio thread). In practice it is one or two stereo reverbs.
 
-## Building
+## Run 24 (PR #10, merged in 2c12dbb): effects
+
+- **The owner: "the sound is amazing".** Footsteps on each kind of ground, water, menus, and reverb in caves. FPS 80+.
+- **Every audio import is done:** `snd_core` 37/37, `snd_user` 37/37.
+- **Both reverbs the game made fell back to the default room**, so the rooms are this port's, not the game's:
+  - `[audio fx] Hi at 0x2e60efd0`: every setting read as 0 (pre-delay, time, coloration, damping, crosstalk and mix). That is no
+    real setting, so the check refused it.
+  - `[audio fx] MultiCh at 0x2e60f884`: its parameters are not known.
+- **Open: where `ReverbHi`'s settings come from.** All zeros looks like the structure read at `Init`, before the game writes its
+  settings, rather than wrong offsets: a wrong place would rarely be all zero. To find out:
+  1. Read the structure again at each `Settings` call and at the first callbacks (`MH3U_TRACE_AX` logs every `Init`/`Settings`), and
+     take the settings once they become plausible.
+  2. If they never do, dump the 0x160 bytes to see where the floats are.
+  3. `MultiChReverb`'s parameters remain unknown.
+
 
 - Windows: nothing more (WASAPI is part of Windows).
 - Linux: `cpal` needs the ALSA development files: `alsa-lib` on Arch (`sudo pacman -S alsa-lib`), `libasound2-dev` on Debian and
