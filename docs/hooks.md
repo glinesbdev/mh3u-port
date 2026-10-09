@@ -153,6 +153,22 @@ prints which `f_` each one is.
 - **Not hooked yet:** weapon craft or upgrade, and the quest reward. They are likely other callers of `money_add`. Its
   `[hook] money_add ... lr 0x…` lines give their call sites, which become new `in:` entries.
 
+### Run 32 (user): craft and quest hooks
+
+| Hook | Function | Verdict | Arguments | Seen on |
+|---|---|---|---|---|
+| `craft_jewel` | `f_02208758` | **confirmed** | r4 = 5, r3 = the smithy (0x2e6607c0) | crafting a jewel (-200) |
+| `craft_equipment` (was craft_armour) | `f_022070cc` | **confirmed** | r4 = 7 for both armour and a Great Sword (not the kind) | crafting armour (-300) and a Great Sword (-750) |
+| `upgrade_equipment` | containing lr `0x220c078` | new | – | upgrading a weapon (-4000) |
+| `quest_accept` | `f_021e355c` | **confirmed** | r4 = the quest's data, r5 = the quest's number (0x4b2, 0x450) | accepting two quests (-100 each) |
+| `quest_end` (was quest_abandon) | `f_0217242c` | **confirmed** | r4 = 1 both times (not the outcome) | abandoning, then a refund of +100 (lr `0x2172ca4`); completing, then the payments below |
+| `quest_fee_back` | containing lr `0x21794c8` | new | – | +200 just before `quest_end` on completion |
+| `quest_reward` | containing lr `0x217f12c` | new, likely | – | +800 after completion |
+| `quest_reward_items` | containing lr `0x217f5b0` | new, low | – | 10 small payments (8 to 0x87) after completion |
+
+`quest_end`'s r4 does not tell an abandon from a completion. What follows does: a `money_add` from lr `0x2172ca4` means
+abandoned; `quest_fee_back` and `quest_reward` mean completed.
+
 ## Plan
 
 1. Write this doc. **(done)**
@@ -167,6 +183,7 @@ prints which `f_` each one is.
 
 See the bottom of this file. It is updated with each commit of PR #13.
 
-- Status: PR #15 adds `in:` entries and the craft and quest hooks (craft_jewel, craft_armour, quest_accept, quest_abandon).
-  None is confirmed yet.
-- Next: the confirm run (steps in the PR). It also gives the `money_add` lrs of a weapon craft and a quest reward.
+- Status: run 32 confirmed craft_jewel, craft_equipment, quest_accept and quest_end. The upgrade and quest-reward hooks are
+  new and not confirmed yet (PR #15).
+- Next: a short run to confirm `upgrade_equipment`, `quest_fee_back`, `quest_reward` and `quest_reward_items` (upgrade a
+  weapon, complete a quest).

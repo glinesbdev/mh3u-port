@@ -13,9 +13,13 @@
 0x02198d40 equip_records      # writes the records at +0x50..+0xbf after crafting armour; r5 = record kind (0x10..0x19)
 # The functions that call money_add at these return addresses (in: = the function containing the address; the translator prints
 # which f_ it is):
-in:0x022087d4 craft_jewel      # the jewel craft fee (-200)
-in:0x0220715c craft_armour     # the armour craft fee (-300)
-in:0x021e3724 quest_accept     # the quest fee (-310)
-in:0x02172ca4 quest_abandon    # the refund on abandoning (+310)
+in:0x022087d4 craft_jewel        # f_02208758, confirmed run 32 (fee -200)
+in:0x0220715c craft_equipment    # f_022070cc, confirmed run 32: armour (-300) and a Great Sword (-750); r4 = 7 both times
+in:0x0220c078 upgrade_equipment  # run 32: the weapon upgrade fee (-4000)
+in:0x021e3724 quest_accept       # f_021e355c, confirmed run 32; r4 = the quest's data, r5 = the quest's number (0x4b2, 0x450)
+in:0x02172ca4 quest_end          # f_0217242c, confirmed run 32 on abandon and on completion (r4 = 1 both times)
+in:0x021794c8 quest_fee_back     # run 32: +200 just before quest_end on completion
+in:0x0217f12c quest_reward       # run 32: +800 after completion, the reward money (likely)
+in:0x0217f5b0 quest_reward_items # run 32: 10 small payments after completion (likely the reward's items, or the commodities)
 # Rejected (thousands of calls a minute, queries, not actions): 0x0219acec (pouch item lookup, r4 = item id),
 # 0x02199408 (box item lookup, r4 = item id), 0x02198770 (field getter, r5 = 7/8), 0x0216afd4 (per-frame, another object).
