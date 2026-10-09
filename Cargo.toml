@@ -25,3 +25,4 @@ mh3u-recomp = { path = "crates/mh3u-recomp" }
 mh3u-testkit = { path = "crates/mh3u-testkit" }
 mh3u-latte = { path = "crates/mh3u-latte" }
 mh3u-audio = { path = "crates/mh3u-audio" }
+mh3u-mods = { path = "crates/mh3u-mods" }

@@ -102,6 +102,8 @@ pub(crate) struct Target {
 }
 
 pub struct Gx2 {
+    /// The mod overlay, drawn over the picture (`use_overlay`).
+    overlay: Option<crate::overlay::Overlay>,
     pub(crate) batch: crate::draw::Batch,
     pub(crate) d: Display,
     pub(crate) config: wgpu::SurfaceConfiguration,
@@ -184,6 +186,13 @@ struct Out { @builtin(position) position: vec4<f32>, @location(0) uv: vec2<f32> 
 ";
 
 impl Gx2 {
+    /// Draws the mod overlay (unless `MH3U_OVERLAY=off`), with the game's data from the dump's base folder and the wishlist in `dir`.
+    pub fn use_overlay(&mut self, dump_base: std::path::PathBuf, dir: std::path::PathBuf) {
+        if crate::overlay::enabled() && self.d.window.is_some() {
+            self.overlay = Some(crate::overlay::Overlay::new(dump_base, dir));
+        }
+    }
+
     pub fn new(d: Display) -> Gx2 {
         eprintln!("[gfx] build {}", crate::BUILD);
         let pipes = crate::pipelines::Pipelines::new(d.device.clone());
@@ -267,6 +276,7 @@ impl Gx2 {
             ..Default::default()
         });
         Gx2 {
+            overlay: None,
             batch: Default::default(),
             d,
             config,
@@ -606,6 +616,16 @@ impl Gx2 {
                 pass.set_bind_group(0, &group, &[]);
                 pass.draw(0..3, 0..1);
             }
+        }
+        if let Some(o) = self.overlay.as_mut() {
+            o.frame(
+                &self.d.device,
+                &self.d.queue,
+                &mut enc,
+                &view,
+                self.config.format,
+                (size.width, size.height),
+            );
         }
         self.d.queue.submit([enc.finish()]);
         self.d.queue.present(frame);

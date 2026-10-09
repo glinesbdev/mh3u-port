@@ -6,6 +6,25 @@
 //! is made, so there the range is only *reserved*, and a vectored exception handler commits 64 KiB at a time when the game or the
 //! runtime first touches it (an access violation inside the range, which is then retried). Both give zeroed pages on first use.
 
+/// Whether the host memory at `p` (inside the guest's range) has been touched already: reading it then costs nothing. On Windows an
+/// untouched page would be committed by the read, so a scan of memory (`mods`) skips those; elsewhere every page reads as cheaply.
+pub fn touched(p: *const u8) -> bool {
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEMORY_BASIC_INFORMATION, VirtualQuery};
+        // SAFETY: a plain C structure of numbers and pointers, for which all zeros is a valid value
+        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: VirtualQuery only reads the address space's bookkeeping, and `info` is ours
+        let n = unsafe { VirtualQuery(p.cast(), &mut info, std::mem::size_of::<MEMORY_BASIC_INFORMATION>()) };
+        n != 0 && info.State == MEM_COMMIT
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = p;
+        true
+    }
+}
+
 /// The size of the guest's address space.
 pub const SIZE: usize = 1 << 32;
 

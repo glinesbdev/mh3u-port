@@ -1,0 +1,518 @@
+//! The mod overlay: `egui` drawn over the game's picture, opened and closed with F1 or a gamepad's Back + right shoulder button. While
+//! open it takes all input (the game gets none; see `mh3u_rt::input`). Closed, it costs one atomic load a frame, plus a look at the
+//! live save four times a second while the wishlist has something on it (for the notices).
+//!
+//! The window's events reach egui on the window's thread (`egui-winit`), which hands the input it makes to the game thread through
+//! `INPUT`; the game thread runs egui and draws it at the end of the present pass (`egui-wgpu`).
+//!
+//! What it shows is the blacksmith wishlist (`mh3u_mods`): pieces picked from the recipes, what each needs against the item box and
+//! pouch of the save the game is playing, a shopping list of it all, and a notice when a piece becomes craftable.
+
+use mh3u_mods::data::{GameData, KINDS};
+use mh3u_mods::live;
+use mh3u_mods::wishlist::{Craftable, Piece, Wishlist};
+use mh3u_rt::input::{OVERLAY_ENABLED, OVERLAY_OPEN, OVERLAY_PRESSES, OVERLAY_TOGGLE, button};
+use mh3u_rt::mods::{self, Searching};
+use std::path::PathBuf;
+use std::sync::atomic::Ordering::Relaxed;
+use std::sync::{Arc, LazyLock, Mutex};
+use std::time::{Duration, Instant};
+
+/// The egui context the window's thread and the game thread share.
+pub static CONTEXT: LazyLock<egui::Context> = LazyLock::new(egui::Context::default);
+/// The input the window's thread gathered since the game thread last took it.
+pub static INPUT: Mutex<Option<egui::RawInput>> = Mutex::new(None);
+
+/// Whether the overlay is on (`MH3U_OVERLAY=off` turns it off); says so to the input.
+pub fn enabled() -> bool {
+    let on = !matches!(std::env::var("MH3U_OVERLAY").ok().as_deref().map(str::trim), Some("off" | "0"));
+    OVERLAY_ENABLED.store(on, Relaxed);
+    on
+}
+
+/// Adds input from the window's thread to what the game thread will take: the events in order, the newest of everything else.
+pub fn push_input(raw: egui::RawInput) {
+    let mut slot = INPUT.lock().unwrap_or_else(|e| e.into_inner());
+    match slot.as_mut() {
+        Some(old) => {
+            let mut events = std::mem::take(&mut old.events);
+            events.extend(raw.events.iter().cloned());
+            let mut dropped = std::mem::take(&mut old.dropped_files);
+            dropped.extend(raw.dropped_files.iter().cloned());
+            *old = raw;
+            old.events = events;
+            old.dropped_files = dropped;
+        }
+        None => *slot = Some(raw),
+    }
+}
+
+/// How long a notice stays.
+const NOTICE: Duration = Duration::from_secs(6);
+/// How often the save is looked at while closed, in frames, and how long after a failed search the next starts.
+const LOOK_EVERY: u64 = 15;
+const SEARCH_AGAIN: Duration = Duration::from_secs(10);
+
+enum Save {
+    /// Not looked for yet, or looked for and not there (since when).
+    Unknown(Option<Instant>),
+    Searching,
+    /// Found at this address, and its latest contents (none while the hunter is not loaded).
+    At(u32, Option<Box<mh3u_mods::companion::save::Save>>),
+}
+
+pub struct Overlay {
+    renderer: Option<egui_wgpu::Renderer>,
+    open: bool,
+    data: Arc<Mutex<Option<Result<GameData, String>>>>,
+    wishlist: Wishlist,
+    path: PathBuf,
+    save: Save,
+    craftable: Craftable,
+    notices: Vec<(String, Instant)>,
+    frame: u64,
+    /// The picker: the kind shown and the filter typed.
+    kind: u8,
+    filter: String,
+}
+
+impl Overlay {
+    /// The overlay with the game's data read from the dump's base folder (on a thread of its own: it takes a moment) and the wishlist
+    /// kept in `dir`.
+    pub fn new(dump_base: PathBuf, dir: PathBuf) -> Overlay {
+        let data = Arc::new(Mutex::new(None));
+        let slot = data.clone();
+        std::thread::spawn(move || {
+            let loaded = GameData::load(&dump_base).map_err(|e| format!("{e:#}"));
+            match &loaded {
+                Ok(d) => eprintln!(
+                    "[overlay] game data: {} items, {} recipes, {} upgrades",
+                    d.items.len(),
+                    d.recipes.len(),
+                    d.upgrades.len()
+                ),
+                Err(e) => eprintln!("[overlay] no game data: {e}"),
+            }
+            *slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(loaded);
+        });
+        let path = dir.join("wishlist.json");
+        let wishlist = Wishlist::load(&path);
+        eprintln!(
+            "[overlay] F1 or Back + RB opens it; wishlist {} ({} pieces)",
+            path.display(),
+            wishlist.pieces.len()
+        );
+        Overlay {
+            renderer: None,
+            open: false,
+            data,
+            wishlist,
+            path,
+            save: Save::Unknown(None),
+            craftable: Craftable::default(),
+            notices: Vec::new(),
+            frame: 0,
+            kind: 5,
+            filter: String::new(),
+        }
+    }
+
+    /// Each frame, from the present pass: opens or closes on a toggle, keeps the live save up to date, and draws when open or when a
+    /// notice is showing.
+    pub fn frame(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        enc: &mut wgpu::CommandEncoder,
+        view: &wgpu::TextureView,
+        format: wgpu::TextureFormat,
+        size: (u32, u32),
+    ) {
+        if OVERLAY_TOGGLE.swap(false, Relaxed) {
+            self.open = !self.open;
+            OVERLAY_OPEN.store(self.open, Relaxed);
+            OVERLAY_PRESSES.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        }
+        self.frame += 1;
+        if self.open || (!self.wishlist.pieces.is_empty() && self.frame.is_multiple_of(LOOK_EVERY)) {
+            self.follow_save();
+        }
+        self.notices.retain(|(_, t)| t.elapsed() < NOTICE);
+        if !self.open && self.notices.is_empty() {
+            // nothing to draw; the input gathered meanwhile is not wanted
+            INPUT.lock().unwrap_or_else(|e| e.into_inner()).take();
+            return;
+        }
+        self.draw(device, queue, enc, view, format, size);
+    }
+
+    /// Finds the live save (a search through the game's memory, a slice a frame) and reads it from the snapshot of each frame.
+    fn follow_save(&mut self) {
+        match &mut self.save {
+            Save::Unknown(since) => {
+                if since.is_none_or(|t| t.elapsed() > SEARCH_AGAIN) {
+                    mods::search(live::SEARCH_FROM, live::SEARCH_TO, live::is_live_block);
+                    self.save = Save::Searching;
+                }
+            }
+            Save::Searching => match mods::searching() {
+                Searching::Found(at) => {
+                    eprintln!("[overlay] the live save is at {at:#x}");
+                    mods::watch(&[(at, live::LEN)]);
+                    self.save = Save::At(at, None);
+                }
+                Searching::NotFound | Searching::Idle => self.save = Save::Unknown(Some(Instant::now())),
+                Searching::Running { .. } => {}
+            },
+            Save::At(at, save) => {
+                let at = *at;
+                let snap = mods::latest();
+                let parsed = snap.bytes(at, live::LEN as usize).and_then(|b| live::parse(b, at));
+                if parsed.is_none() && snap.bytes(at, 4).is_some() {
+                    // it was there and is not now: the hunter was unloaded (or it was never the save); look again
+                    mods::watch(&[]);
+                    self.craftable.forget();
+                    self.save = Save::Unknown(Some(Instant::now()));
+                    return;
+                }
+                *save = parsed.map(Box::new);
+                self.check_craftable();
+            }
+        }
+    }
+
+    /// Notices for the pieces that just became craftable.
+    fn check_craftable(&mut self) {
+        let Save::At(_, Some(save)) = &self.save else { return };
+        let shared = self.data.clone();
+        let guard = shared.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(Ok(data)) = guard.as_ref() else { return };
+        let statuses = self
+            .wishlist
+            .status(|p| data.making(p.kind, p.id).map(|m| m.materials), |i| save.item_count(i));
+        let new = self.craftable.update(&statuses);
+        let names: Vec<String> = new
+            .iter()
+            .map(|p| data.piece_name(p.kind, p.id).unwrap_or("?").to_string())
+            .collect();
+        drop(guard);
+        for n in names {
+            eprintln!("[overlay] craftable now: {n}");
+            self.notices.push((format!("⚒ {n} can be made now"), Instant::now()));
+        }
+    }
+
+    fn draw(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        enc: &mut wgpu::CommandEncoder,
+        view: &wgpu::TextureView,
+        format: wgpu::TextureFormat,
+        size: (u32, u32),
+    ) {
+        let ctx = CONTEXT.clone();
+        let mut raw = INPUT.lock().unwrap_or_else(|e| e.into_inner()).take().unwrap_or_default();
+        if !self.open {
+            // the notices only: no input for them
+            raw.events.clear();
+        }
+        let ppp = raw
+            .viewports
+            .get(&raw.viewport_id)
+            .and_then(|v| v.native_pixels_per_point)
+            .unwrap_or(1.0);
+        raw.screen_rect = Some(egui::Rect::from_min_size(
+            egui::Pos2::ZERO,
+            egui::vec2(size.0 as f32 / ppp, size.1 as f32 / ppp),
+        ));
+        // the gamepad moves through the overlay: up and down between the controls, A presses, B closes
+        for b in OVERLAY_PRESSES.lock().unwrap_or_else(|e| e.into_inner()).drain(..) {
+            let key = |key, shift| egui::Event::Key {
+                key,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers {
+                    shift,
+                    ..Default::default()
+                },
+            };
+            match b {
+                button::DOWN => raw.events.push(key(egui::Key::Tab, false)),
+                button::UP => raw.events.push(key(egui::Key::Tab, true)),
+                button::A => raw.events.push(key(egui::Key::Enter, false)),
+                button::B => OVERLAY_TOGGLE.store(true, Relaxed),
+                _ => {}
+            }
+        }
+        let output = ctx.run_ui(raw, |ui| {
+            let ctx = ui.ctx().clone();
+            self.ui(&ctx);
+        });
+        let renderer = self
+            .renderer
+            .get_or_insert_with(|| egui_wgpu::Renderer::new(device, format, Default::default()));
+        let jobs = ctx.tessellate(output.shapes, output.pixels_per_point);
+        let screen = egui_wgpu::ScreenDescriptor {
+            size_in_pixels: [size.0, size.1],
+            pixels_per_point: output.pixels_per_point,
+        };
+        let mut textures = output.textures_delta;
+        for (id, deltas) in textures.set.drain() {
+            for delta in &deltas {
+                renderer.update_texture(device, queue, id, delta);
+            }
+        }
+        let extra = renderer.update_buffers(device, queue, enc, &jobs, &screen);
+        {
+            let pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("overlay"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            renderer.render(&mut pass.forget_lifetime(), &jobs, &screen);
+        }
+        if !extra.is_empty() {
+            queue.submit(extra);
+        }
+        for id in textures.free.drain() {
+            renderer.free_texture(&id);
+        }
+    }
+
+    fn ui(&mut self, ctx: &egui::Context) {
+        for (k, (text, _)) in self.notices.iter().enumerate() {
+            egui::Area::new(egui::Id::new(("notice", k)))
+                .anchor(egui::Align2::RIGHT_TOP, egui::vec2(-16.0, 16.0 + 40.0 * k as f32))
+                .show(ctx, |ui| {
+                    egui::Frame::popup(ui.style()).show(ui, |ui| ui.label(egui::RichText::new(text).strong()));
+                });
+        }
+        if !self.open {
+            return;
+        }
+        let mut changed = false;
+        let shared = self.data.clone();
+        let guard = shared.lock().unwrap_or_else(|e| e.into_inner());
+        egui::Window::new("Blacksmith wishlist")
+            .default_pos([24.0, 24.0])
+            .default_width(520.0)
+            .show(ctx, |ui| {
+                ui.label("F1 or Back + RB closes this. The game is paused for input while it is open.");
+                let data = match guard.as_ref() {
+                    None => {
+                        ui.label("Reading the game's data from the dump…");
+                        return;
+                    }
+                    Some(Err(e)) => {
+                        ui.colored_label(egui::Color32::LIGHT_RED, format!("No game data: {e}"));
+                        return;
+                    }
+                    Some(Ok(d)) => d,
+                };
+                let save = match &self.save {
+                    Save::At(at, Some(s)) => {
+                        ui.label(format!("Hunter: {} (live save at {at:#x})", s.hunter_name));
+                        Some(s)
+                    }
+                    Save::At(..) => {
+                        ui.label("The live save is not readable just now (no hunter loaded?)");
+                        None
+                    }
+                    Save::Searching => {
+                        if let Searching::Running { done, of } = mods::searching() {
+                            ui.label(format!(
+                                "Looking for the live save in memory… {}%",
+                                u64::from(done) * 100 / u64::from(of.max(1))
+                            ));
+                        }
+                        None
+                    }
+                    Save::Unknown(_) => {
+                        ui.label("No live save found yet: load a hunter (it is looked for again every few seconds)");
+                        None
+                    }
+                };
+                let have = |item: u16| save.map_or(0, |s| s.item_count(item));
+                ui.separator();
+                // the picker
+                ui.horizontal(|ui| {
+                    egui::ComboBox::from_id_salt("kind")
+                        .selected_text(KINDS.iter().find(|k| k.0 == self.kind).map_or("?", |k| k.1))
+                        .show_ui(ui, |ui| {
+                            for &(k, name, _) in KINDS {
+                                ui.selectable_value(&mut self.kind, k, name);
+                            }
+                        });
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.filter)
+                            .hint_text("filter by name")
+                            .desired_width(200.0),
+                    );
+                });
+                let needle = self.filter.to_lowercase();
+                egui::ScrollArea::vertical().id_salt("pieces").max_height(160.0).show(ui, |ui| {
+                    for (id, name) in data.pieces(self.kind) {
+                        if !needle.is_empty() && !name.to_lowercase().contains(&needle) {
+                            continue;
+                        }
+                        let piece = Piece { kind: self.kind, id };
+                        ui.horizontal(|ui| {
+                            let on = self.wishlist.pieces.contains(&piece);
+                            if ui.add_enabled(!on, egui::Button::new("+")).clicked() {
+                                changed |= self.wishlist.add(piece);
+                            }
+                            ui.label(name);
+                        });
+                    }
+                });
+                ui.separator();
+                let statuses = self.wishlist.status(|p| data.making(p.kind, p.id).map(|m| m.materials), have);
+                if statuses.is_empty() {
+                    ui.label("Nothing wished for yet: pick pieces above.");
+                }
+                let mut remove = None;
+                egui::ScrollArea::vertical().id_salt("wished").max_height(260.0).show(ui, |ui| {
+                    for s in &statuses {
+                        let p = s.piece;
+                        let name = data.piece_name(p.kind, p.id).unwrap_or("?");
+                        let missing: u32 = s.materials.iter().map(|n| n.missing()).sum();
+                        let head = if s.craftable {
+                            format!("✔ {name}: ready")
+                        } else {
+                            format!("{name}: {missing} missing")
+                        };
+                        ui.horizontal(|ui| {
+                            if ui.small_button("✖").on_hover_text("take it off the list").clicked() {
+                                remove = Some(p);
+                            }
+                            egui::CollapsingHeader::new(head).id_salt(("wish", p.kind, p.id)).show(ui, |ui| {
+                                if let Some(m) = data.making(p.kind, p.id)
+                                    && !m.from.is_empty()
+                                {
+                                    let from: Vec<&str> = m.from.iter().filter_map(|&f| data.piece_name(p.kind, f)).collect();
+                                    ui.label(format!("upgraded from {}", from.join(" or ")));
+                                }
+                                egui::Grid::new(("materials", p.kind, p.id)).striped(true).show(ui, |ui| {
+                                    for n in &s.materials {
+                                        ui.label(data.item_name(n.item));
+                                        let text = format!("{} / {}", n.have, n.need);
+                                        if n.missing() == 0 {
+                                            ui.colored_label(egui::Color32::LIGHT_GREEN, text);
+                                        } else {
+                                            ui.label(text);
+                                        }
+                                        ui.end_row();
+                                    }
+                                });
+                            });
+                        });
+                    }
+                });
+                if let Some(p) = remove {
+                    self.wishlist.remove(p);
+                    changed = true;
+                }
+                if !statuses.is_empty() {
+                    ui.separator();
+                    ui.label(egui::RichText::new("Shopping list").strong());
+                    egui::Grid::new("shopping").striped(true).show(ui, |ui| {
+                        ui.label("item");
+                        ui.label("have");
+                        ui.label("need");
+                        ui.label("missing");
+                        ui.end_row();
+                        for n in Wishlist::shopping(&statuses) {
+                            ui.label(data.item_name(n.item));
+                            ui.label(n.have.to_string());
+                            ui.label(n.need.to_string());
+                            if n.missing() > 0 {
+                                ui.colored_label(egui::Color32::LIGHT_RED, n.missing().to_string());
+                            } else {
+                                ui.label("0");
+                            }
+                            ui.end_row();
+                        }
+                    });
+                }
+            });
+        drop(guard);
+        if changed && let Err(e) = self.wishlist.save(&self.path) {
+            eprintln!("[overlay] could not save the wishlist to {}: {e}", self.path.display());
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn input_from_the_window_keeps_every_event_and_the_newest_of_the_rest() {
+        let ev = |c: &str| egui::Event::Text(c.into());
+        push_input(egui::RawInput {
+            events: vec![ev("a")],
+            time: Some(1.0),
+            ..Default::default()
+        });
+        push_input(egui::RawInput {
+            events: vec![ev("b")],
+            time: Some(2.0),
+            ..Default::default()
+        });
+        let raw = INPUT.lock().unwrap().take().unwrap();
+        assert_eq!(raw.events, [ev("a"), ev("b")]);
+        assert_eq!(raw.time, Some(2.0));
+    }
+
+    #[test]
+    fn it_opens_draws_and_closes_on_a_toggle_and_draws_nothing_closed() {
+        let d = crate::Display::noop();
+        let dir = std::env::temp_dir().join(format!("mh3u-overlay-{}", std::process::id()));
+        // no dump here: the overlay says so instead of the wishlist
+        let mut o = Overlay::new(dir.join("no-dump"), dir.clone());
+        let target = d.device.create_texture(&wgpu::TextureDescriptor {
+            label: None,
+            size: wgpu::Extent3d {
+                width: 640,
+                height: 360,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[],
+        });
+        let view = target.create_view(&Default::default());
+        let frame = |o: &mut Overlay| {
+            let mut enc = d.device.create_command_encoder(&Default::default());
+            o.frame(&d.device, &d.queue, &mut enc, &view, wgpu::TextureFormat::Rgba8Unorm, (640, 360));
+            d.queue.submit([enc.finish()]);
+        };
+        frame(&mut o);
+        assert!(o.renderer.is_none(), "closed with no notices: egui does not run");
+        OVERLAY_TOGGLE.store(true, Relaxed);
+        frame(&mut o);
+        frame(&mut o);
+        assert!(OVERLAY_OPEN.load(Relaxed));
+        assert!(o.renderer.is_some());
+        OVERLAY_TOGGLE.store(true, Relaxed);
+        frame(&mut o);
+        assert!(!OVERLAY_OPEN.load(Relaxed));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+}

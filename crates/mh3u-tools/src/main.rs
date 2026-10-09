@@ -91,6 +91,9 @@ enum Tool {
         /// Open a window and draw into it.
         #[arg(long)]
         window: bool,
+        /// With --window: borderless fullscreen on the window's monitor (also MH3U_FULLSCREEN=1; F11 or Alt+Enter toggles it).
+        #[arg(long)]
+        fullscreen: bool,
         /// How many system calls to allow before stopping.
         #[arg(long, default_value_t = 100_000)]
         max_imports: u64,
@@ -270,10 +273,11 @@ fn main() -> Result<()> {
             c_dir,
             save_dir,
             window,
+            fullscreen,
             max_imports,
         } => {
             let save = save_dir.unwrap_or_else(|| c_dir.join("save"));
-            run_game(&dump(&game_dir)?, &c_dir, max_imports, save, window)
+            run_game(&dump(&game_dir)?, &c_dir, max_imports, save, window, fullscreen)
         }
         Tool::Disasm { game_dir, start, count } => {
             let data = read(&dump(&game_dir)?.executable()?)?;
@@ -880,7 +884,7 @@ fn patch_import_addresses(rpx_data: &[u8], words: &mut [u32], imports: &Imports)
     Ok(())
 }
 
-fn run_game(dump: &Dump, c_dir: &Path, max_imports: u64, save: PathBuf, window: bool) -> Result<()> {
+fn run_game(dump: &Dump, c_dir: &Path, max_imports: u64, save: PathBuf, window: bool, fullscreen: bool) -> Result<()> {
     let data = read(&dump.executable()?)?;
     let entry = u32::from_be_bytes(data.get(0x18..0x1c).context("short file")?.try_into()?);
     let mut pieces = Vec::new();
@@ -927,10 +931,14 @@ fn run_game(dump: &Dump, c_dir: &Path, max_imports: u64, save: PathBuf, window: 
     mh3u_rt::input::start_gamepads();
     // the pipelines made are kept with the build, in its cache folder
     let cache = c_dir.join("cache");
-    mh3u_gfx::run(move |display| {
+    // the overlay reads the game's data from the base game, and keeps its files (the wishlist) with the build
+    let (dump_base, mods_dir) = (dump.base.clone(), c_dir.join("mods"));
+    let fullscreen = mh3u_gfx::fullscreen_wanted(fullscreen, std::env::var("MH3U_FULLSCREEN").ok().as_deref());
+    mh3u_gfx::run(fullscreen, move |display| {
         let mut options = options;
         let mut gx2 = mh3u_gfx::Gx2::new(display);
         gx2.use_cache_dir(&cache);
+        gx2.use_overlay(dump_base, mods_dir);
         options.backend = Some(Box::new(gx2));
         if let Err(e) = finish(options) {
             eprintln!("{e:#}");

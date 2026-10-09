@@ -11,6 +11,8 @@ param(
     [string]$Out = (Join-Path $env:LOCALAPPDATA 'mh3u\c'),
     # Print the FPS and the graphics timings (MH3U_FPS and MH3U_GFX_TIMES).
     [switch]$Fps,
+    # Borderless fullscreen on the window's monitor (--fullscreen); F11 or Alt+Enter toggles it while playing.
+    [switch]$Fullscreen,
     # Print the graphics report at the end (MH3U_GFX_REPORT).
     [switch]$Report,
     # Write frames (draws, shaders, textures, the picture) to this folder (MH3U_GFX_DUMP_DIR); which ones is -Frames.
@@ -72,6 +74,7 @@ if (-not $Log) {
 }
 
 $runArgs = @('run', $Games, $Out, '--window', '--max-imports', '1000000000000')
+if ($Fullscreen) { $runArgs += '--fullscreen' }
 $savedEncoding = [Console]::OutputEncoding
 $writer = $null
 try {

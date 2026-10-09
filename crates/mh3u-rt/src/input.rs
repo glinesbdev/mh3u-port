@@ -52,6 +52,18 @@ pub struct Input {
 
 pub static INPUT: Input = Input::new();
 
+/// The overlay (`mh3u-gfx`): whether there is one (`MH3U_OVERLAY`), whether it is open (the game then gets no input at all), a toggle
+/// asked for by the gamepad's combination, the buttons kept from the game until they are let go (the combination's), and the gamepad
+/// buttons pressed while it is open (for the overlay to move with).
+pub static OVERLAY_ENABLED: AtomicBool = AtomicBool::new(false);
+pub static OVERLAY_OPEN: AtomicBool = AtomicBool::new(false);
+pub static OVERLAY_TOGGLE: AtomicBool = AtomicBool::new(false);
+static SWALLOWED: AtomicU32 = AtomicU32::new(0);
+pub static OVERLAY_PRESSES: std::sync::Mutex<Vec<u32>> = std::sync::Mutex::new(Vec::new());
+/// Back (View, Select) and the right shoulder button held together open and close the overlay. The game has no use for the pair:
+/// Minus opens its menu only on its own, and the combination's buttons are kept from the game until they are let go.
+pub const OVERLAY_COMBO: u32 = button::MINUS | button::R;
+
 fn store(a: &AtomicU32, v: f32) {
     a.store(v.to_bits(), Relaxed);
 }
@@ -107,9 +119,16 @@ impl Input {
 
     pub fn set_pad_button(&self, mask: u32, down: bool) {
         if down {
-            self.pad.fetch_or(mask, Relaxed);
+            let held = self.pad.fetch_or(mask, Relaxed) | mask;
+            if OVERLAY_ENABLED.load(Relaxed) && held & OVERLAY_COMBO == OVERLAY_COMBO && mask & OVERLAY_COMBO != 0 {
+                OVERLAY_TOGGLE.store(true, Relaxed);
+                SWALLOWED.fetch_or(OVERLAY_COMBO, Relaxed);
+            } else if OVERLAY_OPEN.load(Relaxed) {
+                OVERLAY_PRESSES.lock().unwrap_or_else(|e| e.into_inner()).push(mask);
+            }
         } else {
             self.pad.fetch_and(!mask, Relaxed);
+            SWALLOWED.fetch_and(!mask, Relaxed);
         }
     }
 
@@ -134,6 +153,9 @@ impl Input {
     /// The sticks (left x, left y, right x, right y): a gamepad's when it is pushed, else the keyboard's.
     pub fn sticks(&self) -> [f32; 4] {
         let mut out = [0.0; 4];
+        if OVERLAY_OPEN.load(Relaxed) {
+            return out;
+        }
         for (i, o) in out.iter_mut().enumerate() {
             let p = load(&self.pad_sticks[i]);
             *o = if p.abs() > 0.05 { p } else { load(&self.keyboard_sticks[i]) };
@@ -143,11 +165,18 @@ impl Input {
 
     /// The buttons held, with the sticks' directions as buttons.
     pub fn hold(&self) -> u32 {
+        if OVERLAY_OPEN.load(Relaxed) {
+            return 0;
+        }
         let s = self.sticks();
-        self.keyboard.load(Relaxed) | self.pad.load(Relaxed) | stick_buttons(s[0], s[1], true) | stick_buttons(s[2], s[3], false)
+        let all = self.keyboard.load(Relaxed) | self.pad.load(Relaxed) | stick_buttons(s[0], s[1], true) | stick_buttons(s[2], s[3], false);
+        all & !SWALLOWED.load(Relaxed)
     }
 
     pub fn touch(&self) -> Option<(f32, f32)> {
+        if OVERLAY_OPEN.load(Relaxed) {
+            return None;
+        }
         self.touched.load(Relaxed).then(|| (load(&self.touch_x), load(&self.touch_y)))
     }
 }
@@ -330,6 +359,34 @@ pub fn start_gamepads() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_overlay_combination_toggles_and_is_kept_from_the_game_and_an_open_overlay_takes_all_input() {
+        // its own Input, but the overlay's flags are global: this is the only test that sets them
+        let input = Input::new();
+        OVERLAY_ENABLED.store(true, Relaxed);
+        input.set_pad_button(button::MINUS, true);
+        // Back alone reaches the game
+        assert_eq!(input.hold(), button::MINUS);
+        input.set_pad_button(button::R, true);
+        assert!(OVERLAY_TOGGLE.swap(false, Relaxed));
+        assert_eq!(input.hold(), 0, "the combination's buttons are the overlay's");
+        input.set_pad_button(button::R, false);
+        assert_eq!(input.hold(), 0, "Back stays kept until it is let go");
+        input.set_pad_button(button::MINUS, false);
+        input.set_pad_button(button::A, true);
+        assert_eq!(input.hold(), button::A);
+        // open: nothing reaches the game, and presses go to the overlay
+        OVERLAY_OPEN.store(true, Relaxed);
+        input.set_pad_button(button::DOWN, true);
+        input.set_keyboard_axis(0, 1.0);
+        input.set_touch(Some((1.0, 2.0)));
+        assert_eq!((input.hold(), input.sticks(), input.touch()), (0, [0.0; 4], None));
+        assert_eq!(OVERLAY_PRESSES.lock().unwrap().drain(..).collect::<Vec<_>>(), [button::DOWN]);
+        OVERLAY_OPEN.store(false, Relaxed);
+        assert_eq!(input.hold() & button::A, button::A);
+        OVERLAY_ENABLED.store(false, Relaxed);
+    }
 
     #[test]
     fn a_pushed_stick_is_also_a_button_and_keys_and_pads_add_up() {
