@@ -285,11 +285,7 @@ pub fn spawn(k: &Kernel, t: usize) {
     let th = &k.threads[t];
     let (entry, argc, argv, top) = (th.entry, th.argc, th.argv, th.stack_top);
     std::thread::spawn(move || {
-        let mut guard = lock();
-        while guard.as_ref().expect("kernel").current != t {
-            guard = kernel::BATON.wait(guard).unwrap_or_else(std::sync::PoisonError::into_inner);
-        }
-        drop(guard);
+        drop(kernel::wait_for_baton(lock(), t));
         let mut c = new_ctx(mem as *mut u8);
         c.r[1] = top.wrapping_sub(0x20);
         c.r[3] = argc;
@@ -321,10 +317,7 @@ pub fn spawn_audio(k: &mut Kernel) {
     });
     let (call, mem) = (k.call, k.memory as usize);
     std::thread::spawn(move || {
-        let mut guard = lock();
-        while guard.as_ref().expect("kernel").current != t {
-            guard = kernel::BATON.wait(guard).unwrap_or_else(std::sync::PoisonError::into_inner);
-        }
+        let mut guard = kernel::wait_for_baton(lock(), t);
         loop {
             guard = kernel::sleep_current(guard, std::time::Duration::from_millis(3));
             let callbacks = guard.as_ref().expect("kernel").ax_callbacks.clone();
@@ -358,10 +351,7 @@ pub fn spawn_alarms(k: &mut Kernel) {
     });
     let (call, mem) = (k.call, k.memory as usize);
     std::thread::spawn(move || {
-        let mut guard = lock();
-        while guard.as_ref().expect("kernel").current != t {
-            guard = kernel::BATON.wait(guard).unwrap_or_else(std::sync::PoisonError::into_inner);
-        }
+        let mut guard = kernel::wait_for_baton(lock(), t);
         loop {
             guard = kernel::sleep_current(guard, std::time::Duration::from_millis(2));
             let now = std::time::Instant::now();

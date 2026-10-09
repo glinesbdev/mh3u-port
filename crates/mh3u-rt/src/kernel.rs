@@ -198,6 +198,20 @@ pub fn lock() -> MutexGuard<'static, Option<Kernel>> {
     KERNEL.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
+/// Gives the baton to guest thread `next` (the caller holds the lock and the baton).
+fn hand_to(k: &mut Kernel, next: usize) {
+    k.current = next;
+    BATON.notify_all();
+}
+
+/// Waits, with the lock held on return, until guest thread `me` holds the baton.
+pub fn wait_for_baton(mut guard: MutexGuard<'static, Option<Kernel>>, me: usize) -> MutexGuard<'static, Option<Kernel>> {
+    while guard.as_ref().expect("kernel").current != me {
+        guard = BATON.wait(guard).unwrap_or_else(std::sync::PoisonError::into_inner);
+    }
+    guard
+}
+
 /// Something got done: a system function finished, so the threads that wait are not stuck.
 pub fn progress(k: &mut Kernel) {
     k.spins = 0;
@@ -273,8 +287,7 @@ pub fn pass_baton(mut guard: MutexGuard<'static, Option<Kernel>>, waiting: bool)
         k.stuck_since = None;
     }
     let next = k.next_after(me);
-    k.current = next;
-    BATON.notify_all();
+    hand_to(k, next);
     // when nothing else can run and this thread only waits for time to pass, do not spin the core
     let idle = next == me && waiting;
     if idle || (k.spins > 4 * k.threads.len() as u64 + 8 && waiting) {
@@ -287,13 +300,9 @@ pub fn pass_baton(mut guard: MutexGuard<'static, Option<Kernel>>, waiting: bool)
         std::thread::sleep(Duration::from_micros(200));
         guard = lock();
     }
-    while guard.as_ref().expect("kernel").current != me {
-        guard = BATON.wait(guard).unwrap_or_else(std::sync::PoisonError::into_inner);
-    }
-    guard
+    wait_for_baton(guard, me)
 }
 
-/// Sleeps the calling thread for `duration`, letting the others run meanwhile.
 /// Time spent in the graphics calls, by name.
 #[derive(Default)]
 pub struct CallTimes {
@@ -351,6 +360,7 @@ pub struct Alarm {
     pub tag: u32,
 }
 
+/// Sleeps the calling thread for `duration`, letting the others run meanwhile.
 pub fn sleep_current(mut guard: MutexGuard<'static, Option<Kernel>>, duration: Duration) -> MutexGuard<'static, Option<Kernel>> {
     let until = Instant::now() + duration;
     let me = guard.as_ref().expect("kernel").current;
@@ -371,8 +381,8 @@ pub fn retire(mut guard: MutexGuard<'static, Option<Kernel>>) -> ! {
         drop(guard);
         crate::game::stop_unlocked("every thread has ended".into());
     }
-    k.current = k.next_after(me);
-    BATON.notify_all();
+    let next = k.next_after(me);
+    hand_to(k, next);
     loop {
         guard = BATON.wait(guard).unwrap_or_else(std::sync::PoisonError::into_inner);
     }
@@ -409,5 +419,105 @@ mod reporting_tests {
         // a number past the names grows the arrays instead of failing
         r.note(5, [0; 4], 0);
         assert_eq!(r.counts[5], 1);
+    }
+}
+
+#[cfg(test)]
+mod baton_tests {
+    use super::*;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    fn thread() -> Thread {
+        Thread {
+            addr: 0,
+            life: Life::Ready,
+            suspend: 0,
+            exit_code: 0,
+            sleep_until: None,
+            entry: 0,
+            argc: 0,
+            argv: 0,
+            stack_top: 0,
+            started: true,
+            last: None,
+        }
+    }
+
+    unsafe extern "C" fn no_call(_: *mut Ctx, _: u32) -> i32 {
+        0
+    }
+
+    fn env(name: &str, default: u64) -> u64 {
+        std::env::var(name).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
+    }
+
+    /// The cost of passing the baton between live guest threads when many others have ended (a thread that returns from its entry
+    /// point, or calls `OSExitThread`, is retired). The only test that sets the kernel: its threads are left blocked when it ends.
+    /// `MH3U_BATON_RETIRED` (50), `MH3U_BATON_LIVE` (8) and `MH3U_BATON_PASSES` (20000) set its size; run with `--nocapture` to see the
+    /// time per pass.
+    #[test]
+    fn baton_goes_round_the_live_threads_in_order() {
+        let retired = env("MH3U_BATON_RETIRED", 50) as usize;
+        let live = env("MH3U_BATON_LIVE", 8).max(1) as usize;
+        let passes = env("MH3U_BATON_PASSES", 20_000).max(64);
+        let mut memory = crate::memory::GuestMemory::reserve().expect("guest memory");
+        let mem = memory.as_mut_ptr();
+        let guest = Guest::new(mem);
+        let os = Os::new(&guest);
+        let n = retired + live;
+        let threads = (0..n).map(|_| thread()).collect();
+        *lock() = Some(Kernel::new(
+            os,
+            guest,
+            threads,
+            HashMap::new(),
+            no_call,
+            mem,
+            Reporting::new(Vec::new(), Vec::new(), u64::MAX),
+        ));
+        // the kernel points into it, and the threads outlive the test
+        std::mem::forget(memory);
+        for t in 0..retired {
+            std::thread::spawn(move || {
+                let mut guard = wait_for_baton(lock(), t);
+                guard.as_mut().expect("kernel").finish_thread(0);
+                retire(guard)
+            });
+        }
+        let count = Arc::new(AtomicU64::new(0));
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let start = Arc::new(Mutex::new(None::<Instant>));
+        let (done, finished) = std::sync::mpsc::channel();
+        for t in retired..n {
+            let (count, order, start, done) = (count.clone(), order.clone(), start.clone(), done.clone());
+            std::thread::spawn(move || {
+                let mut guard = wait_for_baton(lock(), t);
+                loop {
+                    // the kernel lock is held here, so the counting is in baton order
+                    let c = count.fetch_add(1, Ordering::Relaxed) + 1;
+                    if c == 1 {
+                        *start.lock().unwrap() = Some(Instant::now());
+                    }
+                    if c <= 64 {
+                        order.lock().unwrap().push(t);
+                    }
+                    if c == passes {
+                        let took = start.lock().unwrap().expect("started").elapsed();
+                        done.send(took).unwrap();
+                        drop(guard);
+                        loop {
+                            std::thread::park();
+                        }
+                    }
+                    guard = pass_baton(guard, false);
+                }
+            });
+        }
+        let took = finished.recv_timeout(Duration::from_secs(600)).expect("the baton went round");
+        let per = took / u32::try_from(passes - 1).unwrap();
+        eprintln!("[baton] {retired} retired, {live} live threads: {passes} passes in {took:.2?}, {per:.2?} per pass");
+        let expected: Vec<usize> = (0..64).map(|k| retired + k % live).collect();
+        assert_eq!(*order.lock().unwrap(), expected);
     }
 }
