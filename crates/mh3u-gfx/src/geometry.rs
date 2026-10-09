@@ -7,7 +7,7 @@ use crate::draw::{AttribStream, BufRef, Compiled, GeometryEntry, Role, count_loo
 use crate::gx2::Gx2;
 use crate::state::State;
 use mh3u_latte::decode::{decode, ring_extent};
-use mh3u_latte::translate::{Context, RingConfig, TexKind, VertexAttribute, VertexInputs, translate_es, translate_gs, translate_vertex};
+use mh3u_latte::translate::{Context, RingConfig, TexKind, VertexInputs, translate_es, translate_gs, translate_vertex};
 use mh3u_rt::Guest;
 use std::sync::Arc;
 
@@ -209,6 +209,7 @@ impl Gx2 {
                 st.half_z,
                 es_vec4,
                 gs_vec4,
+                crate::draw::vertex_semantics(g, vs),
             )),
         );
         if let Some(e) = self.caches.geometry.get(&key) {
@@ -225,16 +226,7 @@ impl Gx2 {
                 max_vertices,
             };
             let ctx = Context::new(&|_| TexKind::D2);
-            let attributes = fetch
-                .iter()
-                .enumerate()
-                .map(|(i, a)| VertexAttribute {
-                    gpr: a.location + 1,
-                    stream: i as u32,
-                    per_instance: a.per_instance,
-                    divisor: a.divisor,
-                })
-                .collect();
+            let attributes = crate::draw::vertex_attributes(&crate::draw::vertex_semantics(g, vs), fetch);
             let inputs = VertexInputs {
                 attributes,
                 half_z: st.half_z,

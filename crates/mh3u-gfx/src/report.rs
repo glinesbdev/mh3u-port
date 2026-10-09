@@ -368,6 +368,34 @@ impl Diagnostics {
                 let _ = std::fs::write(self.dump_dir.join("shaders").join(format!("{name}.txt")), text);
             }
         }
+        // the linkage: which register each attribute is loaded into (the vertex shader's semantic table), and which vertex output
+        // each pixel input takes (by semantic)
+        if st.vertex_shader != 0 {
+            let vs = st.vertex_shader;
+            let table = crate::draw::vertex_semantics(g, vs);
+            let loaded: Vec<String> = crate::draw::vertex_attributes(&table, attributes)
+                .iter()
+                .map(|a| format!("location {} -> R{}", attributes[a.stream as usize].location, a.gpr))
+                .collect();
+            let _ = writeln!(t, "  vertex semantic table {table:?}: {}", loaded.join(", "));
+            let words = g.u32(vs + 0xc).min(10);
+            let outs: Vec<u32> = (0..words * 4)
+                .map(|k| (g.u32(vs + 0x10 + 4 * (k / 4)) >> (8 * (k % 4))) & 0xff)
+                .collect();
+            if st.pixel_shader != 0 {
+                let ps = st.pixel_shader;
+                let inputs: Vec<String> = (0..g.u32(ps + 0x10).min(32))
+                    .map(|i| {
+                        let semantic = g.u32(ps + 0x14 + 4 * i) & 0xff;
+                        match outs.iter().position(|&o| o == semantic) {
+                            Some(p) => format!("i{i}<-param{p}"),
+                            None => format!("i{i}<-none(semantic {semantic})"),
+                        }
+                    })
+                    .collect();
+                let _ = writeln!(t, "  vertex output semantics {outs:?}; pixel inputs {}", inputs.join(", "));
+            }
+        }
         let cb = st.colour_buffers[0];
         let surface = |s: u32| {
             if s == 0 {

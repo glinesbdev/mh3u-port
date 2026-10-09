@@ -310,7 +310,10 @@ with their text and the cloth background, upright, in the right places (the hunt
     arrives from the vertex shader, e.g. `input1` the vertex colour of many shaders: black means the vertex stream or the vertex
     shader) and `normalN`/`normals` (the same mapped from -1..1). Magenta: the shader has no such lookup or input.
   - **Uniform blocks** are read to the next 256 bytes past the size the game gives (`SQ_ALU_CONST_BUFFER_SIZE` is in 256-byte units),
-    as the hardware does; the village's scenery reads its material colour and UV transform there.
+    as the hardware does.
+  - **Vertex attributes** go to the registers the vertex shader's semantic table (`SQ_VTX_SEMANTIC`, `GX2VertexShader` +0x40/+0x44)
+    names for their location (the fetch shader's semantic id), not `location + 1`; an attribute the table does not name is not
+    loaded.
   - **Shadow maps drawn as colour**: a buffer drawn into as colour (the village's 1024x1024 `r32f`) and read with a comparison
     (`SAMPLE_C`) is copied into a depth texture (first component, clamped to 0..1) when it has changed since the last copy, and the
     comparison is the sampler's own (`GX2InitSamplerDepthCompare`; less or equal when none was set). Before, such a lookup read a

@@ -184,14 +184,22 @@ fog table and shadow lookups and are right, which leaves the scenery's own input
 `INT_TO_FLT` path, texture 1, block 1's packed material bytes). `MH3U_GFX_DEBUG_PS` and the per-draw uniform blocks are there to
 settle it in one run.
 
-**3h. Why the scenery was black (debug runs on c5d6ec1).** With `MH3U_GFX_DEBUG_PS` on the two scenery pixel shaders: `alpha1` and
-`input1` black, `tex` the whole village in flat texture colours, `uv` black. So the vertex colour was zero and every texture was read
-at one texel (uv (0, 1): black under `fract`). In the scenery's vertex shaders (`vs-169eee80`, `vs-169eb340`) the colour is
-constant 10 of block 1 (`MOV R1 <- KC0[10]`, or the decoded vertex colour times it), and the texture coordinates are the UV stream
-times constants 8 and 9 (`DOT4 R4.x <- R2.x, KC0[8].x`...); position uses constants 0 to 7 and was right. The upload read only
-`size` bytes of the block, and the hardware reads to the next 256 bytes (`GX2Set*UniformBlock` gives `SQ_ALU_CONST_BUFFER_SIZE` as
-`(size + 255) >> 8`): a block given as 8 vec4s still has 16. Constants past the given size are now uploaded up to that rounding.
-The integer colour path (`uint 8_8_8_8`, 0x10a, kept as integers for `INT_TO_FLT`) was checked and is right.
+**3h. A uniform block's readable size (dd1df47).** `GX2Set*UniformBlock` gives the hardware the size in 256-byte units, rounded up
+(`SQ_ALU_CONST_BUFFER_SIZE = (size + 255) >> 8`), so constants up to that rounding are now uploaded. This is what the hardware does,
+but it was **not** the cause of the black scenery: run 6's dump shows the scenery's block 1 is 1536 bytes with the constants it
+needs (draw 234: `[8] = (1, 0, 0, 0)`, `[9] = (0, 1, 0, 0)`, `[10] = (1, 1, 1, 1)`).
+
+**3i. Why the scenery was black (run 6, frame 2400).** The debug runs (`alpha1`, `input1` black; `tex` flat texture colours; `uv`
+black) said the vertex colour was zero and the UVs constant. Draw 234's fetch shader has location 0 float3 (position), 1 sint8x4
+(normal), 2 float2 (UV), 3 uint8x4 (colour), 4, 5; `vs-169eee80` reads the position in R1, the UVs in R2 (`DOT4 R4.x <- R2.x,
+KC0[8].x`) and the colour in R3 (`INT_TO_FLT R0.x <- R3.x`). Attributes were put in register `location + 1`, so R2 held the normal
+(small integers: UV about (0, 0), read at (0, 1)) and R3 the UV floats (`INT_TO_FLT` of float bits, about 1e9, through the colour
+decode `c / (1.001 - c)`: negative, clamped to black). The hardware loads an attribute into the register its vertex shader's
+`SQ_VTX_SEMANTIC` table names (`GX2VertexShader` +0x40 count, +0x44 entries: entry `i` is the semantic id, the fetch shader's
+location, loaded into R`i+1`; an attribute it does not name is not loaded). That table is now used, for ordinary and geometry
+pipelines; with no table it is `location + 1` as before. The characters' shaders read their attributes in location order, which
+is why they were right. `draws.txt` now shows each draw's semantic table, the registers the attributes go to, the vertex output
+semantics and which output each pixel input takes.
 
 ## 4. Does the generated code compile in a reasonable time? (done: as C yes, as one Rust crate no)
 

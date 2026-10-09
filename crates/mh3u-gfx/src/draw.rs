@@ -69,6 +69,37 @@ pub(crate) fn parse_addresses(text: &str) -> Vec<u32> {
         .collect()
 }
 
+/// A vertex shader's `SQ_VTX_SEMANTIC` table (`GX2VertexShader` +0x40 the count, +0x44 the 32 entries, the semantic id in bits 0
+/// to 7): entry `i` names the attribute that register `i + 1` is loaded with. `None` when the shader has no table (count 0).
+pub(crate) fn vertex_semantics(g: &Guest, vs: u32) -> Option<Vec<u32>> {
+    let count = g.u32(vs + 0x40).min(32);
+    (count != 0).then(|| (0..count).map(|i| g.u32(vs + 0x44 + 4 * i) & 0xff).collect())
+}
+
+/// Which register each attribute stream is loaded into. The fetch shader tags each attribute with its location as the semantic id;
+/// the vertex shader's semantic table says which register has which id (the first entry that matches; an attribute it does not name
+/// is not loaded). With no table, location `n` goes to register `n + 1`. The village's scenery shaders load location 2 (the UVs) into
+/// R2 and location 3 (the colour) into R3, skipping location 1: read as `location + 1` the UVs were the normal and the colour the
+/// UVs, which made the scenery black.
+pub(crate) fn vertex_attributes(semantics: &Option<Vec<u32>>, fetch: &[AttribStream]) -> Vec<VertexAttribute> {
+    fetch
+        .iter()
+        .enumerate()
+        .filter_map(|(i, a)| {
+            let gpr = match semantics {
+                Some(table) => table.iter().position(|&id| id == a.location)? as u32 + 1,
+                None => a.location + 1,
+            };
+            Some(VertexAttribute {
+                gpr,
+                stream: i as u32,
+                per_instance: a.per_instance,
+                divisor: a.divisor,
+            })
+        })
+        .collect()
+}
+
 pub struct Compiled {
     pub module: wgpu::ShaderModule,
     pub interface: Interface,
@@ -627,9 +658,7 @@ fn stencil_face(f: [u32; 4]) -> wgpu::StencilFaceState {
 }
 
 /// How much of a uniform block the shader can read: `GX2Set*UniformBlock` gives the hardware the size in 256-byte units, rounded up
-/// (`SQ_ALU_CONST_BUFFER_SIZE`, 9 bits), so a block given as 0x80 bytes still reads 16 vec4s. The village's scenery shaders read
-/// constants 8 to 13 of block 1 (texture-coordinate transform and material colour) past the size the game gives; read as zero, the
-/// scenery was black with every texture read at one texel.
+/// (`SQ_ALU_CONST_BUFFER_SIZE`, 9 bits), so a block given as 0x80 bytes still reads 16 vec4s.
 pub(crate) fn readable_bytes(size: u32) -> u32 {
     (size.div_ceil(256) & 0x1ff) * 256
 }
@@ -782,7 +811,8 @@ impl Gx2 {
         if let Some((c, _)) = found {
             return c;
         }
-        let ranges = [(program, size), (0, 0), (0, 0)];
+        // the shader's semantic table (which register each attribute goes to) is checked with its program
+        let ranges = [(program, size), (vs + 0x40, 0x84), (0, 0)];
         let compiled = self.vertex_shader_slow(g, vs, program, size, fetch, half_z);
         let hash = hash_ranges(g, &ranges);
         self.caches
@@ -803,22 +833,17 @@ impl Gx2 {
     ) -> Option<Arc<Compiled>> {
         let mut code = vec![0u8; size as usize];
         g.read(program, &mut code);
-        let key = (vs, program, hash_fast(&code, 0) ^ hash_of(&(fetch, half_z)));
+        let key = (
+            vs,
+            program,
+            hash_fast(&code, 0) ^ hash_of(&(fetch, half_z, vertex_semantics(g, vs))),
+        );
         if let Some(c) = self.caches.vertex.get(&key) {
             return c.clone();
         }
         let result = (|| {
             let decoded = decode(&code).map_err(|e| e.to_string())?;
-            let attributes = fetch
-                .iter()
-                .enumerate()
-                .map(|(i, a)| VertexAttribute {
-                    gpr: a.location + 1,
-                    stream: i as u32,
-                    per_instance: a.per_instance,
-                    divisor: a.divisor,
-                })
-                .collect();
+            let attributes = vertex_attributes(&vertex_semantics(g, vs), fetch);
             let constants = loop_constants(g, g.u32(vs + 0xf4), g.u32(vs + 0xf8));
             let loop_const = move |n: u32| constants.get(n as usize).copied().flatten();
             let mut ctx = Context::new(&|_| TexKind::D2);
@@ -2954,6 +2979,50 @@ mod tests {
         gx2.end_pass();
     }
 
+    fn stream(location: u32, offset: u32, format: u32) -> AttribStream {
+        AttribStream {
+            location,
+            buffer: 0,
+            offset,
+            format,
+            per_instance: false,
+            divisor: 0,
+            select: [0, 1, 2, 3],
+            endian: 3,
+        }
+    }
+
+    /// Draw 234 of the run-6 village frame: the fetch shader has locations 0 to 5 (position, normal, UV, colour, ...), and
+    /// `vs-169eee80` reads the position in R1, the UVs in R2 (`DOT4 R4.x <- R2.x, KC0[8].x`) and the colour in R3 (`INT_TO_FLT R0.x
+    /// <- R3.x`): its semantic table is 0, 2, 3.
+    #[test]
+    fn attributes_go_to_the_registers_the_semantic_table_names() {
+        let fetch = [
+            stream(0, 0, 0x811),
+            stream(1, 12, 0x30a),
+            stream(2, 16, 0x80d),
+            stream(3, 24, 0x10a),
+            stream(4, 28, 0x30a),
+            stream(5, 32, 0x80d),
+        ];
+        let mut m = vec![0u8; 0x1000];
+        let g = Guest::new(m.as_mut_ptr());
+        let vs = 0x100;
+        g.put_u32(vs + 0x40, 3);
+        for (i, id) in [0u32, 2, 3].iter().enumerate() {
+            g.put_u32(vs + 0x44 + 4 * i as u32, *id);
+        }
+        let table = vertex_semantics(&g, vs);
+        assert_eq!(table, Some(vec![0, 2, 3]));
+        let got: Vec<(u32, u32)> = vertex_attributes(&table, &fetch).iter().map(|a| (a.stream, a.gpr)).collect();
+        // position R1, UV (stream 2) R2, colour (stream 3) R3; the normal and the rest are not loaded
+        assert_eq!(got, [(0, 1), (2, 2), (3, 3)]);
+        // no table: location + 1, as before
+        g.put_u32(vs + 0x40, 0);
+        let got: Vec<u32> = vertex_attributes(&vertex_semantics(&g, vs), &fetch).iter().map(|a| a.gpr).collect();
+        assert_eq!(got, [1, 2, 3, 4, 5, 6]);
+    }
+
     #[test]
     fn uniform_blocks_are_readable_to_the_next_256_bytes() {
         assert_eq!(readable_bytes(0), 0);
@@ -2961,7 +3030,7 @@ mod tests {
         assert_eq!(readable_bytes(0x100), 0x100);
         assert_eq!(readable_bytes(0x101), 0x200);
         assert_eq!(readable_bytes(0x1_0000), 0x1_0000);
-        // what the scenery's vertex shader reads: block 1 given as 8 vec4s, the material colour at constant 10 is uploaded
+        // a block given as 8 vec4s: constant 10 is still uploaded
         let mut gx2 = Gx2::new(crate::Display::noop());
         let mut m = vec![0u8; 0x2_0000];
         let g = Guest::new(m.as_mut_ptr());
