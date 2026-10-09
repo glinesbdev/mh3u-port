@@ -44,6 +44,31 @@ pub trait Gx2Backend: Send {
     /// Whether the backend does something for this import ("gx2:GX2SwapScanBuffers"); the others stay stubs.
     fn implements(&self, name: &str) -> bool;
     fn call(&mut self, name: &str, c: &mut Ctx, g: &Guest);
+    /// A number for an import the backend implements, asked once when the game is loaded; calls then come to `call_id` with it, so a
+    /// backend need not match names on every call. None (the default) keeps them coming by name.
+    fn resolve(&self, _name: &str) -> Option<u32> {
+        None
+    }
+    fn call_id(&mut self, _id: Option<u32>, name: &str, c: &mut Ctx, g: &Guest) {
+        self.call(name, c, g);
+    }
+}
+
+/// Frames shown so far: the graphics backend counts its swaps here, so the timing reports (MH3U_GFX_TIMES) can give per-frame averages.
+pub static FRAMES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// MH3U_TIMES_WINDOW: how many seconds each timing report covers (10 when it is not set or not a number).
+pub fn times_window() -> std::time::Duration {
+    static WINDOW: std::sync::OnceLock<std::time::Duration> = std::sync::OnceLock::new();
+    *WINDOW.get_or_init(|| {
+        let secs = std::env::var("MH3U_TIMES_WINDOW").ok().and_then(|v| v.trim().parse::<f64>().ok());
+        std::time::Duration::from_secs_f64(secs.filter(|s| s.is_finite() && *s > 0.0).unwrap_or(10.0))
+    })
+}
+
+/// The frames shown since `since` (a value of [`FRAMES`]), at least one so averages can be divided by it.
+pub fn frames_since(since: u64) -> u64 {
+    FRAMES.load(std::sync::atomic::Ordering::Relaxed).saturating_sub(since).max(1)
 }
 
 /// A piece of the executable to put in the guest's memory, or to clear.

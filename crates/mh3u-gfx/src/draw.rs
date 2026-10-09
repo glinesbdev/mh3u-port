@@ -2,11 +2,13 @@
 //! the recorded state, cached by what makes it different.
 
 use crate::gx2::Gx2;
+use crate::shader_cache::{FrontCache, Lookup, Ranges};
 use crate::state::State;
 use mh3u_latte::decode::decode;
 use mh3u_latte::translate::{Context, Interface, PixelInputs, TexKind, VertexAttribute, VertexInputs, translate_pixel, translate_vertex};
 use mh3u_rt::Guest;
 use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
 /// One element of a fetch shader's description (`GX2AttribStream`).
@@ -44,53 +46,232 @@ pub struct Compiled {
     pub interface: Interface,
 }
 
-/// A pipeline and what it was made from.
-/// The three translated stages of a geometry pipeline and how many vertices the geometry shader may emit.
-pub type GeometryShaders = (Arc<Compiled>, Arc<Compiled>, Arc<Compiled>, u32);
+/// A geometry pipeline: the three translated stages, how many vertices the geometry shader may emit, and the compute pipelines of the
+/// first two stages.
+pub struct GeometryEntry {
+    pub es: Arc<Compiled>,
+    pub gs: Arc<Compiled>,
+    pub copy: Arc<Compiled>,
+    pub max_vertices: u32,
+    pub es_pipeline: wgpu::ComputePipeline,
+    pub gs_pipeline: wgpu::ComputePipeline,
+    /// The layouts of their bind groups 0 and 1, asked for once.
+    pub es_layouts: [wgpu::BindGroupLayout; 2],
+    pub gs_layouts: [wgpu::BindGroupLayout; 2],
+}
+
+/// A fetch shader's streams, shared (see `Gx2::fetch_shaders`).
+pub type Fetch = Arc<[AttribStream]>;
+/// The front key of a vertex shader: (shader, program, size, fetch shader version, half z).
+pub type VertexFront = (u32, u32, u32, usize, bool);
+/// The front key of a pixel shader: (shader, program, size, hash of the words its inputs are made from, texture kinds).
+pub type PixelFront = (u32, u32, u32, u64, [u8; 18]);
+
+/// The front key of a geometry pipeline: the vertex and geometry shaders, their three programs (start, size), the fetch shader version,
+/// half z, and the ring item sizes (es and gs vec4s), everything its translation depends on besides the program bytes.
+pub type GeometryFront = (u32, u32, [(u32, u32); 3], usize, bool, u32, u32);
 
 pub struct CachedTexture {
     pub texture: wgpu::Texture,
     pub layers: u32,
     pub range: (u32, u32),
     pub mips: (u32, u32),
+    /// The views the shaders read it through, made once: as a 2D texture, and as a cube (see `texture_view`).
+    pub views: [Option<wgpu::TextureView>; 2],
+    /// What it was decoded from: a hash of the header's words and of the bytes of its image and smaller levels.
+    pub hash: u64,
+    /// `GX2Invalidate` covered its memory since it was decoded or checked: at its next use it is hashed again, and decoded again
+    /// only if the hash differs.
+    pub dirty: bool,
+    /// The swap it was last drawn with (an invalidated texture not drawn for a second is forgotten, see `prune`).
+    pub used: u32,
+}
+
+/// The words of a `GX2Texture` header that decoding reads (`texture::Header::read` reads up to 0x88).
+const TEXTURE_HEADER_BYTES: usize = 0x88;
+
+/// A hash of what a texture is decoded from: its header's words and the bytes of its image and of its smaller levels.
+fn texture_source_hash(g: &Guest, t: u32, h: &crate::texture::Header) -> u64 {
+    let mut buf = vec![0u8; TEXTURE_HEADER_BYTES];
+    g.read(t, &mut buf);
+    let mut hash = hash_fast(&buf, 0x7e);
+    for (at, size) in [(h.image, h.image_size), (h.mip_ptr, h.mip_size)] {
+        if at == 0 || size == 0 {
+            continue;
+        }
+        buf.resize(size.min(1 << 28) as usize, 0);
+        g.read(at, &mut buf);
+        hash = hash_fast(&buf, hash);
+    }
+    hash
 }
 
 pub struct PipelineEntry {
     pub pipeline: wgpu::RenderPipeline,
+    /// The layouts of its four bind groups, asked for once (the same objects the pipeline was made with).
+    pub layouts: [wgpu::BindGroupLayout; 4],
+    /// The shaders the pipeline's key names by address, kept alive so the address is not reused while the key is.
+    _shaders: (Arc<Compiled>, Arc<Compiled>),
 }
+
+/// What makes a render pipeline different. The shaders are named by the address of their translation (kept alive by the entry).
+#[derive(Clone, PartialEq, Eq, Hash)]
+pub(crate) struct PipelineKey {
+    vs: usize,
+    ps: usize,
+    topology: wgpu::PrimitiveTopology,
+    target_format: wgpu::TextureFormat,
+    blend: crate::state::Blend,
+    depth_format: Option<wgpu::TextureFormat>,
+    blend_on: u32,
+    masks: u32,
+    depth_test: bool,
+    depth_write: bool,
+    depth_func: u32,
+    cull: u8,
+    front_face: u32,
+}
+
+/// A depth buffer the game draws with, and its views (made once): the whole of it for drawing, its depth for sampling.
+pub struct DepthTarget {
+    pub texture: wgpu::Texture,
+    pub format: wgpu::TextureFormat,
+    pub view: wgpu::TextureView,
+    pub sample_view: wgpu::TextureView,
+}
+
+/// One resource of a bind group as a cache key: wgpu handles compare and hash by identity, so equal keys mean the same objects.
+#[derive(Clone, PartialEq, Eq, Hash)]
+pub(crate) enum Bound {
+    Buffer(wgpu::Buffer, u64, u64),
+    View(wgpu::TextureView),
+    Sampler(wgpu::Sampler),
+}
+
+/// A bind group's layout and what is bound at each binding.
+#[derive(Clone, PartialEq, Eq, Hash)]
+pub(crate) struct GroupKey {
+    layout: wgpu::BindGroupLayout,
+    entries: Vec<(u32, Bound)>,
+}
+
+/// How many bind groups are kept before the cache is emptied (it is also pruned of the ones not used for a second, see `prune`).
+const BIND_GROUP_LIMIT: usize = 16384;
 
 #[derive(Default)]
 pub struct DrawCaches {
     pub vertex: HashMap<(u32, u32, u64), Option<Arc<Compiled>>>,
     pub pixel: HashMap<(u32, u64), Option<Arc<Compiled>>>,
-    pub pipelines: HashMap<String, Arc<PipelineEntry>>,
-    pub depth: HashMap<u32, (wgpu::Texture, wgpu::TextureFormat)>,
-    pub fallback: HashMap<&'static str, wgpu::Texture>,
+    /// The fronts of the two (see `shader_cache`): by (shader, program, size, fetch shader version, half z), and by (shader, program,
+    /// size, hash of the inputs' words, texture kinds).
+    pub vertex_front: FrontCache<VertexFront, (Option<Arc<Compiled>>, Fetch)>,
+    pub pixel_front: FrontCache<PixelFront, Option<Arc<Compiled>>>,
+    pub pipelines: HashMap<PipelineKey, Arc<PipelineEntry>>,
+    pub depth: HashMap<u32, DepthTarget>,
+    pub fallback: HashMap<&'static str, (wgpu::Texture, wgpu::TextureView)>,
     pub reported: std::collections::HashSet<String>,
     /// How many draws went to each colour buffer (by image address), for the log.
     pub drawn_into: HashMap<u32, u64>,
     /// Textures made from the guest's, by the address of their image and what they were read as, with the memory they cover.
     pub textures: HashMap<(u32, u32, u32, u32, u32), CachedTexture>,
-    pub samplers: HashMap<String, wgpu::Sampler>,
-    pub geometry: HashMap<String, Option<GeometryShaders>>,
-    pub compute: HashMap<String, wgpu::ComputePipeline>,
+    /// Samplers by the three words of the `GX2Sampler` they were made from, and the two that are not the game's.
+    pub samplers: HashMap<[u32; 3], wgpu::Sampler>,
+    pub default_sampler: Option<wgpu::Sampler>,
+    pub compare_sampler: Option<wgpu::Sampler>,
+    /// Bind groups by what they bind, with the swap they were last used in.
+    pub bind_groups: HashMap<GroupKey, (wgpu::BindGroup, u32)>,
+    /// The uniform blocks uploaded, by (address, vec4s, bytes read): the guest bytes of each upload of the current batch, so a draw
+    /// that finds the same bytes there again reads the same upload (compared in place, nothing copied or hashed).
+    pub uniforms: HashMap<(u32, u32, u32), UniformVersions>,
+    /// A buffer reused for the words of a uniform block.
+    pub scratch: Vec<u8>,
+    /// Geometry pipelines by the hashes of their programs and what else their translation depends on, with their front.
+    pub geometry: HashMap<(u32, u32, u64), Option<Arc<GeometryEntry>>>,
+    pub geometry_front: FrontCache<GeometryFront, (Option<Arc<GeometryEntry>>, Fetch)>,
     /// Why draws were not drawn, and how many.
     pub skipped: HashMap<&'static str, u64>,
     pub gs_draws: HashMap<(u32, u32, u32, u32, u32), u64>,
+    /// Index lists by the draw and a hash of its index bytes (see `draw_indices`), and the bytes of their buffers.
+    pub indices: HashMap<IndexKey, IndexEntry>,
+    pub index_bytes: u64,
     /// Decoded vertex streams kept on the GPU, by what they were decoded from (the layout and a hash of the bytes).
     pub streams: HashMap<(u64, u64), StreamEntry>,
     pub stream_bytes: u64,
 }
 
+/// The uploads of one uniform block in the current batch (`batch`, see `Batch::generation`), newest last: its guest bytes and where they
+/// went. Older batches' entries are reused, keeping their memory.
+#[derive(Default)]
+pub struct UniformVersions {
+    batch: u64,
+    used: usize,
+    versions: Vec<(Vec<u8>, Option<BufRef>)>,
+    swap: u32,
+}
+
+/// The words of the `have` bytes of a uniform block at `address`, in the order the shader reads them, into `out` (a word cut short by
+/// the block's size is completed with zeros, as the rest of the block is).
+pub(crate) fn uniform_words(g: &Guest, address: u32, have: usize, out: &mut Vec<u8>) {
+    out.clear();
+    g.with_bytes(address, have, |b| out.extend_from_slice(b));
+    out.resize(have.next_multiple_of(4), 0);
+    for w in out.as_chunks_mut::<4>().0 {
+        w.reverse();
+    }
+}
+
+/// How many uploads of one block a batch remembers (a block rewritten more often than this between flushes is uploaded each time).
+const UNIFORM_VERSIONS: usize = 8;
+
+impl UniformVersions {
+    /// The upload of this batch that holds `now` (the block's guest bytes).
+    fn find(&mut self, batch: u64, now: &[u8]) -> Option<BufRef> {
+        if self.batch != batch {
+            self.batch = batch;
+            self.used = 0;
+            return None;
+        }
+        self.versions[..self.used]
+            .iter()
+            .rev()
+            .find(|(raw, _)| raw.as_slice() == now)
+            .and_then(|(_, r)| r.clone())
+    }
+
+    fn insert(&mut self, batch: u64, raw: &[u8], r: &BufRef) {
+        if self.batch != batch {
+            self.batch = batch;
+            self.used = 0;
+        }
+        if self.used == UNIFORM_VERSIONS {
+            return;
+        }
+        if self.used == self.versions.len() {
+            self.versions.push((Vec::new(), None));
+        }
+        let v = &mut self.versions[self.used];
+        v.0.clear();
+        v.0.extend_from_slice(raw);
+        v.1 = Some(r.clone());
+        self.used += 1;
+    }
+}
+
+/// Uniform blocks of this size or more (the banks a shader reads by index are declared 4096 vec4, 64 KiB) go to slots of their own,
+/// which are kept zero past what was written, so only the block's own bytes are copied and uploaded, not the zeros after them.
+const SLOT_SIZE: u64 = 64 << 10;
+const SLOTS_PER_BUFFER: usize = 16;
+
 pub struct StreamEntry {
     buffer: wgpu::Buffer,
-    meta: [[u32; 4]; 16],
+    /// Where each stream starts, as the shaders read it (a small buffer of its own, so a draw's bind group 3 is the same every frame).
+    meta: wgpu::Buffer,
     size: u64,
     used: u32,
 }
 
 /// A quick hash of bytes (eight at a time), for telling whether vertex data is what it was.
-fn hash_fast(b: &[u8], seed: u64) -> u64 {
+pub(crate) fn hash_fast(b: &[u8], seed: u64) -> u64 {
     let mut h = seed ^ (b.len() as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
     let (words, rest) = b.as_chunks::<8>();
     for w in words {
@@ -103,13 +284,35 @@ fn hash_fast(b: &[u8], seed: u64) -> u64 {
     h ^ (h >> 32)
 }
 
-fn hash_bytes(b: &[u8]) -> u64 {
-    // FNV-1a
-    let mut h = 0xcbf2_9ce4_8422_2325u64;
-    for &x in b {
-        h = (h ^ u64::from(x)).wrapping_mul(0x0100_0000_01b3);
+/// A hash of the guest memory in `ranges` (the programs a cached translation was made from).
+pub(crate) fn hash_ranges(g: &Guest, ranges: &Ranges) -> u64 {
+    let mut h = 0x51u64;
+    let mut buf = Vec::new();
+    for &(at, len) in ranges.iter().filter(|r| r.1 != 0) {
+        buf.resize(len as usize, 0);
+        g.read(at, &mut buf);
+        h = hash_fast(&buf, h);
     }
     h
+}
+
+/// A hash of anything hashable, for the parts of a shader key that are not bytes.
+pub(crate) fn hash_of(v: &impl Hash) -> u64 {
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    v.hash(&mut h);
+    h.finish()
+}
+
+/// Counts a shader cache lookup in the timing report.
+pub(crate) fn count_lookup(how: &Lookup, hit: &'static str, checked: &'static str, miss: &'static str) {
+    Lap::count(
+        match how {
+            Lookup::Hit => hit,
+            Lookup::Checked => checked,
+            Lookup::Miss => miss,
+        },
+        1,
+    );
 }
 
 /// The attribute's components as raw 32-bit patterns (floats for the float and normalised formats, integers as they are for the others).
@@ -328,11 +531,38 @@ impl Gx2 {
         }
     }
 
-    fn vertex_shader(&mut self, g: &Guest, vs: u32, fetch: &[AttribStream], half_z: bool) -> Option<Arc<Compiled>> {
+    fn vertex_shader(&mut self, g: &Guest, vs: u32, fetch: &Arc<[AttribStream]>, half_z: bool) -> Option<Arc<Compiled>> {
         let (size, program) = (g.u32(vs + 0xd0), g.u32(vs + 0xd4));
-        let mut code = vec![0u8; size.min(1 << 20) as usize];
+        let size = size.min(1 << 20);
+        let front = (vs, program, size, Arc::as_ptr(fetch).cast::<u8>() as usize, half_z);
+        let swaps = self.swaps;
+        let (found, how) = self.caches.vertex_front.get(&front, swaps, |r| hash_ranges(g, r));
+        count_lookup(&how, "vertex shader hits", "vertex shader checks", "vertex shader misses");
+        if let Some((c, _)) = found {
+            return c;
+        }
+        let ranges = [(program, size), (0, 0), (0, 0)];
+        let compiled = self.vertex_shader_slow(g, vs, program, size, fetch, half_z);
+        let hash = hash_ranges(g, &ranges);
+        self.caches
+            .vertex_front
+            .insert(front, ranges, hash, swaps, (compiled.clone(), fetch.clone()));
+        compiled
+    }
+
+    /// The vertex shader from its program bytes: translated once for each program, fetch shader and depth range.
+    fn vertex_shader_slow(
+        &mut self,
+        g: &Guest,
+        vs: u32,
+        program: u32,
+        size: u32,
+        fetch: &[AttribStream],
+        half_z: bool,
+    ) -> Option<Arc<Compiled>> {
+        let mut code = vec![0u8; size as usize];
         g.read(program, &mut code);
-        let key = (vs, program, hash_bytes(&code) ^ hash_bytes(format!("{fetch:?}{half_z}").as_bytes()));
+        let key = (vs, program, hash_fast(&code, 0) ^ hash_of(&(fetch, half_z)));
         if let Some(c) = self.caches.vertex.get(&key) {
             return c.clone();
         }
@@ -378,7 +608,36 @@ impl Gx2 {
         compiled
     }
 
-    fn pixel_shader(&mut self, g: &Guest, ps: u32, semantics_at: u32, kinds: &[TexKind; 18]) -> Option<(Arc<Compiled>, PixelInputs)> {
+    fn pixel_shader(&mut self, g: &Guest, ps: u32, semantics_at: u32, kinds: &[TexKind; 18]) -> Option<Arc<Compiled>> {
+        // what the translation depends on besides the program: the words the inputs are made from, and the texture kinds
+        let count = g.u32(ps + 0x10).min(32);
+        let mut words = [0u32; 1 + 32 + 10];
+        words[0] = count;
+        for i in 0..count {
+            words[1 + i as usize] = g.u32(ps + 0x14 + 4 * i);
+        }
+        for k in 0..10 {
+            words[33 + k as usize] = g.u32(semantics_at + 4 * k);
+        }
+        let words_bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let (size, program) = (g.u32(ps + 0xa4), g.u32(ps + 0xa8));
+        let size = size.min(1 << 20);
+        let front = (ps, program, size, hash_fast(&words_bytes, 0x9), kinds.map(|k| k as u8));
+        let swaps = self.swaps;
+        let (found, how) = self.caches.pixel_front.get(&front, swaps, |r| hash_ranges(g, r));
+        count_lookup(&how, "pixel shader hits", "pixel shader checks", "pixel shader misses");
+        if let Some(c) = found {
+            return c;
+        }
+        let ranges = [(program, size), (0, 0), (0, 0)];
+        let compiled = self.pixel_shader_slow(g, ps, semantics_at, kinds);
+        let hash = hash_ranges(g, &ranges);
+        self.caches.pixel_front.insert(front, ranges, hash, swaps, compiled.clone());
+        compiled
+    }
+
+    /// The pixel shader from its program bytes and inputs: translated once for each.
+    fn pixel_shader_slow(&mut self, g: &Guest, ps: u32, semantics_at: u32, kinds: &[TexKind; 18]) -> Option<Arc<Compiled>> {
         // the inputs: pixel input i takes the vertex shader's output with the same semantic
         let count = g.u32(ps + 0x10).min(32);
         let vs_semantics: Vec<u32> = (0..40u32)
@@ -399,9 +658,12 @@ impl Gx2 {
         let (size, program) = (g.u32(ps + 0xa4), g.u32(ps + 0xa8));
         let mut code = vec![0u8; size.min(1 << 20) as usize];
         g.read(program, &mut code);
-        let key = (ps, hash_bytes(&code) ^ hash_bytes(format!("{inputs:?}{kinds:?}").as_bytes()));
+        let key = (
+            ps,
+            hash_fast(&code, 0) ^ hash_of(&(inputs.count, &inputs.flat, &inputs.locations, kinds.map(|k| k as u8))),
+        );
         if let Some(c) = self.caches.pixel.get(&key) {
-            return c.clone().map(|c| (c, inputs));
+            return c.clone();
         }
         let kinds = *kinds;
         let result = (|| {
@@ -431,15 +693,70 @@ impl Gx2 {
             }
         };
         self.caches.pixel.insert(key, compiled.clone());
-        compiled.map(|c| (c, inputs))
+        compiled
     }
 
-    /// Makes the texture at `t` (a `GX2Texture`) into a GPU texture, once until the game says it changed.
+    /// Makes the texture at `t` (a `GX2Texture`) into a GPU texture, once until the game says it changed (and it did: an invalidated
+    /// texture whose header and bytes hash the same is kept).
+    ///
+    /// The path taken for a texture already made reads the five header words of the key and does one look-up.
     fn texture_view(&mut self, g: &Guest, t: u32, kind: TexKind) -> Option<wgpu::TextureView> {
+        // the key: image, width, height, format, tile mode and dimension (as `texture::Header::read` reads them)
+        let key = (
+            g.u32(t + 0x24),
+            g.u32(t + 4),
+            g.u32(t + 8),
+            g.u32(t + 0x14),
+            g.u32(t + 0x30) ^ (g.u32(t) << 8),
+        );
+        let found = match self.caches.textures.get_mut(&key) {
+            Some(cached) if cached.dirty => {
+                let h = crate::texture::Header::read(g, t);
+                if texture_source_hash(g, t, &h) == cached.hash {
+                    Lap::count("texture invalidations of unchanged textures", 1);
+                    cached.dirty = false;
+                    cached.used = self.swaps;
+                    true
+                } else {
+                    self.caches.textures.remove(&key);
+                    false
+                }
+            }
+            Some(cached) => {
+                cached.used = self.swaps;
+                true
+            }
+            None => false,
+        };
+        if !found {
+            self.decode_texture(g, t, key)?;
+        }
+        let cached = self.caches.textures.get_mut(&key)?;
+        let slot = &mut cached.views[usize::from(kind == TexKind::Cube)];
+        if let Some(view) = slot {
+            return Some(view.clone());
+        }
+        let view = cached.texture.create_view(&wgpu::TextureViewDescriptor {
+            dimension: Some(match kind {
+                TexKind::Cube if cached.layers > 1 => wgpu::TextureViewDimension::D2Array,
+                _ => wgpu::TextureViewDimension::D2,
+            }),
+            array_layer_count: Some(if kind == TexKind::Cube { 6.min(cached.layers) } else { 1 }),
+            ..Default::default()
+        });
+        *slot = Some(view.clone());
+        Some(view)
+    }
+
+    /// Decodes the texture at `t` and keeps it under `key`; None if it cannot be read.
+    #[inline(never)]
+    fn decode_texture(&mut self, g: &Guest, t: u32, key: (u32, u32, u32, u32, u32)) -> Option<()> {
+        static TEXDUMP: std::sync::OnceLock<Option<std::ffi::OsString>> = std::sync::OnceLock::new();
+        let texdump = TEXDUMP.get_or_init(|| std::env::var_os("MH3U_GFX_TEXDUMP")).as_ref();
+        let mut lap = Lap::new();
         let h = crate::texture::Header::read(g, t);
-        let key = (h.image, h.width, h.height, h.format, h.tile_mode ^ (h.dim << 8));
-        if !self.caches.textures.contains_key(&key) {
-            if let Some(dir) = std::env::var_os("MH3U_GFX_TEXDUMP") {
+        {
+            if let Some(dir) = texdump {
                 let dir = std::path::Path::new(&dir);
                 let _ = std::fs::create_dir_all(dir);
                 let mut raw = vec![0u8; h.image_size.min(1 << 26) as usize];
@@ -450,9 +767,11 @@ impl Gx2 {
                 let _ = std::fs::write(dir.join(format!("{name}.image")), raw);
                 let _ = std::fs::write(dir.join(format!("{name}.header")), header);
             }
-            match crate::texture::decode(g, &h) {
+            let decoded = crate::texture::decode(g, &h);
+            lap.mark("texture decode (in texture views)");
+            match decoded {
                 Ok(d) => {
-                    if let Some(dir) = std::env::var_os("MH3U_GFX_TEXDUMP") {
+                    if let Some(dir) = texdump {
                         let name = format!(
                             "tex-{:08x}-{}x{}-f{:x}-m{}.decoded",
                             h.image, d.width, d.height, h.format, h.tile_mode
@@ -500,34 +819,46 @@ impl Gx2 {
                             layers: d.layers,
                             range: (h.image, h.image.saturating_add(h.image_size)),
                             mips: (h.mip_ptr, h.mip_ptr.saturating_add(h.mip_size)),
+                            views: [None, None],
+                            hash: texture_source_hash(g, t, &h),
+                            dirty: false,
+                            used: self.swaps,
                         },
                     );
+                    lap.mark("texture upload and hash (in texture views)");
+                    Lap::count("texture decodes", 1);
+                    Lap::count("texture bytes decoded", u64::from(h.image_size) + u64::from(h.mip_size));
+                    Some(())
                 }
                 Err(e) => {
                     self.report(format!(
                         "texture {t:#x} (format {:#x}, {}x{}, tile mode {}) not read: {e}",
                         h.format, h.width, h.height, h.tile_mode
                     ));
-                    return None;
+                    None
                 }
             }
         }
-        let cached = &self.caches.textures[&key];
-        Some(cached.texture.create_view(&wgpu::TextureViewDescriptor {
-            dimension: Some(match kind {
-                TexKind::Cube if cached.layers > 1 => wgpu::TextureViewDimension::D2Array,
-                _ => wgpu::TextureViewDimension::D2,
-            }),
-            array_layer_count: Some(if kind == TexKind::Cube { 6.min(cached.layers) } else { 1 }),
-            ..Default::default()
-        }))
     }
 
+    /// `GX2Invalidate` of shader memory: the translations made from programs there are looked up by their bytes again.
+    pub(crate) fn invalidate_shaders(&mut self, address: u32, size: u32) {
+        self.caches.vertex_front.invalidate(address, size);
+        self.caches.pixel_front.invalidate(address, size);
+        self.caches.geometry_front.invalidate(address, size);
+    }
+
+    /// `GX2Invalidate` of texture memory: the textures it overlaps are checked against their bytes at their next use.
     pub(crate) fn invalidate_textures(&mut self, address: u32, size: u32) {
         let end = address.saturating_add(size);
-        self.caches
-            .textures
-            .retain(|_, t| (t.range.1 <= address || t.range.0 >= end) && (t.mips.1 <= address || t.mips.0 >= end));
+        let mut marked = 0;
+        for t in self.caches.textures.values_mut() {
+            if !((t.range.1 <= address || t.range.0 >= end) && (t.mips.1 <= address || t.mips.0 >= end)) {
+                t.dirty = true;
+                marked += 1;
+            }
+        }
+        Lap::count("textures invalidated", marked);
     }
 
     fn fallback_texture(&mut self, kind: TexKind) -> wgpu::TextureView {
@@ -585,17 +916,17 @@ impl Gx2 {
                     );
                 }
             }
-            self.caches.fallback.insert(name, texture);
+            let view = texture.create_view(&wgpu::TextureViewDescriptor {
+                dimension: Some(match kind {
+                    TexKind::D3 => wgpu::TextureViewDimension::D3,
+                    TexKind::Cube => wgpu::TextureViewDimension::D2Array,
+                    _ => wgpu::TextureViewDimension::D2,
+                }),
+                ..Default::default()
+            });
+            self.caches.fallback.insert(name, (texture, view));
         }
-        let texture = &self.caches.fallback[name];
-        texture.create_view(&wgpu::TextureViewDescriptor {
-            dimension: Some(match kind {
-                TexKind::D3 => wgpu::TextureViewDimension::D3,
-                TexKind::Cube => wgpu::TextureViewDimension::D2Array,
-                _ => wgpu::TextureViewDimension::D2,
-            }),
-            ..Default::default()
-        })
+        self.caches.fallback[name].1.clone()
     }
 
     fn depth_target(&mut self, g: &Guest, db: u32) -> Option<(u32, wgpu::TextureFormat)> {
@@ -607,7 +938,7 @@ impl Gx2 {
             .caches
             .depth
             .get(&image)
-            .is_none_or(|(t, f)| t.width() != width || t.height() != height || *f != format);
+            .is_none_or(|d| d.texture.width() != width || d.texture.height() != height || d.format != format);
         if stale {
             let texture = self.d.device.create_texture(&wgpu::TextureDescriptor {
                 label: Some("depth buffer"),
@@ -626,7 +957,20 @@ impl Gx2 {
                     | wgpu::TextureUsages::COPY_DST,
                 view_formats: &[],
             });
-            self.caches.depth.insert(image, (texture, format));
+            let view = texture.create_view(&Default::default());
+            let sample_view = texture.create_view(&wgpu::TextureViewDescriptor {
+                aspect: wgpu::TextureAspect::DepthOnly,
+                ..Default::default()
+            });
+            self.caches.depth.insert(
+                image,
+                DepthTarget {
+                    texture,
+                    format,
+                    view,
+                    sample_view,
+                },
+            );
         }
         Some((image, format))
     }
@@ -634,7 +978,7 @@ impl Gx2 {
     pub(crate) fn clear_depth(&mut self, g: &Guest, db: u32, depth: f32, stencil: u32, mode: u32) {
         self.flush_draws();
         let Some((image, format)) = self.depth_target(g, db) else { return };
-        let view = self.caches.depth[&image].0.create_view(&Default::default());
+        let view = self.caches.depth[&image].view.clone();
         let has_stencil = format == wgpu::TextureFormat::Depth24PlusStencil8;
         let mut enc = self.d.device.create_command_encoder(&Default::default());
         {
@@ -718,7 +1062,7 @@ impl Gx2 {
 
     /// The decoded streams of a draw on the GPU: made again only when the layout or the vertex bytes are not what they were (the bytes
     /// are hashed, so a game that changes its vertex data without telling the GPU is still followed).
-    fn cached_streams(
+    pub(crate) fn cached_streams(
         &mut self,
         g: &Guest,
         st: &State,
@@ -726,7 +1070,7 @@ impl Gx2 {
         start: u32,
         vertices: u32,
         instances: u32,
-    ) -> (BufRef, [[u32; 4]; 16]) {
+    ) -> (BufRef, BufRef) {
         let mut lap = Lap::new();
         let (mut h1, mut h2) = (0x1234_5678_9abc_def0u64, 0x0fed_cba9_8765_4321u64);
         let mut mix = |v: u64| {
@@ -736,8 +1080,10 @@ impl Gx2 {
         mix(u64::from(start));
         mix(u64::from(vertices));
         mix(u64::from(instances));
-        // the bytes each buffer is read from: one span per buffer and range of items
-        let mut spans: Vec<(u32, u32, u32, u32)> = Vec::new(); // (buffer, first item, items, bytes needed past the last item's start)
+        // the bytes each buffer is read from: one span per buffer and range of items (buffer, first item, items, bytes needed past the
+        // last item's start), at most one per attribute
+        let mut spans = [(0u32, 0u32, 0u32, 0u32); 16];
+        let mut n_spans = 0;
         for a in fetch.iter().take(16) {
             for v in [
                 a.location,
@@ -759,13 +1105,16 @@ impl Gx2 {
                 (start, vertices)
             };
             let end = a.offset + attribute_size(a.format);
-            match spans.iter_mut().find(|s| (s.0, s.1, s.2) == (a.buffer, first, items)) {
+            match spans[..n_spans].iter_mut().find(|s| (s.0, s.1, s.2) == (a.buffer, first, items)) {
                 Some(s) => s.3 = s.3.max(end),
-                None => spans.push((a.buffer, first, items, end)),
+                None => {
+                    spans[n_spans] = (a.buffer, first, items, end);
+                    n_spans += 1;
+                }
             }
         }
-        let mut raw = Vec::new();
-        for &(buffer, first, items, end) in &spans {
+        let mut bytes_hashed = 0;
+        for &(buffer, first, items, end) in &spans[..n_spans] {
             let b = &st.attrib_buffers[(buffer as usize).min(15)];
             mix(u64::from(b.address != 0));
             mix(u64::from(b.stride));
@@ -776,19 +1125,29 @@ impl Gx2 {
             let from = u64::from(first) * u64::from(b.stride);
             let len = (u64::from(items) - 1) * u64::from(b.stride) + u64::from(end);
             let len = len.min(u64::from(b.size).saturating_sub(from)).min(1 << 28);
-            raw.resize(len as usize, 0);
-            g.read(b.address.wrapping_add(from as u32), &mut raw);
-            mix(hash_fast(&raw, 1));
+            // hashed where they are (no copy), with a hash that does many bytes per cycle
+            mix(g.with_bytes(b.address.wrapping_add(from as u32), len as usize, |raw| {
+                xxhash_rust::xxh3::xxh3_64(raw)
+            }));
+            bytes_hashed += len;
         }
+        Lap::count("vertex bytes hashed", bytes_hashed);
         let key = (h1, h2);
         let swaps = self.swaps;
         lap.mark("stream hash");
         if let Some(e) = self.caches.streams.get_mut(&key) {
             lap.mark("stream hit");
             e.used = swaps;
-            let (buffer, meta) = (e.buffer.clone(), e.meta);
+            let (buffer, meta) = (e.buffer.clone(), e.meta.clone());
             let size = e.size;
-            return (BufRef { buffer, offset: 0, size }, meta);
+            return (
+                BufRef { buffer, offset: 0, size },
+                BufRef {
+                    buffer: meta,
+                    offset: 0,
+                    size: 256,
+                },
+            );
         }
         let (data, meta) = self.decode_streams(g, st, fetch, start, vertices, instances);
         lap.mark("stream miss: decode");
@@ -807,6 +1166,14 @@ impl Gx2 {
             mapped_at_creation: false,
         });
         self.d.queue.write_buffer(&buffer, 0, &data);
+        let meta_buffer = self.d.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("vertex stream starts"),
+            size: 256,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let meta_bytes: Vec<u8> = meta.iter().flatten().flat_map(|v| v.to_le_bytes()).collect();
+        self.d.queue.write_buffer(&meta_buffer, 0, &meta_bytes);
         // forget what has not been used for a while, or what is too much
         self.caches.stream_bytes += size;
         if self.caches.stream_bytes > (1 << 30) {
@@ -822,26 +1189,262 @@ impl Gx2 {
             key,
             StreamEntry {
                 buffer: buffer.clone(),
-                meta,
+                meta: meta_buffer.clone(),
                 size,
                 used: swaps,
             },
         );
-        (BufRef { buffer, offset: 0, size }, meta)
+        (
+            BufRef { buffer, offset: 0, size },
+            BufRef {
+                buffer: meta_buffer,
+                offset: 0,
+                size: 256,
+            },
+        )
     }
 
-    /// The upload of one uniform block: the guest's big-endian words as the shader reads them.
+    /// The index buffer of a draw (vertex numbers relative to `lowest`), and the vertices it uses; `None` when it draws nothing or its
+    /// primitive type is not drawn. A list made before from the same index bytes (hashed where they are) and draw is used again: the
+    /// first time it is put in the batch's arena, and when it comes again it gets a buffer of its own that later frames use as it is.
+    pub(crate) fn draw_indices(
+        &mut self,
+        g: &Guest,
+        restart_index: Option<u32>,
+        primitive: u32,
+        count: u32,
+        indexed: Option<(u32, u32)>,
+        first: u32,
+    ) -> Option<DrawIndices> {
+        let (_, expand) = topology_of(primitive)?;
+        let bytes = match indexed {
+            Some((kind, address)) => g.with_bytes(address, index_bytes(kind, count), xxhash_rust::xxh3::xxh3_64),
+            None => 0,
+        };
+        let key = IndexKey {
+            indexed,
+            count,
+            first,
+            primitive,
+            restart_index,
+            bytes,
+        };
+        let swaps = self.swaps;
+        // the bytes are compared too, so a hash that happens to match is not trusted
+        let same = |e: &IndexEntry| match indexed {
+            Some((kind, address)) => g.with_bytes(address, index_bytes(kind, count), |b| b == e.raw.as_slice()),
+            None => true,
+        };
+        if let Some(e) = self.caches.indices.get_mut(&key).filter(|e| same(e)) {
+            e.used = swaps;
+            Lap::count("index list hits", 1);
+            let (count, lowest, vertices) = (e.count, e.lowest, e.vertices);
+            let buffer = match &e.buffer {
+                Some(b) => b.clone(),
+                None => {
+                    // seen again: worth a buffer of its own
+                    let list = std::mem::take(&mut e.indices);
+                    let b = self.d.device.create_buffer(&wgpu::BufferDescriptor {
+                        label: Some("index list"),
+                        size: u64::from(count.max(1)) * 4,
+                        usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
+                        mapped_at_creation: false,
+                    });
+                    let bytes: Vec<u8> = list.iter().flat_map(|i| i.to_le_bytes()).collect();
+                    self.d.queue.write_buffer(&b, 0, &bytes);
+                    self.caches.index_bytes += bytes.len() as u64;
+                    if let Some(e) = self.caches.indices.get_mut(&key) {
+                        e.buffer = Some(b.clone());
+                    }
+                    b
+                }
+            };
+            return Some(DrawIndices {
+                buffer: BufRef {
+                    buffer,
+                    offset: 0,
+                    size: u64::from(count) * 4,
+                },
+                count,
+                lowest,
+                vertices,
+            });
+        }
+        Lap::count("index list misses", 1);
+        let IndexList { indices, lowest, vertices } = index_list(g, restart_index, primitive, expand, count, indexed, first)?;
+        let raw = match indexed {
+            Some((kind, address)) => g.with_bytes(address, index_bytes(kind, count), <[u8]>::to_vec),
+            None => Vec::new(),
+        };
+        let index_bytes: Vec<u8> = indices.iter().flat_map(|i| i.to_le_bytes()).collect();
+        let buffer = self.arena_write(&index_bytes, index_bytes.len() as u64);
+        let count = indices.len() as u32;
+        // forget the lists not used for a while when they take too much
+        if self.caches.index_bytes > (256 << 20) {
+            self.caches.indices.retain(|_, e| e.used + 120 >= swaps);
+            self.caches.index_bytes = self
+                .caches
+                .indices
+                .values()
+                .filter(|e| e.buffer.is_some())
+                .map(|e| u64::from(e.count) * 4)
+                .sum();
+        }
+        if self.caches.indices.len() >= INDEX_LIST_LIMIT {
+            self.caches.indices.retain(|_, e| e.used + 2 >= swaps);
+        }
+        self.caches.indices.insert(
+            key,
+            IndexEntry {
+                raw,
+                indices,
+                buffer: None,
+                count,
+                lowest,
+                vertices,
+                used: swaps,
+            },
+        );
+        Some(DrawIndices {
+            buffer,
+            count,
+            lowest,
+            vertices,
+        })
+    }
+
+    /// The upload of one uniform block: the guest's big-endian words as the shader reads them, `vec4s` of them (zeros past the block's
+    /// size). The same bytes at the same place uploaded earlier in the batch are not uploaded again: the draw reads that upload (the
+    /// guest bytes are compared, not hashed), which also lets it share the bind group of the draw before.
     pub(crate) fn uniform_buffer(&mut self, g: &Guest, block: &crate::state::UniformBlock, vec4s: u32) -> BufRef {
         let size = u64::from(vec4s.max(1)) * 16;
-        let mut bytes = vec![0u8; size as usize];
-        let have = (block.size as usize).min(bytes.len());
-        if block.address != 0 && have > 0 {
-            g.read(block.address, &mut bytes[..have]);
-            for w in bytes.as_chunks_mut::<4>().0 {
-                w.reverse();
-            }
+        let have = if block.address != 0 {
+            (block.size as usize).min(size as usize)
+        } else {
+            0
+        };
+        let key = (block.address, vec4s, have as u32);
+        let batch = self.batch.generation;
+        let swaps = self.swaps;
+        let memo = self.caches.uniforms.entry(key).or_default();
+        memo.swap = swaps;
+        if let Some(r) = g.with_bytes(block.address, have, |now| memo.find(batch, now)) {
+            Lap::count("uniform uploads shared", 1);
+            return r;
         }
-        self.arena_write(&bytes, size)
+        let mut words = std::mem::take(&mut self.caches.scratch);
+        uniform_words(g, block.address, have, &mut words);
+        let r = if size >= SLOT_SIZE {
+            Lap::count("uniform blocks read by index", 1);
+            self.slot_write(&words, size)
+        } else {
+            self.arena_write(&words, size)
+        };
+        Lap::count("uniform uploads", 1);
+        Lap::count("uniform bytes uploaded", words.len() as u64);
+        let memo = self.caches.uniforms.get_mut(&key).expect("made above");
+        g.with_bytes(block.address, have, |now| memo.insert(batch, now, &r));
+        self.caches.scratch = words;
+        r
+    }
+
+    /// A slot of `size` (at most `SLOT_SIZE`) bytes holding `data` and zeros after it. Only `data`, and the part of the slot an earlier
+    /// batch wrote past it, are uploaded: the rest of the slot is zero already (buffers start zeroed).
+    fn slot_write(&mut self, data: &[u8], size: u64) -> BufRef {
+        debug_assert!(size <= SLOT_SIZE && data.len() as u64 <= size && data.len().is_multiple_of(4));
+        let k = self.batch.slots_used;
+        self.batch.slots_used += 1;
+        if k / SLOTS_PER_BUFFER >= self.batch.slot_buffers.len() {
+            let buffer = self.d.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("uniform slots"),
+                size: SLOT_SIZE * SLOTS_PER_BUFFER as u64,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            self.batch.slot_buffers.push(buffer);
+            self.batch.slot_marks.resize(self.batch.slot_buffers.len() * SLOTS_PER_BUFFER, 0);
+        }
+        let buffer = self.batch.slot_buffers[k / SLOTS_PER_BUFFER].clone();
+        let offset = (k % SLOTS_PER_BUFFER) as u64 * SLOT_SIZE;
+        if !data.is_empty() {
+            self.d.queue.write_buffer(&buffer, offset, data);
+        }
+        // what an earlier upload wrote past this one's end goes back to zero
+        let mark = self.batch.slot_marks[k];
+        if mark > data.len() as u64 {
+            let zeros = vec![0u8; (mark - data.len() as u64) as usize];
+            self.d.queue.write_buffer(&buffer, offset + data.len() as u64, &zeros);
+        }
+        self.batch.slot_marks[k] = data.len() as u64;
+        BufRef { buffer, offset, size }
+    }
+
+    /// A bind group with these resources: the one made before for the same layout and resources, or a new one (which is kept unless
+    /// `keep` is false, for resources made for this draw only).
+    pub(crate) fn bind_group(&mut self, layout: &wgpu::BindGroupLayout, entries: Vec<(u32, Bound)>, keep: bool) -> wgpu::BindGroup {
+        let key = GroupKey {
+            layout: layout.clone(),
+            entries,
+        };
+        if keep && let Some(e) = self.caches.bind_groups.get_mut(&key) {
+            e.1 = self.swaps;
+            Lap::count("bind group hits", 1);
+            return e.0.clone();
+        }
+        let list: Vec<wgpu::BindGroupEntry> = key
+            .entries
+            .iter()
+            .map(|(binding, r)| wgpu::BindGroupEntry {
+                binding: *binding,
+                resource: match r {
+                    Bound::Buffer(buffer, offset, size) => wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                        buffer,
+                        offset: *offset,
+                        size: std::num::NonZeroU64::new(*size),
+                    }),
+                    Bound::View(v) => wgpu::BindingResource::TextureView(v),
+                    Bound::Sampler(s) => wgpu::BindingResource::Sampler(s),
+                },
+            })
+            .collect();
+        let group = self.d.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout,
+            entries: &list,
+        });
+        if keep {
+            Lap::count("bind group misses", 1);
+            if self.caches.bind_groups.len() >= BIND_GROUP_LIMIT {
+                self.caches.bind_groups.clear();
+            }
+            self.caches.bind_groups.insert(key, (group.clone(), self.swaps));
+        } else {
+            Lap::count("bind groups not kept", 1);
+        }
+        group
+    }
+
+    /// Once a second of frames: forgets the bind groups not used in that time (they keep their buffers and views alive), and the
+    /// invalidated textures not drawn in that time.
+    pub(crate) fn prune(&mut self) {
+        let swaps = self.swaps;
+        if swaps.is_multiple_of(60) {
+            self.caches.bind_groups.retain(|_, e| e.1 + 60 >= swaps);
+            self.caches.uniforms.retain(|_, u| u.swap + 60 >= swaps);
+            // index lists drawn once and not again are not kept long
+            self.caches
+                .indices
+                .retain(|_, e| e.used + 120 >= swaps && (e.buffer.is_some() || e.used + 2 >= swaps));
+            self.caches.index_bytes = self
+                .caches
+                .indices
+                .values()
+                .filter(|e| e.buffer.is_some())
+                .map(|e| u64::from(e.count) * 4)
+                .sum();
+            // an invalidated texture is kept in case its bytes did not change; one not drawn since goes as it did before
+            self.caches.textures.retain(|_, t| !t.dirty || t.used + 60 >= swaps);
+        }
     }
 
     pub(crate) fn draw_call(&mut self, g: &Guest, primitive: u32, count: u32, indexed: Option<(u32, u32)>, first: u32, instances: u32) {
@@ -879,8 +1482,11 @@ impl Gx2 {
         }
         lap.mark("target and kinds");
         let geometry = st.geometry_shader != 0 && st.shader_mode == 2;
+        // only the draws with a geometry shader have this pass, and only they are timed as it
         let geo = if geometry {
-            match self.geometry_pass(g, &st, &fetch, primitive, count, first, indexed, instances) {
+            let geo = self.geometry_pass(g, &st, &fetch, primitive, count, first, indexed, instances);
+            lap.mark("geometry pass");
+            match geo {
                 Some(x) => Some(x),
                 None => {
                     *self.caches.skipped.entry("geometry pipeline not drawn").or_default() += 1;
@@ -890,7 +1496,6 @@ impl Gx2 {
         } else {
             None
         };
-        lap.mark("geometry pass");
         let vs = match &geo {
             Some(x) => x.copy.clone(),
             None => {
@@ -902,7 +1507,7 @@ impl Gx2 {
             }
         };
         let semantics_at = geo.as_ref().map_or(st.vertex_shader + 0x10, |x| x.semantics_at);
-        let Some((ps, _inputs)) = self.pixel_shader(g, st.pixel_shader, semantics_at, &kinds) else {
+        let Some(ps) = self.pixel_shader(g, st.pixel_shader, semantics_at, &kinds) else {
             *self.caches.skipped.entry("pixel shader not translated").or_default() += 1;
             return;
         };
@@ -920,93 +1525,24 @@ impl Gx2 {
                     wgpu::PrimitiveTopology::TriangleList,
                 )
             } else {
-                // indices
-                let index_values: Option<Vec<u32>> = match indexed {
-                    Some((kind, address)) => {
-                        let (wide, big) = (matches!(kind, 1 | 9), matches!(kind, 4 | 9));
-                        let size = if wide { 4 } else { 2 };
-                        let mut bytes = vec![0u8; (count * size) as usize];
-                        g.read(address, &mut bytes);
-                        Some(
-                            bytes
-                                .chunks_exact(size as usize)
-                                .map(|c| match (wide, big) {
-                                    (true, true) => u32::from_be_bytes([c[0], c[1], c[2], c[3]]),
-                                    (true, false) => u32::from_le_bytes([c[0], c[1], c[2], c[3]]),
-                                    (false, true) => u32::from(u16::from_be_bytes([c[0], c[1]])),
-                                    (false, false) => u32::from(u16::from_le_bytes([c[0], c[1]])),
-                                })
-                                // the restart index of a strip is `u32::MAX` from here on (what the GPU API takes)
-                                .map(|i| if Some(i) == st.restart_index { u32::MAX } else { i })
-                                .collect(),
-                        )
-                    }
-                    None => None,
-                };
-                let (topology, expand): (wgpu::PrimitiveTopology, bool) = match primitive {
-                    1 => (wgpu::PrimitiveTopology::PointList, false),
-                    2 => (wgpu::PrimitiveTopology::LineList, false),
-                    3 => (wgpu::PrimitiveTopology::LineStrip, false),
-                    4 => (wgpu::PrimitiveTopology::TriangleList, false),
-                    6 => (wgpu::PrimitiveTopology::TriangleStrip, false),
-                    5 | 0x13 | 0x14 | 0x12 => (wgpu::PrimitiveTopology::TriangleList, true),
-                    other => {
-                        self.report(format!("the primitive type {other:#x} is not drawn"));
-                        *self.caches.skipped.entry("primitive type").or_default() += 1;
-                        return;
-                    }
-                };
-                // the list of vertex numbers the draw uses
-                let base: Vec<u32> = match &index_values {
-                    Some(v) => v.iter().map(|&i| if i == u32::MAX { i } else { i.wrapping_add(first) }).collect(),
-                    None => (first..first + count).collect(),
-                };
-                // only strips restart; elsewhere the restart value is an ordinary vertex number
-                let base: Vec<u32> = if matches!(primitive, 3 | 6) {
-                    base
-                } else {
-                    base.into_iter()
-                        .map(|i| if i == u32::MAX { st.restart_index.unwrap_or(i) } else { i })
-                        .collect()
-                };
-                let indices: Vec<u32> = if expand {
-                    match primitive {
-                        5 => (1..base.len().saturating_sub(1))
-                            .flat_map(|i| [base[0], base[i], base[i + 1]])
-                            .collect(),
-                        0x13 => base
-                            .as_chunks::<4>()
-                            .0
-                            .iter()
-                            .flat_map(|q| [q[0], q[1], q[2], q[0], q[2], q[3]])
-                            .collect(),
-                        0x14 => (0..base.len().saturating_sub(3))
-                            .step_by(2)
-                            .flat_map(|i| [base[i], base[i + 1], base[i + 3], base[i], base[i + 3], base[i + 2]])
-                            .collect(),
-                        _ => Vec::new(),
-                    }
-                } else {
-                    base
-                };
-                if indices.is_empty() {
+                let Some((topology, _)) = topology_of(primitive) else {
+                    self.report(format!("the primitive type {primitive:#x} is not drawn"));
+                    *self.caches.skipped.entry("primitive type").or_default() += 1;
                     return;
-                }
+                };
+                let Some(DrawIndices {
+                    buffer: index_buffer,
+                    count: index_count,
+                    lowest,
+                    vertices,
+                }) = self.draw_indices(g, st.restart_index, primitive, count, indexed, first)
+                else {
+                    return;
+                };
                 lap.mark("index list");
-                // only the vertices the draw uses are decoded: the indices are made relative to the lowest one
-                let real = || indices.iter().copied().filter(|&i| i != u32::MAX);
-                let lowest = real().min().unwrap_or(0);
-                let highest = real().max().unwrap_or(0);
-                let indices: Vec<u32> = indices.iter().map(|&i| if i == u32::MAX { i } else { i - lowest }).collect();
-                let vertices = highest - lowest + 1;
-                let (va, meta) = self.cached_streams(g, &st, &fetch, lowest, vertices.min(1 << 22), instances);
+                let (va, meta_buffer) = self.cached_streams(g, &st, &fetch, lowest, vertices.min(1 << 22), instances);
                 lap.mark("decode streams");
-                // buffers
-                let meta_bytes: Vec<u8> = meta.iter().flatten().flat_map(|v| v.to_le_bytes()).collect();
-                let meta_buffer = self.arena_write(&meta_bytes, 256);
-                let index_bytes: Vec<u8> = indices.iter().flat_map(|i| i.to_le_bytes()).collect();
-                let index_buffer = self.arena_write(&index_bytes, index_bytes.len() as u64);
-                (va, meta_buffer, index_buffer, indices.len() as u32, topology)
+                (va, meta_buffer, index_buffer, index_count, topology)
             };
         lap.mark("indices, streams, buffers");
         // the pipeline
@@ -1020,20 +1556,21 @@ impl Gx2 {
             topology,
             wgpu::PrimitiveTopology::TriangleStrip | wgpu::PrimitiveTopology::LineStrip
         );
-        let key = format!(
-            "{:p}{:p}{topology:?}{target_format:?}{:?}{:?}{}{}{}{}{}{}{}",
-            Arc::as_ptr(&vs),
-            Arc::as_ptr(&ps),
-            st.blend[0],
-            use_depth.map(|d| d.1),
-            st.colour_control[1] & 1,
-            st.target_masks & 0xf,
-            st.depth_test,
-            st.depth_write,
-            st.depth_func,
-            st.cull_front as u8 * 2 + st.cull_back as u8,
-            st.front_face,
-        );
+        let key = PipelineKey {
+            vs: Arc::as_ptr(&vs) as usize,
+            ps: Arc::as_ptr(&ps) as usize,
+            topology,
+            target_format,
+            blend: st.blend[0].clone(),
+            depth_format: use_depth.map(|d| d.1),
+            blend_on: st.colour_control[1] & 1,
+            masks: st.target_masks & 0xf,
+            depth_test: st.depth_test,
+            depth_write: st.depth_write,
+            depth_func: st.depth_func,
+            cull: st.cull_front as u8 * 2 + st.cull_back as u8,
+            front_face: st.front_face,
+        };
         let entry = match self.caches.pipelines.get(&key) {
             Some(e) => e.clone(),
             None => {
@@ -1118,47 +1655,31 @@ impl Gx2 {
                     multiview_mask: None,
                     cache: None,
                 });
-                let e = Arc::new(PipelineEntry { pipeline });
+                let layouts = std::array::from_fn(|n| pipeline.get_bind_group_layout(n as u32));
+                let e = Arc::new(PipelineEntry {
+                    pipeline,
+                    layouts,
+                    _shaders: (vs.clone(), ps.clone()),
+                });
                 self.caches.pipelines.insert(key, e.clone());
                 e
             }
         };
         lap.mark("pipeline");
-        // the bindings
-        let mut vs_entries = Vec::new();
-        let mut ps_entries = Vec::new();
-        let mut keep: Vec<BufRef> = Vec::new();
+        // the bindings: the uniform blocks (uploaded again only when their contents are new in this batch) and the bind groups (made
+        // again only when what they bind is new)
+        let mut vs_entries = Vec::with_capacity(vs.interface.banks.len());
         for (&bank, &len) in &vs.interface.banks {
-            keep.push(self.uniform_buffer(g, &st.vertex_blocks[(bank as usize).min(15)], len));
+            let r = self.uniform_buffer(g, &st.vertex_blocks[(bank as usize).min(15)], len);
+            vs_entries.push((bank, r.bound()));
         }
+        let mut ps_entries = Vec::with_capacity(ps.interface.banks.len());
         for (&bank, &len) in &ps.interface.banks {
-            keep.push(self.uniform_buffer(g, &st.pixel_blocks[(bank as usize).min(15)], len));
+            let r = self.uniform_buffer(g, &st.pixel_blocks[(bank as usize).min(15)], len);
+            ps_entries.push((bank, r.bound()));
         }
-        let mut at = 0;
-        for &bank in vs.interface.banks.keys() {
-            vs_entries.push(wgpu::BindGroupEntry {
-                binding: bank,
-                resource: keep[at].binding(),
-            });
-            at += 1;
-        }
-        for &bank in ps.interface.banks.keys() {
-            ps_entries.push(wgpu::BindGroupEntry {
-                binding: bank,
-                resource: keep[at].binding(),
-            });
-            at += 1;
-        }
-        let group0 = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: None,
-            layout: &entry.pipeline.get_bind_group_layout(0),
-            entries: &vs_entries,
-        });
-        let group1 = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: None,
-            layout: &entry.pipeline.get_bind_group_layout(1),
-            entries: &ps_entries,
-        });
+        let group0 = self.bind_group(&entry.layouts[0], vs_entries, true);
+        let group1 = self.bind_group(&entry.layouts[1], ps_entries, true);
         lap.mark("uniforms and groups 0, 1");
         // textures: white stand-ins until the real ones are decoded
         let draw_image = image;
@@ -1176,7 +1697,7 @@ impl Gx2 {
                 {
                     {
                         if image != draw_image {
-                            return (r, target.texture.create_view(&Default::default()));
+                            return (r, target.view.clone());
                         }
                         // the pass draws into what it samples: the shader gets a copy of how it was before
                         let copy = device.create_texture(&wgpu::TextureDescriptor {
@@ -1198,17 +1719,9 @@ impl Gx2 {
                     }
                 }
                 if k == TexKind::Depth2d
-                    && let Some((texture, _)) = self.caches.depth.get(&image)
+                    && let Some(depth) = self.caches.depth.get(&image)
                 {
-                    {
-                        return (
-                            r,
-                            texture.create_view(&wgpu::TextureViewDescriptor {
-                                aspect: wgpu::TextureAspect::DepthOnly,
-                                ..Default::default()
-                            }),
-                        );
-                    }
+                    return (r, depth.sample_view.clone());
                 }
                 if t != 0
                     && k != TexKind::Depth2d
@@ -1223,17 +1736,24 @@ impl Gx2 {
         let sampler_for = |this: &mut Gx2, unit: u32| -> wgpu::Sampler {
             let at = st.pixel_samplers.get(unit as usize).copied().unwrap_or(0);
             if at == 0 {
-                return this.d.device.create_sampler(&wgpu::SamplerDescriptor {
-                    mag_filter: wgpu::FilterMode::Linear,
-                    min_filter: wgpu::FilterMode::Linear,
-                    ..Default::default()
-                });
+                return this
+                    .caches
+                    .default_sampler
+                    .get_or_insert_with(|| {
+                        this.d.device.create_sampler(&wgpu::SamplerDescriptor {
+                            mag_filter: wgpu::FilterMode::Linear,
+                            min_filter: wgpu::FilterMode::Linear,
+                            ..Default::default()
+                        })
+                    })
+                    .clone();
             }
-            let d = crate::texture::Sampler::read(g, at);
-            let key = format!("{d:?}");
+            // the sampler is made from these three words only
+            let key = [g.u32(at), g.u32(at + 4), g.u32(at + 8)];
             if let Some(s) = this.caches.samplers.get(&key) {
                 return s.clone();
             }
+            let d = crate::texture::Sampler::read(g, at);
             let filter = |linear: bool| {
                 if linear {
                     wgpu::FilterMode::Linear
@@ -1260,61 +1780,36 @@ impl Gx2 {
             s
         };
         lap.mark("texture views");
-        let sampler_units: Vec<u32> = ps.interface.samplers.iter().copied().collect();
-        let sampler_list: Vec<(u32, wgpu::Sampler)> = sampler_units.iter().map(|s| (16 + s, sampler_for(self, *s))).collect();
-        let compare_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
-            compare: Some(wgpu::CompareFunction::LessEqual),
-            mag_filter: wgpu::FilterMode::Linear,
-            min_filter: wgpu::FilterMode::Linear,
-            ..Default::default()
-        });
+        let mut tex_entries: Vec<(u32, Bound)> = views.into_iter().map(|(r, v)| (r, Bound::View(v))).collect();
+        for &unit in &ps.interface.samplers {
+            tex_entries.push((16 + unit, Bound::Sampler(sampler_for(self, unit))));
+        }
+        if !ps.interface.compare_samplers.is_empty() {
+            let compare_sampler = self
+                .caches
+                .compare_sampler
+                .get_or_insert_with(|| {
+                    device.create_sampler(&wgpu::SamplerDescriptor {
+                        compare: Some(wgpu::CompareFunction::LessEqual),
+                        mag_filter: wgpu::FilterMode::Linear,
+                        min_filter: wgpu::FilterMode::Linear,
+                        ..Default::default()
+                    })
+                })
+                .clone();
+            for s in &ps.interface.compare_samplers {
+                tex_entries.push((32 + s, Bound::Sampler(compare_sampler.clone())));
+            }
+        }
         lap.mark("samplers");
-        let mut tex_entries: Vec<wgpu::BindGroupEntry> = Vec::new();
-        for (r, v) in &views {
-            tex_entries.push(wgpu::BindGroupEntry {
-                binding: *r,
-                resource: wgpu::BindingResource::TextureView(v),
-            });
-        }
-        for (binding, sampler) in &sampler_list {
-            tex_entries.push(wgpu::BindGroupEntry {
-                binding: *binding,
-                resource: wgpu::BindingResource::Sampler(sampler),
-            });
-        }
-        for s in &ps.interface.compare_samplers {
-            tex_entries.push(wgpu::BindGroupEntry {
-                binding: 32 + s,
-                resource: wgpu::BindingResource::Sampler(&compare_sampler),
-            });
-        }
-        let group2 = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: None,
-            layout: &entry.pipeline.get_bind_group_layout(2),
-            entries: &tex_entries,
-        });
+        // a snapshot is made for this draw only: its bind group is not kept
+        let group2 = self.bind_group(&entry.layouts[2], tex_entries, snapshots.is_empty());
         lap.mark("group 2");
-        let mut group3_entries = vec![
-            wgpu::BindGroupEntry {
-                binding: 0,
-                resource: va.binding(),
-            },
-            wgpu::BindGroupEntry {
-                binding: 1,
-                resource: meta_buffer.binding(),
-            },
-        ];
+        let mut group3_entries = vec![(0, va.bound()), (1, meta_buffer.bound())];
         if let Some(x) = &geo {
-            group3_entries.push(wgpu::BindGroupEntry {
-                binding: 2,
-                resource: x.ring_out.binding(),
-            });
+            group3_entries.push((2, x.ring_out.bound()));
         }
-        let group3 = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: None,
-            layout: &entry.pipeline.get_bind_group_layout(3),
-            entries: &group3_entries,
-        });
+        let group3 = self.bind_group(&entry.layouts[3], group3_entries, true);
         lap.mark("group 3");
         // the draws are recorded into one command buffer and one render pass for as long as they go to the same targets; the pass
         // and the buffer end at the next thing that is not such a draw (see `flush_draws`)
@@ -1339,8 +1834,8 @@ impl Gx2 {
         }
         if self.batch.key != Some(key) {
             self.end_pass();
-            let colour_view = self.targets[&image].texture.create_view(&Default::default());
-            let depth_view = use_depth.map(|(image, _)| self.caches.depth[&image].0.create_view(&Default::default()));
+            let colour_view = self.targets[&image].view.clone();
+            let depth_view = use_depth.map(|(image, _)| self.caches.depth[&image].view.clone());
             let enc = self
                 .batch
                 .enc
@@ -1418,6 +1913,11 @@ impl Gx2 {
 
     /// A part of an arena of at least `size` bytes (contents not defined).
     pub(crate) fn arena_alloc(&mut self, role: Role, size: u64) -> BufRef {
+        self.arena_place(role, size).0
+    }
+
+    /// The same, with which arena of the role it is in (none for a buffer too big to share).
+    fn arena_place(&mut self, role: Role, size: u64) -> (BufRef, Option<usize>) {
         let limits = self.d.device.limits();
         let align = u64::from(
             limits
@@ -1439,17 +1939,20 @@ impl Gx2 {
                 usage,
                 mapped_at_creation: false,
             });
-            return BufRef { buffer, offset: 0, size };
+            return (BufRef { buffer, offset: 0, size }, None);
         }
-        for a in &mut self.batch.arenas[role as usize] {
+        for (i, a) in self.batch.arenas[role as usize].iter_mut().enumerate() {
             let at = a.used.next_multiple_of(align);
             if at + size <= a.size {
                 a.used = at + size;
-                return BufRef {
-                    buffer: a.buffer.clone(),
-                    offset: at,
-                    size,
-                };
+                return (
+                    BufRef {
+                        buffer: a.buffer.clone(),
+                        offset: at,
+                        size,
+                    },
+                    Some(i),
+                );
             }
         }
         let buffer = self.d.device.create_buffer(&wgpu::BufferDescriptor {
@@ -1458,19 +1961,35 @@ impl Gx2 {
             usage,
             mapped_at_creation: false,
         });
-        self.batch.arenas[role as usize].push(Arena {
+        let arenas = &mut self.batch.arenas[role as usize];
+        arenas.push(Arena {
             buffer: buffer.clone(),
             size: ARENA_SIZE,
             used: size,
+            shadow: Vec::new(),
         });
-        BufRef { buffer, offset: 0, size }
+        (BufRef { buffer, offset: 0, size }, Some(arenas.len() - 1))
     }
 
-    /// The same, holding `data` (padded with zeros to `size` when that is more).
+    /// The same, holding `data` (padded with zeros to `size` when that is more). The bytes go to the arena's copy in memory, and the
+    /// arena is uploaded in one write when the batch is handed to the GPU (`flush_draws`), not one write per buffer.
     pub(crate) fn arena_write(&mut self, data: &[u8], size: u64) -> BufRef {
-        let r = self.arena_alloc(Role::Read, size.max(data.len() as u64));
-        if !data.is_empty() {
-            self.d.queue.write_buffer(&r.buffer, r.offset, data);
+        let (r, at) = self.arena_place(Role::Read, size.max(data.len() as u64));
+        match at {
+            Some(i) => {
+                let a = &mut self.batch.arenas[Role::Read as usize][i];
+                let (from, end) = (r.offset as usize, (r.offset + r.size) as usize);
+                if a.shadow.len() < end {
+                    a.shadow.resize(end, 0);
+                }
+                a.shadow[from..from + data.len()].copy_from_slice(data);
+                a.shadow[from + data.len()..end].fill(0);
+            }
+            None => {
+                if !data.is_empty() {
+                    self.d.queue.write_buffer(&r.buffer, r.offset, data);
+                }
+            }
         }
         r
     }
@@ -1485,6 +2004,19 @@ impl Gx2 {
     /// calls this first.
     pub(crate) fn flush_draws(&mut self) {
         self.end_pass();
+        // what the draws read, written into the arenas' copies, goes up first, one write per arena (the queue keeps writes before the
+        // commands submitted after them)
+        for a in &mut self.batch.arenas[Role::Read as usize] {
+            let used = a.used as usize;
+            if used > 0 {
+                if a.shadow.len() < used {
+                    a.shadow.resize(used, 0);
+                }
+                self.d.queue.write_buffer(&a.buffer, 0, &a.shadow[..used]);
+            }
+        }
+        self.batch.generation += 1;
+        self.batch.slots_used = 0;
         let mut work = Vec::new();
         if let Some(pre) = self.batch.pre.take() {
             work.push(pre.finish());
@@ -1501,46 +2033,237 @@ impl Gx2 {
     }
 }
 
-/// MH3U_GFX_TIMES: how long the parts of a draw take, added up and reported every ten seconds.
+/// What a draw's index list is made from: its index buffer (type and address) and a hash of the bytes there, the count, the first vertex,
+/// the primitive type and the restart index.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct IndexKey {
+    indexed: Option<(u32, u32)>,
+    count: u32,
+    first: u32,
+    primitive: u32,
+    restart_index: Option<u32>,
+    bytes: u64,
+}
+
+/// An index list made before: the list itself until it gets a buffer of its own (the second time it is drawn).
+pub(crate) struct IndexEntry {
+    /// The index bytes it was made from.
+    raw: Vec<u8>,
+    indices: Vec<u32>,
+    buffer: Option<wgpu::Buffer>,
+    count: u32,
+    lowest: u32,
+    vertices: u32,
+    used: u32,
+}
+
+/// How many index lists are remembered before the ones not drawn in the last two frames are forgotten.
+const INDEX_LIST_LIMIT: usize = 65536;
+
+/// The bytes of `count` indices of `GX2IndexType` `kind` (32-bit for 1 and 9, 16-bit otherwise).
+fn index_bytes(kind: u32, count: u32) -> usize {
+    count as usize * if matches!(kind, 1 | 9) { 4 } else { 2 }
+}
+
+/// A draw's index buffer on the GPU: `count` vertex numbers relative to `lowest`, which with the `vertices` after it are what the draw
+/// reads.
+pub(crate) struct DrawIndices {
+    pub buffer: BufRef,
+    pub count: u32,
+    pub lowest: u32,
+    pub vertices: u32,
+}
+
+/// The list a draw's primitives are made of.
+pub(crate) struct IndexList {
+    /// Vertex numbers relative to `lowest` (`u32::MAX` restarts a strip).
+    pub indices: Vec<u32>,
+    pub lowest: u32,
+    /// From `lowest` to the highest vertex used.
+    pub vertices: u32,
+}
+
+/// The GPU's primitive topology for a `GX2PrimitiveMode`, and whether its primitives are made into triangles first (fans, quads, quad
+/// strips, rectangles).
+pub(crate) fn topology_of(primitive: u32) -> Option<(wgpu::PrimitiveTopology, bool)> {
+    Some(match primitive {
+        1 => (wgpu::PrimitiveTopology::PointList, false),
+        2 => (wgpu::PrimitiveTopology::LineList, false),
+        3 => (wgpu::PrimitiveTopology::LineStrip, false),
+        4 => (wgpu::PrimitiveTopology::TriangleList, false),
+        6 => (wgpu::PrimitiveTopology::TriangleStrip, false),
+        5 | 0x13 | 0x14 | 0x12 => (wgpu::PrimitiveTopology::TriangleList, true),
+        _ => return None,
+    })
+}
+
+/// The vertex numbers a draw uses, from its index buffer (`indexed`: the `GX2IndexType` and address) or counted from `first`, with
+/// fans and quads made into triangles; `None` when there are none.
+pub(crate) fn index_list(
+    g: &Guest,
+    restart_index: Option<u32>,
+    primitive: u32,
+    expand: bool,
+    count: u32,
+    indexed: Option<(u32, u32)>,
+    first: u32,
+) -> Option<IndexList> {
+    let index_values: Option<Vec<u32>> = match indexed {
+        Some((kind, address)) => {
+            let (wide, big) = (matches!(kind, 1 | 9), matches!(kind, 4 | 9));
+            let size = if wide { 4 } else { 2 };
+            let mut bytes = vec![0u8; (count * size) as usize];
+            g.read(address, &mut bytes);
+            Some(
+                bytes
+                    .chunks_exact(size as usize)
+                    .map(|c| match (wide, big) {
+                        (true, true) => u32::from_be_bytes([c[0], c[1], c[2], c[3]]),
+                        (true, false) => u32::from_le_bytes([c[0], c[1], c[2], c[3]]),
+                        (false, true) => u32::from(u16::from_be_bytes([c[0], c[1]])),
+                        (false, false) => u32::from(u16::from_le_bytes([c[0], c[1]])),
+                    })
+                    // the restart index of a strip is `u32::MAX` from here on (what the GPU API takes)
+                    .map(|i| if Some(i) == restart_index { u32::MAX } else { i })
+                    .collect(),
+            )
+        }
+        None => None,
+    };
+    // the list of vertex numbers the draw uses
+    let base: Vec<u32> = match &index_values {
+        Some(v) => v.iter().map(|&i| if i == u32::MAX { i } else { i.wrapping_add(first) }).collect(),
+        None => (first..first + count).collect(),
+    };
+    // only strips restart; elsewhere the restart value is an ordinary vertex number
+    let base: Vec<u32> = if matches!(primitive, 3 | 6) {
+        base
+    } else {
+        base.into_iter()
+            .map(|i| if i == u32::MAX { restart_index.unwrap_or(i) } else { i })
+            .collect()
+    };
+    let indices: Vec<u32> = if expand {
+        match primitive {
+            5 => (1..base.len().saturating_sub(1))
+                .flat_map(|i| [base[0], base[i], base[i + 1]])
+                .collect(),
+            0x13 => base
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .flat_map(|q| [q[0], q[1], q[2], q[0], q[2], q[3]])
+                .collect(),
+            0x14 => (0..base.len().saturating_sub(3))
+                .step_by(2)
+                .flat_map(|i| [base[i], base[i + 1], base[i + 3], base[i], base[i + 3], base[i + 2]])
+                .collect(),
+            _ => Vec::new(),
+        }
+    } else {
+        base
+    };
+    if indices.is_empty() {
+        return None;
+    }
+    // only the vertices the draw uses are decoded: the indices are made relative to the lowest one
+    let real = || indices.iter().copied().filter(|&i| i != u32::MAX);
+    let lowest = real().min().unwrap_or(0);
+    let highest = real().max().unwrap_or(0);
+    let indices: Vec<u32> = indices.iter().map(|&i| if i == u32::MAX { i } else { i - lowest }).collect();
+    Some(IndexList {
+        indices,
+        lowest,
+        vertices: highest - lowest + 1,
+    })
+}
+
+/// MH3U_GFX_TIMES: how long the parts of a draw take, and how often the caches hit, added up and reported every report window
+/// (MH3U_TIMES_WINDOW seconds, ten by default) as totals and as per-frame averages (steady-state numbers to compare builds with).
 pub(crate) struct Lap {
     on: bool,
     at: std::time::Instant,
 }
 
-type LapTable = (
-    Option<std::time::Instant>,
-    std::collections::BTreeMap<&'static str, (std::time::Duration, u64)>,
-);
+#[derive(Default)]
+struct LapTable {
+    /// When the window began, and the frame count then.
+    since: Option<(std::time::Instant, u64)>,
+    times: std::collections::BTreeMap<&'static str, (std::time::Duration, u64)>,
+    counts: std::collections::BTreeMap<&'static str, u64>,
+}
 
-static LAPS: std::sync::Mutex<LapTable> = std::sync::Mutex::new((None, std::collections::BTreeMap::new()));
+static LAPS: std::sync::Mutex<LapTable> = std::sync::Mutex::new(LapTable {
+    since: None,
+    times: std::collections::BTreeMap::new(),
+    counts: std::collections::BTreeMap::new(),
+});
 
 impl Lap {
-    pub(crate) fn new() -> Lap {
+    pub(crate) fn enabled() -> bool {
         static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("MH3U_GFX_TIMES").is_some())
+    }
+
+    pub(crate) fn new() -> Lap {
+        let on = Lap::enabled();
         Lap {
-            on: *ON.get_or_init(|| std::env::var_os("MH3U_GFX_TIMES").is_some()),
+            on,
             at: std::time::Instant::now(),
         }
     }
 
+    /// Adds the time since the last mark (or since `new`) to `what`.
     pub(crate) fn mark(&mut self, what: &'static str) {
         if !self.on {
             return;
         }
         let now = std::time::Instant::now();
         let mut l = LAPS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        let e = l.1.entry(what).or_default();
+        let e = l.times.entry(what).or_default();
         e.0 += now - self.at;
         e.1 += 1;
         self.at = now;
-        let since = *l.0.get_or_insert(now);
-        if now.duration_since(since) >= std::time::Duration::from_secs(10) {
-            for (name, (d, n)) in &l.1 {
-                eprintln!("[draw times] {:>8.3} s {n:>8}  {name}", d.as_secs_f64());
-            }
-            l.1.clear();
-            l.0 = Some(now);
+        Lap::maybe_print(&mut l, now);
+    }
+
+    /// Counts `n` of `what` (cache hits and misses, calls), reported with the times.
+    pub(crate) fn count(what: &'static str, n: u64) {
+        if !Lap::enabled() {
+            return;
         }
+        let mut l = LAPS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        *l.counts.entry(what).or_default() += n;
+    }
+
+    fn maybe_print(l: &mut LapTable, now: std::time::Instant) {
+        let (since, frames_at) = *l
+            .since
+            .get_or_insert_with(|| (now, mh3u_rt::FRAMES.load(std::sync::atomic::Ordering::Relaxed)));
+        let wall = now.duration_since(since);
+        if wall < mh3u_rt::times_window() {
+            return;
+        }
+        let frames = mh3u_rt::frames_since(frames_at);
+        eprintln!(
+            "[draw times] {:.1} s, {frames} frames ({:.1} fps); total s, count, ms per frame, count per frame",
+            wall.as_secs_f64(),
+            frames as f64 / wall.as_secs_f64()
+        );
+        for (name, (d, n)) in &l.times {
+            eprintln!(
+                "[draw times] {:>8.3} s {n:>8} {:>8.3} ms {:>8.1}  {name}",
+                d.as_secs_f64(),
+                d.as_secs_f64() * 1000.0 / frames as f64,
+                *n as f64 / frames as f64
+            );
+        }
+        for (name, n) in &l.counts {
+            eprintln!("[draw counts] {n:>8} {:>8.1} per frame  {name}", *n as f64 / frames as f64);
+        }
+        l.times.clear();
+        l.counts.clear();
+        l.since = None;
     }
 }
 
@@ -1553,6 +2276,12 @@ pub(crate) struct Batch {
     /// The compute work of the geometry pipelines, which comes before the draws that read what it makes.
     pub(crate) pre: Option<wgpu::CommandEncoder>,
     arenas: [Vec<Arena>; 3],
+    /// Counts the batches handed to the GPU (what was uploaded in an earlier one is not where it was any more).
+    pub(crate) generation: u64,
+    /// The slots of the big uniform blocks (see `slot_write`), how many this batch has used, and how far each was last written.
+    slot_buffers: Vec<wgpu::Buffer>,
+    slots_used: usize,
+    slot_marks: Vec<u64>,
 }
 
 /// A big buffer that the small buffers of a batch of draws are cut from (one allocation instead of several per draw). Its parts are not
@@ -1561,6 +2290,8 @@ struct Arena {
     buffer: wgpu::Buffer,
     size: u64,
     used: u64,
+    /// For the arenas the shaders read: what is written into the buffer, kept here until the batch goes to the GPU.
+    shadow: Vec<u8>,
 }
 
 const ARENA_SIZE: u64 = 256 << 20;
@@ -1586,12 +2317,8 @@ pub(crate) struct BufRef {
 }
 
 impl BufRef {
-    pub(crate) fn binding(&self) -> wgpu::BindingResource<'_> {
-        wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-            buffer: &self.buffer,
-            offset: self.offset,
-            size: std::num::NonZeroU64::new(self.size),
-        })
+    pub(crate) fn bound(&self) -> Bound {
+        Bound::Buffer(self.buffer.clone(), self.offset, self.size)
     }
 
     pub(crate) fn slice(&self) -> wgpu::BufferSlice<'_> {
@@ -1601,3 +2328,170 @@ impl BufRef {
 
 /// What a render pass draws into: the colour target, the depth target, and the number of colour outputs.
 type PassKey = (u32, Option<u32>, usize);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A texture header at 0x100 with its image at 0x1000 (0x100 bytes) and its smaller levels at 0x2000 (0x40 bytes), in a buffer
+    /// that stands for guest memory.
+    fn memory() -> Vec<u8> {
+        let mut m = vec![0u8; 0x3000];
+        let mut put = |at: usize, v: u32| m[at..at + 4].copy_from_slice(&v.to_be_bytes());
+        put(0x100 + 0x24, 0x1000);
+        put(0x100 + 0x20, 0x100);
+        put(0x100 + 0x2c, 0x2000);
+        put(0x100 + 0x28, 0x40);
+        put(0x100 + 4, 16);
+        put(0x100 + 8, 16);
+        m
+    }
+
+    fn hash(m: &mut [u8]) -> u64 {
+        let g = Guest::new(m.as_mut_ptr());
+        let h = crate::texture::Header::read(&g, 0x100);
+        texture_source_hash(&g, 0x100, &h)
+    }
+
+    /// What a uniform upload held before the uploads were made cheaper: the whole block (`vec4s` of them) with the guest's bytes in front,
+    /// every word turned around.
+    fn uniform_as_before(g: &Guest, block: &crate::state::UniformBlock, vec4s: u32) -> Vec<u8> {
+        let size = vec4s.max(1) as usize * 16;
+        let mut bytes = vec![0u8; size];
+        let have = (block.size as usize).min(size);
+        if block.address != 0 && have > 0 {
+            g.read(block.address, &mut bytes[..have]);
+            for w in bytes.as_chunks_mut::<4>().0 {
+                w.reverse();
+            }
+        }
+        bytes
+    }
+
+    #[test]
+    fn uniform_words_are_what_was_uploaded_before() {
+        let mut m: Vec<u8> = (0..0x4000u32).map(|k| (k * 7 + 3) as u8).collect();
+        let g = Guest::new(m.as_mut_ptr());
+        let mut out = Vec::new();
+        for (address, size, vec4s) in [
+            (0x100, 64, 4),
+            (0x100, 70, 8),
+            (0x203, 13, 1),
+            (0x100, 1000, 4),
+            (0, 64, 4),
+            (0x100, 0, 2),
+            (0x40, 0x2000, 4096),
+        ] {
+            let block = crate::state::UniformBlock { address, size };
+            let full = (vec4s as usize).max(1) * 16;
+            let have = if address != 0 { (size as usize).min(full) } else { 0 };
+            uniform_words(&g, address, have, &mut out);
+            assert!(out.len() <= full && out.len().is_multiple_of(4));
+            let mut padded = out.clone();
+            padded.resize(full, 0);
+            assert_eq!(
+                padded,
+                uniform_as_before(&g, &block, vec4s),
+                "block at {address:#x}, {size} bytes, {vec4s} vec4"
+            );
+        }
+    }
+
+    #[test]
+    fn a_uniform_block_is_uploaded_again_only_when_its_bytes_change() {
+        let mut gx2 = Gx2::new(crate::Display::noop());
+        let mut m = vec![0u8; 0x2_0000];
+        let g = Guest::new(m.as_mut_ptr());
+        let small = crate::state::UniformBlock {
+            address: 0x1000,
+            size: 256,
+        };
+        let big = crate::state::UniformBlock {
+            address: 0x8000,
+            size: 0x900,
+        };
+        g.write(0x1000, &[1; 256]);
+        g.write(0x8000, &[2; 0x900]);
+        let a = gx2.uniform_buffer(&g, &small, 16);
+        let a_big = gx2.uniform_buffer(&g, &big, mh3u_latte::translate::DYNAMIC_BANK);
+        assert_eq!(a_big.size, SLOT_SIZE, "a bank read by index is bound whole");
+        let same = |x: &BufRef, y: &BufRef| x.buffer == y.buffer && x.offset == y.offset && x.size == y.size;
+        assert!(same(&gx2.uniform_buffer(&g, &small, 16), &a), "same bytes, same upload");
+        assert!(same(&gx2.uniform_buffer(&g, &big, mh3u_latte::translate::DYNAMIC_BANK), &a_big));
+        // the arena holds what was uploaded before
+        let shadow = &gx2.batch.arenas[Role::Read as usize][0].shadow;
+        assert_eq!(
+            shadow[a.offset as usize..(a.offset + a.size) as usize],
+            uniform_as_before(&g, &small, 16)
+        );
+        // changed bytes are a new upload; changed back, the first one is used again
+        g.write(0x1010, &[9]);
+        let b = gx2.uniform_buffer(&g, &small, 16);
+        assert!(!same(&b, &a));
+        g.write(0x1010, &[1]);
+        assert!(same(&gx2.uniform_buffer(&g, &small, 16), &a));
+        // another size of the same block is another upload
+        assert!(!same(&gx2.uniform_buffer(&g, &small, 8), &a));
+        // after the batch went to the GPU, the bytes are uploaded again
+        gx2.flush_draws();
+        let c = gx2.uniform_buffer(&g, &small, 16);
+        let shadow = &gx2.batch.arenas[Role::Read as usize][0].shadow;
+        assert_eq!(
+            shadow[c.offset as usize..(c.offset + c.size) as usize],
+            uniform_as_before(&g, &small, 16)
+        );
+        assert_eq!(gx2.batch.slots_used, 0);
+    }
+
+    #[test]
+    fn an_index_list_made_before_is_the_same_list() {
+        let mut gx2 = Gx2::new(crate::Display::noop());
+        let mut m = vec![0u8; 0x1_0000];
+        let g = Guest::new(m.as_mut_ptr());
+        let indices: Vec<u8> = [5u16, 9, 7, 0xffff, 6, 8, 12].iter().flat_map(|i| i.to_be_bytes()).collect();
+        g.write(0x100, &indices);
+        for (primitive, restart) in [(4, None), (6, Some(0xffff)), (5, None), (0x13, None)] {
+            let list = |gx2: &mut Gx2| {
+                let d = gx2.draw_indices(&g, restart, primitive, 7, Some((4, 0x100)), 2).expect("drawn");
+                (d.count, d.lowest, d.vertices, d.buffer.size)
+            };
+            let made = index_list(
+                &g,
+                restart,
+                primitive,
+                topology_of(primitive).expect("drawn").1,
+                7,
+                Some((4, 0x100)),
+                2,
+            )
+            .expect("drawn");
+            let expected = (made.indices.len() as u32, made.lowest, made.vertices, made.indices.len() as u64 * 4);
+            // the first time (into the arena), the second (its own buffer) and after
+            for _ in 0..3 {
+                assert_eq!(list(&mut gx2), expected, "primitive {primitive:#x}");
+            }
+        }
+        // other bytes are another list
+        let before = gx2.draw_indices(&g, None, 4, 7, Some((4, 0x100)), 0).expect("drawn");
+        g.write(0x100, &[0, 1]);
+        let after = gx2.draw_indices(&g, None, 4, 7, Some((4, 0x100)), 0).expect("drawn");
+        assert_eq!((before.lowest, after.lowest), (5, 1));
+    }
+
+    #[test]
+    fn a_texture_is_decoded_again_only_when_what_it_is_made_from_changed() {
+        let mut m = memory();
+        let first = hash(&mut m);
+        assert_eq!(hash(&mut m), first, "same bytes, same hash");
+        // memory around it is not part of it
+        m[0x0fff] ^= 1;
+        m[0x1100] ^= 1;
+        m[0x2040] ^= 1;
+        assert_eq!(hash(&mut m), first);
+        for at in [0x1000, 0x10ff, 0x2000, 0x203f, 0x100 + 0x34, 0x100 + 0x84] {
+            let mut changed = memory();
+            changed[at] ^= 0x10;
+            assert_ne!(hash(&mut changed), first, "a change at {at:#x}");
+        }
+    }
+}

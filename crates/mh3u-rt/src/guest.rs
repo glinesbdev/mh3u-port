@@ -35,6 +35,15 @@ impl Guest {
         unsafe { std::ptr::copy_nonoverlapping(self.at(address), out.as_mut_ptr(), out.len()) }
     }
 
+    /// Calls `f` with the `len` bytes at `address` in place, without copying them (for hashing or comparing guest memory). The caller
+    /// keeps `address + len` below 4 GiB. Nothing writes guest memory meanwhile: only the thread holding the baton runs the game's code,
+    /// and it is the one in here.
+    pub fn with_bytes<R>(&self, address: u32, len: usize, f: impl FnOnce(&[u8]) -> R) -> R {
+        debug_assert!(u64::from(address) + len as u64 <= 1 << 32);
+        // SAFETY: inside the reserved range (as for `read`), and not written while `f` runs (above); the slice does not outlive `f`
+        f(unsafe { std::slice::from_raw_parts(self.at(address), len) })
+    }
+
     pub fn write(&self, address: u32, bytes: &[u8]) {
         watched(address, bytes.len() as u32, "write");
         debug_assert!(u64::from(address) + bytes.len() as u64 <= 1 << 32);

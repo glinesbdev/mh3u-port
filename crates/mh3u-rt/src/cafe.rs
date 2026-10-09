@@ -16,8 +16,8 @@ pub type SimpleHandler = fn(&mut Os, &Guest, &mut Ctx);
 pub enum Handler {
     Simple(SimpleHandler),
     Kernel(KernelHandler),
-    /// Done by the graphics backend.
-    Gx2,
+    /// Done by the graphics backend, with the number it gave the import (`Gx2Backend::resolve`).
+    Gx2(Option<u32>),
 }
 
 /// The look-up of an import by its "library:function" name.

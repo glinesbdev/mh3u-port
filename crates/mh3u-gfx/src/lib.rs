@@ -1,8 +1,11 @@
 //! The graphics side: a window, a Vulkan (or Direct3D 12, or Metal) device through `wgpu`, and what the game's `GX2` calls become.
 
 mod draw;
+#[cfg(test)]
+mod draw_bench;
 mod geometry;
 mod gx2;
+mod shader_cache;
 mod state;
 mod texture;
 
@@ -15,14 +18,15 @@ use winit::event::WindowEvent;
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::window::{Window, WindowId};
 
-/// What a window and its GPU are: the device, the queue and the surface the game's frames are shown on.
+/// What a window and its GPU are: the device, the queue and the surface the game's frames are shown on. The tests' displays have no
+/// window and no surface (a device that does nothing, for timing the work on the CPU).
 pub struct Display {
-    pub window: Arc<Window>,
+    pub window: Option<Arc<Window>>,
     pub instance: wgpu::Instance,
     pub adapter: wgpu::Adapter,
     pub device: wgpu::Device,
     pub queue: wgpu::Queue,
-    pub surface: wgpu::Surface<'static>,
+    pub surface: Option<wgpu::Surface<'static>>,
 }
 
 impl Display {
@@ -49,13 +53,45 @@ impl Display {
         // a validation error in one draw is reported, and the game goes on
         device.on_uncaptured_error(Arc::new(|e| eprintln!("[gfx] {e}")));
         Ok(Display {
-            window,
+            window: Some(window),
             instance,
             adapter,
             device,
             queue,
-            surface,
+            surface: Some(surface),
         })
+    }
+
+    /// A display with wgpu's no-op backend and no window: everything is validated, nothing is drawn (for the tests).
+    #[cfg(test)]
+    pub(crate) fn noop() -> Display {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+            backends: wgpu::Backends::NOOP,
+            backend_options: wgpu::BackendOptions {
+                // the limits every adapter has (as strict as a real device about alignments and counts)
+                noop: wgpu::NoopBackendOptions {
+                    limits: Some(wgpu::Limits::default()),
+                    ..wgpu::NoopBackendOptions::enabled()
+                },
+                ..Default::default()
+            },
+            ..wgpu::InstanceDescriptor::new_without_display_handle()
+        });
+        let adapter = pollster::block_on(instance.request_adapter(&Default::default())).expect("the no-op adapter");
+        let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+            required_limits: adapter.limits(),
+            required_features: adapter.features() & (wgpu::Features::TEXTURE_COMPRESSION_BC | wgpu::Features::FLOAT32_FILTERABLE),
+            ..Default::default()
+        }))
+        .expect("the no-op device");
+        Display {
+            window: None,
+            instance,
+            adapter,
+            device,
+            queue,
+            surface: None,
+        }
     }
 }
 

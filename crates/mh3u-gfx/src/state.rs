@@ -6,7 +6,7 @@
 
 use mh3u_rt::{Ctx, Guest};
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
 pub struct Blend {
     pub colour_src: u32,
     pub colour_dst: u32,

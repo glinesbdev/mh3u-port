@@ -5,7 +5,7 @@ use crate::guest::Guest;
 use crate::kernel::{self, Kernel, Life, Reporting, Step, Thread, lock};
 use crate::{Ctx, Piece};
 use anyhow::{Context, Result, bail, ensure};
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 
 /// The calls the translated library makes back into the runtime (`Host` in `ppc.h`).
@@ -60,11 +60,11 @@ fn report_of(k: &Kernel, end: &str) -> Report {
             .first
             .iter()
             .map(|&n| {
-                let a = r.first_args.get(&n).copied().unwrap_or_default();
+                let a = r.first_args.get(n as usize).copied().unwrap_or_default();
                 let stub = if r.handlers[n as usize].is_none() { "  (stub)" } else { "" };
                 (
                     format!("{}({:#x}, {:#x}, {:#x}, {:#x}){stub}", r.names[n as usize], a[0], a[1], a[2], a[3]),
-                    r.counts.get(&n).copied().unwrap_or(0),
+                    r.counts.get(n as usize).copied().unwrap_or(0),
                 )
             })
             .collect(),
@@ -75,7 +75,7 @@ fn report_of(k: &Kernel, end: &str) -> Report {
 fn print_report(k: &Kernel, why: &str) {
     println!("the game stopped: {why}");
     println!("the last system calls (arguments r3 to r6):");
-    for (n, a, lr) in &k.report.recent {
+    for (n, a, lr) in k.report.recent.iter() {
         println!(
             "  {}({:#x}, {:#x}, {:#x}, {:#x})  from {lr:#x}",
             k.report.names[*n as usize], a[0], a[1], a[2], a[3]
@@ -117,20 +117,16 @@ fn stop(c: *mut Ctx, why: String) -> ! {
 extern "C" fn import(c: *mut Ctx, number: u32) {
     // SAFETY: `c` is the context the translated code passed us; it is valid for the call, and nothing else uses it meanwhile
     let c = unsafe { &mut *c };
+    // The kernel lock is taken on every call even though only the thread holding the baton runs guest code: other threads take it too
+    // (a host thread woken with the baton, one coming back from guest callbacks run unlocked, the dump timer), and without contention
+    // it costs a few atomic operations, so skipping it would buy little for a soundness argument this code does not want to depend on.
+    // The window's input has a lock of its own (`input::INPUT`), and the audio and alarm threads are guest threads, which only take it
+    // with the baton or to wait for it.
     let mut guard = lock();
     {
         let k = guard.as_mut().expect("the kernel is set while the game runs");
         let r = &mut k.report;
-        r.calls += 1;
-        if !r.counts.contains_key(&number) {
-            r.first.push(number);
-            r.first_args.insert(number, [c.r[3], c.r[4], c.r[5], c.r[6]]);
-        }
-        *r.counts.entry(number).or_default() += 1;
-        if r.recent.len() == 12 {
-            r.recent.pop_front();
-        }
-        r.recent.push_back((number, [c.r[3], c.r[4], c.r[5], c.r[6]], c.lr));
+        r.note(number, [c.r[3], c.r[4], c.r[5], c.r[6]], c.lr);
         let (calls, max) = (r.calls, r.max_imports);
         let me = k.current;
         k.threads[me].last = Some((number, c.lr, c.r[1]));
@@ -144,16 +140,17 @@ extern "C" fn import(c: *mut Ctx, number: u32) {
         let k = guard.as_mut().expect("the kernel is set while the game runs");
         let step = match k.report.handlers[number as usize] {
             Some(Handler::Kernel(h)) => h(k, c),
-            Some(Handler::Gx2) => {
+            // by the number the backend gave the import when the game was loaded (no name matching per call)
+            Some(Handler::Gx2(id)) => {
                 let guest = k.guest;
                 if let Some(b) = k.backend.as_mut() {
                     let name = &k.report.names[number as usize];
                     if k.gfx_times {
                         let t = std::time::Instant::now();
-                        b.call(name, c, &guest);
-                        k.times.record(name, t.elapsed());
+                        b.call_id(id, name, c, &guest);
+                        k.times.record(number, t.elapsed(), &k.report.names);
                     } else {
-                        b.call(name, c, &guest);
+                        b.call_id(id, name, c, &guest);
                     }
                 }
                 Step::Done
@@ -171,12 +168,9 @@ extern "C" fn import(c: *mut Ctx, number: u32) {
         };
         match step {
             Step::Done => {
-                // MH3U_TRACE_FROM=<seconds>: trace only after that long
-                let from: f64 = std::env::var("MH3U_TRACE_FROM")
-                    .ok()
-                    .and_then(|v| v.parse().ok())
-                    .unwrap_or(f64::MAX);
-                if k.report.trace || k.started.elapsed().as_secs_f64() >= from {
+                // MH3U_TRACE_FROM=<seconds>: trace only after that long (read once when the game was loaded)
+                let from = k.report.trace_from;
+                if k.report.trace || (from.is_finite() && k.started.elapsed().as_secs_f64() >= from) {
                     eprintln!(
                         "[{}] {}({:#x}, {:#x}, {:#x}, {:#x}) = {:#x}  from {:#x}",
                         k.current, k.report.names[number as usize], args[0], args[1], args[2], args[3], c.r[3], c.lr
@@ -293,11 +287,7 @@ pub fn spawn(k: &Kernel, t: usize) {
     let th = &k.threads[t];
     let (entry, argc, argv, top) = (th.entry, th.argc, th.argv, th.stack_top);
     std::thread::spawn(move || {
-        let mut guard = lock();
-        while guard.as_ref().expect("kernel").current != t {
-            guard = kernel::BATON.wait(guard).unwrap_or_else(std::sync::PoisonError::into_inner);
-        }
-        drop(guard);
+        drop(kernel::wait_for_baton(lock(), t));
         let mut c = new_ctx(mem as *mut u8);
         c.r[1] = top.wrapping_sub(0x20);
         c.r[3] = argc;
@@ -306,7 +296,8 @@ pub fn spawn(k: &Kernel, t: usize) {
         unsafe { call(&mut c, entry) };
         let mut guard = lock();
         guard.as_mut().expect("kernel").finish_thread(c.r[3]);
-        kernel::retire(guard)
+        // nothing of the translated code is on this thread's stack any more, so it ends here rather than waiting forever
+        kernel::end_thread(guard);
     });
 }
 
@@ -329,10 +320,7 @@ pub fn spawn_audio(k: &mut Kernel) {
     });
     let (call, mem) = (k.call, k.memory as usize);
     std::thread::spawn(move || {
-        let mut guard = lock();
-        while guard.as_ref().expect("kernel").current != t {
-            guard = kernel::BATON.wait(guard).unwrap_or_else(std::sync::PoisonError::into_inner);
-        }
+        let mut guard = kernel::wait_for_baton(lock(), t);
         loop {
             guard = kernel::sleep_current(guard, std::time::Duration::from_millis(3));
             let callbacks = guard.as_ref().expect("kernel").ax_callbacks.clone();
@@ -366,10 +354,7 @@ pub fn spawn_alarms(k: &mut Kernel) {
     });
     let (call, mem) = (k.call, k.memory as usize);
     std::thread::spawn(move || {
-        let mut guard = lock();
-        while guard.as_ref().expect("kernel").current != t {
-            guard = kernel::BATON.wait(guard).unwrap_or_else(std::sync::PoisonError::into_inner);
-        }
+        let mut guard = kernel::wait_for_baton(lock(), t);
         loop {
             guard = kernel::sleep_current(guard, std::time::Duration::from_millis(2));
             let now = std::time::Instant::now();
@@ -478,20 +463,14 @@ pub fn run(library: &Path, pieces: &[Piece], options: Options) -> Result<Report>
         by_addr,
         call,
         mem,
-        Reporting {
-            handlers: names
+        Reporting::new(
+            names
                 .iter()
-                .map(|n| cafe::find(n).or_else(|| backend.as_ref().filter(|b| b.implements(n)).map(|_| Handler::Gx2)))
+                .map(|n| cafe::find(n).or_else(|| backend.as_ref().filter(|b| b.implements(n)).map(|b| Handler::Gx2(b.resolve(n)))))
                 .collect(),
             names,
-            first: Vec::new(),
-            counts: BTreeMap::new(),
-            first_args: BTreeMap::new(),
-            recent: VecDeque::new(),
-            calls: 0,
-            max_imports: options.max_imports,
-            trace: std::env::var_os("MH3U_TRACE").is_some(),
-        },
+            options.max_imports,
+        ),
     ));
     if let Some(k) = lock().as_mut() {
         k.fs.roots = roots;

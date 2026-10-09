@@ -126,6 +126,14 @@ and the C library, `sync.rs` for threads and what they wait on) or, when none is
   wait (locked mutex, unset event, sleep), yields, or ends. A waiting function is run again when its thread gets the baton back.
   This makes runs repeatable; the cost is that a thread that waits by spinning on memory, never calling the system, would hold the
   baton forever, and that all guest threads share one core of the host for now.
+  The baton goes to the next ready thread in thread order (a sleeping thread stays ready and looks at the clock when the baton
+  reaches it). Each guest thread has its own condition variable, so a handoff wakes only the host thread that receives the baton;
+  a thread that has ended is never woken again (its host thread ends if its entry function returned, and parks for good if it
+  called `OSExitThread` from inside translated code). The baton used to be one condition variable woken for all on every pass, with
+  ended threads waiting on it forever: every pass woke every one of them, so the cost grew with each thread the game had finished
+  (a Windows profile had 64% of the time in the ended threads' waits; the kernel test `baton_goes_round_the_live_threads_in_order`
+  measures it: 50 ended and 8 live threads went from about 150 us per pass to 5 us). With `MH3U_GFX_TIMES=1` a `[baton]` line
+  every report window gives the passes and idle sleeps per frame and how many guest threads have ended.
 - **Data imports** (variables the loader fills in, such as the default-heap function pointers) get an address the runtime treats as the
   function's entry, so a call through them reaches the same handler.
 - **Relocations of the code**: the file holds stale halves in the `lis`/`addi`/`lwz` that build the address of an import; the
@@ -165,7 +173,11 @@ for the next frame) blocks there, with the other guest threads waiting.
 with their text and the cloth background, upright, in the right places (the hunter's clothing still shows white speckles: not understood yet). The pieces:
 
 - **State**: every `GX2Set*` call is recorded into the state of the current context (`GX2SetContextState`/`GX2SetupContextStateEx`
-  switch between them); display lists (`GX2BeginDisplayListEx`...) are recorded and replayed with their arguments.
+  switch between them); display lists (`GX2BeginDisplayListEx`...) are recorded and replayed with their arguments. A recorded call is
+  a fixed-size record (which call, as a number, and the argument registers and stack words it reads), a list is a shared slice played
+  back without copying, and a `GX2SetPixelTexture`/`GX2SetPixelSampler` that sets a unit to what the list already set it to since its
+  last change of context is left out (the size `GX2EndDisplayList` returns still counts it). Graphics imports are given a number
+  when the game is loaded (`Gx2Backend::resolve`) and dispatched by it.
 - **A draw** (`draw.rs`): the vertex and pixel shaders are read from the guest, translated (cached by address and a hash of the
   program), the vertex attributes are decoded on the CPU into one stream of `vec4` per fetch-shader element (the fetch shader is not
   run: `GX2InitFetchShaderEx` keeps the attribute descriptions), the uniform blocks are copied with their words swapped, a pipeline is
@@ -189,6 +201,53 @@ with their text and the cloth background, upright, in the right places (the hunt
   index (`GX2SetPrimitiveRestartIndex`, 0xffff here) becomes the API's restart value: before that, strips drew a vertex 65535 away
   and decoded all 64 thousand vertices before it for every such draw. `MH3U_GFX_TIMES=1` prints where the time goes (every ten seconds:
   per graphics call, and per part of a draw).
+- **What a draw costs on the CPU** (about 50 microseconds by `MH3U_GFX_TIMES` before these changes, ~125 draws a frame in the village): nothing per draw is found by a
+  formatted string or a hash of the whole program any more.
+  - *Shaders*: a translation is found by a front cache (`shader_cache.rs`) keyed by what is cheap to read: the shader's address, its
+    program's address and size, the fetch shader's version (a new shared slice per `GX2InitFetchShaderEx`), half z, and for pixel
+    shaders a hash of the input words and the texture kinds. The program bytes still decide: each entry keeps their hash, the first
+    draw of every frame that uses it hashes them again, and `GX2Invalidate` with the shader (8) or CPU (0x40) bit drops the entries
+    whose programs it overlaps. The assumption: a program rewritten in place without `GX2Invalidate` may be drawn as it was for the
+    rest of that frame (the console's GPU reads programs through its own cache too). Geometry pipelines are found the same way (their
+    key also has half z and the ring sizes, which the translation uses).
+  - *Uploads*: what a batch's draws read (uniform blocks, indices, geometry parameters) is written into a copy of the arena in memory
+    and uploaded with one write per arena when the batch is flushed. The vertex streams' start table lives with the cached streams,
+    and the geometry draws use the stream cache too.
+  - *Uniform blocks*: each upload of the batch keeps the guest bytes it was made from, by (address, vec4 count, bytes read); a draw
+    that finds the same bytes there (compared in place: no copy, no hash, no word swapping) reads that upload. Only new contents are
+    swapped and written. A bank the shader reads by index (`VFETCH` on resource 128 + n) is declared 4096 vec4 (64 KiB) and must be
+    bound whole, with zeros past the block; such blocks go to 64 KiB slots of their own that are kept zero past what was written, so
+    only the block's own bytes are copied and uploaded. Before, every use read, swapped, hashed and compared all 64 KiB, and every
+    new upload zeroed and uploaded 64 KiB: that was most of the 2.2 ms per frame of "uniforms and groups 0, 1" in the village.
+  - *Vertex streams and indices*: the vertex bytes of a draw are hashed where they are, with XXH3, not copied out and hashed a byte
+    at a time. A draw's index list (made relative to its lowest vertex, fans and quads made into triangles) is kept by the draw and an
+    XXH3 hash of its index bytes, which are also compared: the first time it goes into the arena, the second time it gets a buffer of
+    its own that later frames use as it is, so a mesh drawn every frame builds and uploads its list once. Lists not drawn again
+    within two frames are forgotten.
+  - *Textures*: a texture already made is found by the five header words of its key in one look-up. `GX2Invalidate` over its memory
+    no longer throws it away: it is marked, and at its next use the header words and the bytes of its image and smaller levels are
+    hashed and compared with what it was decoded from; it is decoded again only if they differ (a hash pass instead of untiling every
+    texel). A marked texture not drawn for a second is forgotten, as an invalidated one was before.
+  - *Bind groups*: cached by layout and the resources bound (`wgpu` handles compare by identity), pruned of what a second of frames did
+    not use; pipelines keep their bind group layouts; texture, target and depth views are made once with their textures; samplers are
+    keyed by the three `GX2Sampler` words, and the default and compare samplers are made once. A bind group with a per-draw snapshot
+    of the target is not kept.
+  - *System calls*: the report's counters are arrays indexed by import number, `MH3U_TRACE_FROM` is read once, and the timing report
+    allocates nothing per call.
+
+  The reports: `MH3U_GFX_TIMES=1` gives each line as a total, a count, and both per frame (`[gfx times]` per graphics call, `[draw
+  times]` per part of a draw, where "geometry pass" counts only the draws with a geometry shader), and `[draw counts]`: hits, checks
+  and misses of the shader caches, bind groups and uniform uploads, texture decodes (and bytes), textures invalidated and
+  invalidations of textures found unchanged, and the display list calls replayed and left out; "uniform bytes uploaded" and
+  "uniform blocks read by index" (the 64 KiB banks), "index list hits" and "misses", and "vertex bytes hashed". "texture decode (in
+  texture views)" and "texture upload and hash (in texture views)" are timed inside "texture views", not added to it. "index list"
+  covers the whole index path (found or made, and uploaded), and "decode streams" only the vertex streams (the indices used to be
+  made relative to the lowest vertex inside it).
+  `cargo test -p mh3u-gfx --release draw_bench -- --nocapture` times the same parts on wgpu's no-op device with a synthetic frame shaped
+  like the village's (190 draws, half of them with a bank read by index), and the playback of a display list of state calls; the
+  graphics tests run on that device too (no window, nothing drawn, everything validated).
+  `MH3U_TIMES_WINDOW=<seconds>` sets how long each report covers (10 by default); the per-frame numbers are the ones to compare
+  between builds and scenes.
 - **Textures** (`texture.rs`): a `GX2Texture` is read from the guest, untiled texel by texel (`tiling::address`) and uploaded in the
   format the GPU takes (the block-compressed ones as they are stored: the blocks are not byte-swapped; the packed ones are converted).
   The layout is `tiling::surface_info`, the same calculation the game's size call used. The tiling code is a restatement of the part of
@@ -204,7 +263,9 @@ with their text and the cloth background, upright, in the right places (the hunt
   (`gilrs`, on a thread of their own), combined in one shared state. Keys are named by position: WASD is the left stick, the arrow keys the
   right stick, Enter A, Backspace B, X, C the X and Y buttons, I/J/K/L the D-pad, Q/E L and R, 1/3 ZL and ZR, P plus, O minus, Left
   and Right Shift the stick clicks. A pushed stick also
-  sets the stick's direction buttons (the menus read those). Gamepad face buttons go by label (the Xbox A is the GamePad's A); `MH3U_PAD_LAYOUT=position` puts them where the GamePad's are. The mouse is the touch panel (the picture is the TV's, so it only matters once
+  sets the stick's direction buttons (the menus read those). Gamepad face buttons go by label (the Xbox A is the GamePad's A); `MH3U_PAD_LAYOUT=position` puts them where the GamePad's are. The gamepad thread takes the pending events without waiting and sleeps 4 ms when there are none (it used to wait in
+  gilrs's blocking call; a Windows profile seemed to put a whole core there, but the time was the baton's, see Threads above); `MH3U_GAMEPADS=0` turns gamepads off entirely (no thread,
+  no backend), for comparing. The mouse is the touch panel (the picture is the TV's, so it only matters once
   the GamePad's screen is shown). `VPADGetTPCalibratedPoint` scales the raw touch values (0 to 4095) to 1280 x 720 (a guess). The Wii
   Remote and Pro Controller functions (`KPAD*`, `WPAD*`) are not answered: no controller of those kinds exists for the game.
   `MH3U_PRESS` still works and is added to the real input.

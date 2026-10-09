@@ -15,3 +15,8 @@ mh3u-formats.workspace = true
 wgpu = "30"
 winit = "0.30"
 pollster = "0.4"
+xxhash-rust = { version = "0.8.19", features = ["xxh3"] }
+
+[dev-dependencies]
+# the tests time the draw path on a device that does nothing
+wgpu = { version = "30", features = ["noop"] }
