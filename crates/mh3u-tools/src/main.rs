@@ -937,7 +937,9 @@ fn run_game(dump: &Dump, c_dir: &Path, max_imports: u64, save: PathBuf, window: 
     // the overlay reads the game's data from the base game, and keeps its files (the wishlist) with the build
     let (dump_base, mods_dir, save_dir) = (dump.base.clone(), c_dir.join("mods"), save.clone());
     let fullscreen = mh3u_gfx::fullscreen_wanted(fullscreen, std::env::var("MH3U_FULLSCREEN").ok().as_deref());
-    mh3u_gfx::run(fullscreen, move |display| {
+    // the keyboard and mouse bindings are kept with the build, like the wishlist
+    let bindings = c_dir.join("input").join("bindings.json");
+    mh3u_gfx::run(fullscreen, Some(bindings), move |display| {
         let mut options = options;
         let mut gx2 = mh3u_gfx::Gx2::new(display);
         gx2.use_cache_dir(&cache);

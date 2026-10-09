@@ -38,6 +38,79 @@ pub mod button {
 /// The size of the GamePad's screen, which touch points are given in.
 pub const TOUCH_SIZE: (f32, f32) = (1280.0, 720.0);
 
+/// The right stick from the mouse: the mouse's speed (pixels a second, from raw motion) times `sensitivity`, eased towards with a time
+/// constant of `smoothing` and so falling back to 0 the same way when the mouse stops. No dead zone is added (the game has its own).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct MouseStick {
+    /// Stick units per pixel a second: 0.0015 gives full deflection at about 670 pixels a second.
+    pub sensitivity: f32,
+    pub smoothing: std::time::Duration,
+    pub invert_y: bool,
+    moved: (f32, f32),
+    value: (f32, f32),
+    last: Option<std::time::Instant>,
+}
+
+/// Samples closer together than this give the last value (the game reads the sticks more than once a frame).
+const MOUSE_MIN_STEP: std::time::Duration = std::time::Duration::from_millis(2);
+
+impl MouseStick {
+    pub const fn new() -> MouseStick {
+        MouseStick {
+            sensitivity: 0.0015,
+            smoothing: std::time::Duration::from_millis(30),
+            invert_y: false,
+            moved: (0.0, 0.0),
+            value: (0.0, 0.0),
+            last: None,
+        }
+    }
+
+    /// Raw mouse motion, in pixels (y down, as the mouse reports it).
+    pub fn add(&mut self, dx: f32, dy: f32) {
+        self.moved.0 += dx;
+        self.moved.1 += dy;
+    }
+
+    /// The stick (x right, y up, each -1 to 1) at `now`.
+    pub fn sample(&mut self, now: std::time::Instant) -> (f32, f32) {
+        let Some(last) = self.last else {
+            self.last = Some(now);
+            self.moved = (0.0, 0.0);
+            return self.value;
+        };
+        let dt = now.saturating_duration_since(last);
+        if dt < MOUSE_MIN_STEP {
+            return self.value;
+        }
+        self.last = Some(now);
+        let secs = dt.as_secs_f32();
+        let y = if self.invert_y { self.moved.1 } else { -self.moved.1 };
+        let target = (
+            (self.moved.0 / secs * self.sensitivity).clamp(-1.0, 1.0),
+            (y / secs * self.sensitivity).clamp(-1.0, 1.0),
+        );
+        self.moved = (0.0, 0.0);
+        let keep = if self.smoothing.is_zero() {
+            0.0
+        } else {
+            (-secs / self.smoothing.as_secs_f32()).exp()
+        };
+        let ease = |v: f32, t: f32| {
+            let n = t + (v - t) * keep;
+            if t == 0.0 && n.abs() < 0.01 { 0.0 } else { n }
+        };
+        self.value = (ease(self.value.0, target.0), ease(self.value.1, target.1));
+        self.value
+    }
+}
+
+impl Default for MouseStick {
+    fn default() -> MouseStick {
+        MouseStick::new()
+    }
+}
+
 #[derive(Default)]
 pub struct Input {
     keyboard: AtomicU32,
@@ -48,6 +121,8 @@ pub struct Input {
     touched: AtomicBool,
     touch_x: AtomicU32,
     touch_y: AtomicU32,
+    /// The mouse as the right stick (keyboard and mouse controls).
+    pub mouse: std::sync::Mutex<MouseStick>,
 }
 
 pub static INPUT: Input = Input::new();
@@ -106,7 +181,13 @@ impl Input {
             touched: AtomicBool::new(false),
             touch_x: AtomicU32::new(0),
             touch_y: AtomicU32::new(0),
+            mouse: std::sync::Mutex::new(MouseStick::new()),
         }
+    }
+
+    /// All the keyboard's (and mouse buttons') GamePad buttons at once.
+    pub fn set_keyboard_buttons(&self, mask: u32) {
+        self.keyboard.store(mask, Relaxed);
     }
 
     pub fn set_keyboard_button(&self, mask: u32, down: bool) {
@@ -158,9 +239,19 @@ impl Input {
         if OVERLAY_OPEN.load(Relaxed) {
             return out;
         }
+        let (mx, my) = self
+            .mouse
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .sample(std::time::Instant::now());
+        let mouse = [0.0, 0.0, mx, my];
         for (i, o) in out.iter_mut().enumerate() {
             let p = load(&self.pad_sticks[i]);
-            *o = if p.abs() > 0.05 { p } else { load(&self.keyboard_sticks[i]) };
+            *o = if p.abs() > 0.05 {
+                p
+            } else {
+                (load(&self.keyboard_sticks[i]) + mouse[i]).clamp(-1.0, 1.0)
+            };
         }
         out
     }
@@ -181,46 +272,6 @@ impl Input {
         }
         self.touched.load(Relaxed).then(|| (load(&self.touch_x), load(&self.touch_y)))
     }
-}
-
-/// The GamePad button a keyboard key stands for, by the key's position (so it does not depend on the layout).
-pub fn key_button(code: &str) -> Option<u32> {
-    use button::*;
-    Some(match code {
-        "Enter" => A,
-        "Backspace" => B,
-        "KeyX" => X,
-        "KeyC" => Y,
-        "KeyI" => UP,
-        "KeyK" => DOWN,
-        "KeyJ" => LEFT,
-        "KeyL" => RIGHT,
-        "KeyQ" => L,
-        "KeyE" => R,
-        "Digit1" => ZL,
-        "Digit3" => ZR,
-        "KeyP" => PLUS,
-        "KeyO" => MINUS,
-        "Home" => HOME,
-        "ShiftLeft" => STICK_L,
-        "ShiftRight" => STICK_R,
-        _ => return None,
-    })
-}
-
-/// The stick axis a keyboard key pushes: (axis, direction). WASD is the left stick and the arrows the right one.
-pub fn key_axis(code: &str) -> Option<(usize, f32)> {
-    Some(match code {
-        "KeyA" => (0, -1.0),
-        "KeyD" => (0, 1.0),
-        "KeyW" => (1, 1.0),
-        "KeyS" => (1, -1.0),
-        "ArrowLeft" => (2, -1.0),
-        "ArrowRight" => (2, 1.0),
-        "ArrowUp" => (3, 1.0),
-        "ArrowDown" => (3, -1.0),
-        _ => return None,
-    })
 }
 
 /// How long the gamepad thread sleeps when there is no event: short next to a frame (the game reads the pads once a frame), long
@@ -361,6 +412,45 @@ pub fn start_gamepads() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_mouse_stick_follows_the_mouse_s_speed_and_falls_back_to_zero_when_it_stops() {
+        let t0 = std::time::Instant::now();
+        let ms = |n: u64| t0 + std::time::Duration::from_millis(n);
+        let mut m = MouseStick::new();
+        m.smoothing = std::time::Duration::ZERO;
+        assert_eq!(m.sample(ms(0)), (0.0, 0.0));
+        // 4 pixels right and 4 up (y down on the mouse) in 10 ms: 400 px/s, 0.6 of the way at 0.0015
+        m.add(4.0, -4.0);
+        let (x, y) = m.sample(ms(10));
+        assert!((x - 0.6).abs() < 1e-4 && (y - 0.6).abs() < 1e-4, "{x} {y}");
+        // closer than 2 ms: the same value
+        m.add(100.0, 0.0);
+        assert_eq!(m.sample(ms(11)), (x, y));
+        // fast: at most full deflection
+        assert_eq!(m.sample(ms(20)).0, 1.0);
+        // stopped: zero (no smoothing)
+        assert_eq!(m.sample(ms(30)), (0.0, 0.0));
+        // with smoothing it eases there and decays to exactly zero
+        m.smoothing = std::time::Duration::from_millis(30);
+        m.add(4.0, 0.0);
+        let first = m.sample(ms(40)).0;
+        assert!(first > 0.0 && first < 0.6);
+        let mut t = 40;
+        let mut v = first;
+        for _ in 0..40 {
+            t += 10;
+            let n = m.sample(ms(t)).0;
+            assert!(n <= v);
+            v = n;
+        }
+        assert_eq!(v, 0.0);
+        // inverted: mouse up is stick down
+        m.smoothing = std::time::Duration::ZERO;
+        m.invert_y = true;
+        m.add(0.0, -4.0);
+        assert!(m.sample(ms(t + 10)).1 < 0.0);
+    }
 
     #[test]
     fn the_overlay_combination_toggles_and_is_kept_from_the_game_and_an_open_overlay_takes_all_input() {

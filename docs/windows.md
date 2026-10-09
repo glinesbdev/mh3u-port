@@ -60,6 +60,8 @@ take paths as they are, brackets and all.
   crate's exact `fma`, `mh3u_ppc::fused`.)
 - **A sound device** (any; WASAPI's default output is used). Nothing to install for it. `$env:MH3U_AUDIO = 'off'` runs without
   sound, and `$env:MH3U_AUDIO_FX = 'off'` without the reverbs and the low-pass filter (see `audio.md`).
+- **Keyboard and mouse** (see `input.md`): WASD moves, the mouse turns the camera, and the left and right buttons are X and A. The
+  bindings are in `$Out\input\bindings.json`, and `$env:MH3U_KBM = 'off'` turns them off.
 - **The overlay and fullscreen** (see `overlay.md`): F1 or Back + RB opens the blacksmith wishlist (`$env:MH3U_OVERLAY = 'off'` turns it
   off); `win-run.ps1 -Fullscreen` starts in borderless fullscreen, and F11 or Alt+Enter switches while playing.
 - **Your dump** of the game, base game and update (see the first section of `pc-port.md`).

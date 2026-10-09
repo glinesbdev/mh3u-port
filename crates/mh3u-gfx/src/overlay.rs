@@ -20,6 +20,8 @@ use std::time::{Duration, Instant};
 
 /// The egui context the window's thread and the game thread share.
 pub static CONTEXT: LazyLock<egui::Context> = LazyLock::new(egui::Context::default);
+/// The keyboard and mouse bindings, for the overlay's Controls section (empty with them off).
+pub static CONTROLS: Mutex<Vec<(String, String)>> = Mutex::new(Vec::new());
 /// The input the window's thread gathered since the game thread last took it.
 pub static INPUT: Mutex<Option<egui::RawInput>> = Mutex::new(None);
 
@@ -550,6 +552,25 @@ impl Overlay {
                 }
             });
         drop(guard);
+        let controls = CONTROLS.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        egui::Window::new("Controls")
+            .default_pos([560.0, 24.0])
+            .default_open(false)
+            .show(ctx, |ui| {
+                if controls.is_empty() {
+                    ui.label("Keyboard and mouse controls are off (MH3U_KBM=off): the mouse is the GamePad's touch screen.");
+                    return;
+                }
+                ui.label("Keyboard and mouse (edit input/bindings.json in the build folder, then restart):");
+                egui::Grid::new("controls").striped(true).show(ui, |ui| {
+                    for (what, keys) in &controls {
+                        ui.label(what);
+                        ui.label(keys);
+                        ui.end_row();
+                    }
+                });
+                ui.label("F1: this overlay. F11 or Alt+Enter: fullscreen.");
+            });
         if changed && let Err(e) = self.wishlist.save(&self.path) {
             eprintln!("[overlay] could not save the wishlist to {}: {e}", self.path.display());
         }

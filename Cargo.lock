@@ -1308,6 +1308,8 @@ dependencies = [
  "mh3u-mods",
  "mh3u-rt",
  "pollster",
+ "serde",
+ "serde_json",
  "wgpu",
  "winit",
  "xxhash-rust",

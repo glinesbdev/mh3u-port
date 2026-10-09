@@ -2,6 +2,11 @@
 
 What comes after the current work. Order: graphics and performance, then audio (in progress, see `audio.md`), then the items below.
 
+## Keyboard and mouse (PR #12)
+
+WASD and mouse-look onto the virtual GamePad, a bindings file, and a grabbed cursor (`input.md`). Later: a rebinding screen in the
+overlay, and the touch screen's buttons (the item bar, the map) on keys.
+
 ## After audio: mod hooks and an overlay
 
 **First milestone done in PR #11** (merged in fab2efe; confirmed in run 27, see `overlay.md`): the overlay (F1 or Back + RB),
