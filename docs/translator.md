@@ -107,8 +107,9 @@ then `cc`, then `gcc` otherwise; clang, then `gcc` on Windows, where `cl` and `c
 extensions) and `MH3U_CFLAGS` adds flags to every compile and the link. `mh3u_recomp::toolchain` asks the compiler for its target
 (`-dumpmachine`, so a `--target=` in `MH3U_CFLAGS` cross-compiles) and chooses what the target needs: `-fPIC -fvisibility=hidden` and
 `-lm` for a shared object, nothing of those for `game.dll` (which exports through `GAME_API`) and lld for clang's link. On Windows
-`ppc.h` does the fused multiply-adds with the FMA instruction, because some MinGW C libraries' `fma` is off by a bit (Debian's
-mingw-w64 is); `run` checks for FMA there. `MH3U_TEST_CFLAGS` adds flags to the `c_diff.rs` tests and the dispatch test, to check a
+`ppc.h` does the fused multiply-adds with the FMA instruction, because some MinGW C libraries' `fma` is off by a bit
+(mingw-w64's own, in its msvcrt builds); `run` checks for FMA there. The interpreter does them with the `libm` crate's `fma` and
+`fmaf` (`mh3u_ppc::fused`), never `mul_add`, which calls the C library's (`clippy.toml` forbids it). `MH3U_TEST_CFLAGS` adds flags to the `c_diff.rs` tests and the dispatch test, to check a
 build such as `-march=native` against the interpreter, and `MH3U_TEST_RUNNER` starts their programs through another (with
 `MH3U_TEST_CFLAGS=--target=x86_64-w64-windows-gnu` and `MH3U_TEST_RUNNER=wine` they check the Windows build of the C from Linux).
 Building on Windows: `docs/windows.md`.

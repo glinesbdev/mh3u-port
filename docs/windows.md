@@ -8,10 +8,11 @@ installer's, with the Visual Studio build tools) works too; see the end. Microso
 clang's extensions, and `build-game` says so if they are all it finds.
 
 What has been checked, and how: the Windows builds of every crate are compiled and linted from Linux (`cargo clippy` for
-`x86_64-pc-windows-gnullvm`, `-gnu` and `-msvc`), the test suites of the `-gnullvm` and `-gnu` builds pass under Wine, the C tests
-(`c_diff.rs`, the dispatch test) pass as Windows programs built by llvm-mingw's clang 23 and run under Wine, and `build-game` makes a
-`game.dll` with that clang, with and without `--native` and `--lto`. It has not yet been run on a real Windows machine; if something
-below does not work, that is a bug.
+`x86_64-pc-windows-gnullvm`, `-gnu` and `-msvc`), the test suites of the `-gnullvm` build (linked by llvm-mingw's msvcrt and its UCRT
+build) and of the `-gnu` build pass under Wine, the C tests (`c_diff.rs`, the dispatch test) pass as Windows programs built by
+llvm-mingw's clang 23 (both builds) and run under Wine, and `build-game` makes a `game.dll` with that clang, with and without `--native`
+and `--lto`. On a real Windows machine (llvm-mingw 20261006, msvcrt) the first run found the interpreter's fused multiply-adds wrong:
+see below.
 
 All commands are for **Windows PowerShell** (or PowerShell 7). Paths with spaces or square brackets need single quotes: in PowerShell
 `[` and `]` are wildcards for commands such as `Test-Path` and `Get-ChildItem`, so use `-LiteralPath` with those. The port's own tools
@@ -19,14 +20,15 @@ take paths as they are, brackets and all.
 
 ## What you need
 
-- **clang for `x86_64-w64-windows-gnu`** on `PATH`: llvm-mingw (unpack a `llvm-mingw-*-ucrt-x86_64.zip` release and add its `bin`
-  folder to `PATH`) or MSYS2 (`pacman -S mingw-w64-clang-x86_64-clang` in MSYS2, then add `C:\msys64\clang64\bin` to `PATH`). Check:
+- **clang for `x86_64-w64-windows-gnu`** on `PATH`: llvm-mingw (unpack a `llvm-mingw-*-ucrt-x86_64.zip` or
+  `llvm-mingw-*-msvcrt-x86_64.zip` release and add its `bin` folder to `PATH`; either works, UCRT is the newer C runtime and the one
+  to pick when starting fresh) or MSYS2 (`pacman -S mingw-w64-clang-x86_64-clang` in MSYS2, then add `C:\msys64\clang64\bin` to `PATH`). Check:
 
   ```powershell
   clang --version        # "Target: x86_64-w64-windows-gnu"
   ```
 
-- **Rust**, with the `x86_64-pc-windows-gnullvm` host (it links with your clang, and uses the same C runtime, UCRT). From a fresh
+- **Rust**, with the `x86_64-pc-windows-gnullvm` host (it links with your clang, against your clang's C runtime). From a fresh
   machine:
 
   ```powershell
@@ -53,6 +55,9 @@ take paths as they are, brackets and all.
 - **A GPU driver with Vulkan or Direct3D 12** (any current NVIDIA, AMD or Intel driver). `wgpu` picks the backend.
 - **A processor with FMA** (every x86-64 processor since 2013): the Windows build uses the FMA instruction for the PowerPC's fused
   multiply-adds, because some MinGW C libraries' `fma` is not exact, and `run` stops with a message on a processor without it.
+  (mingw-w64's own `fma`, which the msvcrt builds link because msvcrt.dll has none, is off by a bit in some cases and gives NaN for a
+  finite product plus an infinity. Nothing of the port calls it: the C uses the instruction and the Rust interpreter uses the `libm`
+  crate's exact `fma`, `mh3u_ppc::fused`.)
 - **Your dump** of the game, base game and update (see the first section of `pc-port.md`).
 
 ## Build, translate, run
