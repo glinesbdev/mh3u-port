@@ -12,6 +12,7 @@ use mh3u_rt::Guest;
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
+use std::time::Instant;
 
 /// One element of a fetch shader's description (`GX2AttribStream`).
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -307,6 +308,38 @@ pub struct DrawCaches {
     pub stream_bytes: u64,
     /// Shaders translated and textures decoded so far (for the area-change lines, `perf.rs`).
     pub work: crate::perf::Work,
+    /// Translations kept on disk (`translations.rs`; not open in the tests and when `MH3U_GFX_SHADER_CACHE=off`).
+    pub translations: crate::translations::Translations,
+    /// How long shaders may be translated in one frame before the draws that need more wait for the next (`MH3U_GFX_SHADER_BUDGET_MS`;
+    /// None: no limit), and how long they have been this frame.
+    pub budget: Option<std::time::Duration>,
+    pub spent: std::time::Duration,
+    /// Set when a shader was left for a later frame (the draw that asked is not drawn, and says why).
+    pub deferred: bool,
+}
+
+/// The default of `MH3U_GFX_SHADER_BUDGET_MS`.
+const SHADER_BUDGET_MS: u64 = 5;
+
+/// The translation budget from `MH3U_GFX_SHADER_BUDGET_MS` (milliseconds a frame; 0 or `off`: no limit).
+pub(crate) fn shader_budget(setting: Option<&str>) -> Option<std::time::Duration> {
+    let ms = match setting.map(|v| v.trim().to_ascii_lowercase()) {
+        None => SHADER_BUDGET_MS,
+        Some(v) if v == "off" => 0,
+        Some(v) => v.parse::<u64>().unwrap_or(SHADER_BUDGET_MS),
+    };
+    (ms > 0).then(|| std::time::Duration::from_millis(ms))
+}
+
+/// The key a translation is kept on disk under: a hash of what it is (vertex or pixel), its program bytes, and everything else it
+/// depends on (written out with `Debug`, which the build's source hash in the folder name keeps the same).
+pub(crate) fn translation_key(kind: &str, code: &[u8], inputs: &impl std::fmt::Debug) -> u64 {
+    let mut h = xxhash_rust::xxh3::Xxh3::new();
+    h.update(kind.as_bytes());
+    h.update(&(code.len() as u64).to_le_bytes());
+    h.update(code);
+    h.update(format!("{inputs:?}").as_bytes());
+    h.digest()
 }
 
 /// The uploads of one uniform block in the current batch (`batch`, see `Batch::generation`), newest last: its guest bytes and where they
@@ -808,11 +841,60 @@ fn tex_kind(dim: u32, format: u32) -> TexKind {
 
 impl Gx2 {
     /// A shader module from WGSL, with errors reported (once) instead of stopping the program.
-    fn compile(&mut self, label: &str, wgsl: &str) -> wgpu::ShaderModule {
-        self.d.device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some(label),
-            source: wgpu::ShaderSource::Wgsl(wgsl.into()),
+    /// A translated shader made into a module: the one made already for the same WGSL (by a worker, for a pipeline read from the
+    /// disk, or for another draw) or a new one.
+    fn compile(&mut self, label: &str, wgsl: Arc<str>, id: u64, interface: Interface) -> Arc<Compiled> {
+        let started = Instant::now();
+        let (module, reused) = self.pipes.module(id, &wgsl, label);
+        let w = &mut self.caches.work;
+        if reused {
+            w.modules_reused += 1;
+        } else {
+            w.modules_made += 1;
+            w.module_ms += started.elapsed().as_secs_f64() * 1000.0;
+        }
+        Arc::new(Compiled {
+            module,
+            interface,
+            wgsl,
+            id,
         })
+    }
+
+    /// Whether this frame's translation time is used up (the first translation of a frame always goes ahead).
+    fn over_budget(&mut self) -> bool {
+        let over = self.caches.budget.is_some_and(|b| self.caches.spent >= b);
+        if over {
+            self.caches.deferred = true;
+            self.caches.work.deferred += 1;
+        }
+        over
+    }
+
+    /// A translation found on disk, made into a module.
+    fn found_on_disk(&mut self, label: &str, key: Option<u64>) -> Option<Arc<Compiled>> {
+        let found = self.caches.translations.get(key?)?;
+        self.caches.work.from_disk += 1;
+        Some(self.compile(label, found.wgsl, found.id, found.interface))
+    }
+
+    /// A translation made now: timed, written down on disk, and made into a module.
+    fn translated(
+        &mut self,
+        label: &str,
+        key: Option<u64>,
+        result: Result<mh3u_latte::translate::Translated, String>,
+        started: Instant,
+    ) -> Result<Arc<Compiled>, String> {
+        let spent = started.elapsed();
+        self.caches.spent += spent;
+        self.caches.work.translate_ms += spent.as_secs_f64() * 1000.0;
+        let t = result?;
+        let id = xxhash_rust::xxh3::xxh3_64(t.wgsl.as_bytes());
+        if let Some(key) = key {
+            self.caches.translations.record(key, id, &t.wgsl, &t.interface);
+        }
+        Ok(self.compile(label, t.wgsl.into(), id, t.interface))
     }
 
     /// Keeps a shader's listing and WGSL (or why it was not translated) for the frame that is written out.
@@ -850,7 +932,8 @@ impl Gx2 {
         }
         // the shader's semantic table (which register each attribute goes to) is checked with its program
         let ranges = [(program, size), (vs + 0x40, 0x84), (0, 0)];
-        let compiled = self.vertex_shader_slow(g, vs, program, size, fetch, half_z);
+        // left for a later frame: nothing is kept, the next draw asks again
+        let compiled = self.vertex_shader_slow(g, vs, program, size, fetch, half_z)?;
         let hash = hash_ranges(g, &ranges);
         self.caches
             .vertex_front
@@ -858,7 +941,8 @@ impl Gx2 {
         compiled
     }
 
-    /// The vertex shader from its program bytes: translated once for each program, fetch shader and depth range.
+    /// The vertex shader from its program bytes: translated once for each program, fetch shader and depth range (or found on disk).
+    /// None when this frame's translation time is used up (`over_budget`).
     fn vertex_shader_slow(
         &mut self,
         g: &Guest,
@@ -867,7 +951,7 @@ impl Gx2 {
         size: u32,
         fetch: &[AttribStream],
         half_z: bool,
-    ) -> Option<Arc<Compiled>> {
+    ) -> Option<Option<Arc<Compiled>>> {
         let mut code = vec![0u8; size as usize];
         g.read(program, &mut code);
         let key = (
@@ -876,13 +960,23 @@ impl Gx2 {
             hash_fast(&code, 0) ^ hash_of(&(fetch, half_z, vertex_semantics(g, vs))),
         );
         if let Some(c) = self.caches.vertex.get(&key) {
-            return c.clone();
+            return Some(c.clone());
+        }
+        let constants = loop_constants(g, g.u32(vs + 0xf4), g.u32(vs + 0xf8));
+        let disk_key = (self.caches.translations.is_open() && !self.diag.keeps_shaders())
+            .then(|| translation_key("vs1", &code, &(fetch, half_z, vertex_semantics(g, vs), &constants)));
+        if let Some(c) = self.found_on_disk("vertex shader", disk_key) {
+            self.caches.vertex.insert(key, Some(c.clone()));
+            return Some(Some(c));
+        }
+        if self.over_budget() {
+            return None;
         }
         self.caches.work.translated += 1;
+        let started = Instant::now();
         let result = (|| {
             let decoded = decode(&code).map_err(|e| e.to_string())?;
             let attributes = vertex_attributes(&vertex_semantics(g, vs), fetch);
-            let constants = loop_constants(g, g.u32(vs + 0xf4), g.u32(vs + 0xf8));
             let loop_const = move |n: u32| constants.get(n as usize).copied().flatten();
             let mut ctx = Context::new(&|_| TexKind::D2);
             ctx.loop_const = &loop_const;
@@ -901,11 +995,8 @@ impl Gx2 {
             &code,
             result.as_ref().map(|t| t.wgsl.as_str()).map_err(String::as_str),
         );
-        let compiled = match result {
-            Ok(t) => {
-                let module = self.compile("vertex shader", &t.wgsl);
-                Some(Arc::new(Compiled::new(module, t.interface, t.wgsl)))
-            }
+        let compiled = match self.translated("vertex shader", disk_key, result, started) {
+            Ok(c) => Some(c),
             Err(e) => {
                 self.diag.untranslated(format!("vertex shader {vs:#x}"), &e);
                 self.report(format!("vertex shader {vs:#x} not translated: {e}"));
@@ -913,7 +1004,7 @@ impl Gx2 {
             }
         };
         self.caches.vertex.insert(key, compiled.clone());
-        compiled
+        Some(compiled)
     }
 
     fn pixel_shader(&mut self, g: &Guest, ps: u32, semantics_at: u32, variant: &PixelVariant) -> Option<Arc<Compiled>> {
@@ -938,14 +1029,15 @@ impl Gx2 {
             return c;
         }
         let ranges = [(program, size), (0, 0), (0, 0)];
-        let compiled = self.pixel_shader_slow(g, ps, semantics_at, variant);
+        let compiled = self.pixel_shader_slow(g, ps, semantics_at, variant)?;
         let hash = hash_ranges(g, &ranges);
         self.caches.pixel_front.insert(front, ranges, hash, swaps, compiled.clone());
         compiled
     }
 
-    /// The pixel shader from its program bytes and inputs: translated once for each.
-    fn pixel_shader_slow(&mut self, g: &Guest, ps: u32, semantics_at: u32, variant: &PixelVariant) -> Option<Arc<Compiled>> {
+    /// The pixel shader from its program bytes and inputs: translated once for each (or found on disk). None when this frame's
+    /// translation time is used up.
+    fn pixel_shader_slow(&mut self, g: &Guest, ps: u32, semantics_at: u32, variant: &PixelVariant) -> Option<Option<Arc<Compiled>>> {
         // the inputs: pixel input i takes the vertex shader's output with the same semantic
         let count = g.u32(ps + 0x10).min(32);
         let vs_semantics: Vec<u32> = (0..40u32)
@@ -971,11 +1063,25 @@ impl Gx2 {
             hash_fast(&code, 0) ^ hash_of(&(inputs.count, &inputs.flat, &inputs.locations, variant)),
         );
         if let Some(c) = self.caches.pixel.get(&key) {
-            return c.clone();
+            return Some(c.clone());
+        }
+        let constants = loop_constants(g, g.u32(ps + 0xc8), g.u32(ps + 0xcc));
+        let solid = std::env::var_os("MH3U_GFX_SOLID").is_some();
+        let disk_key = (self.caches.translations.is_open()
+            && !self.diag.keeps_shaders()
+            && !solid
+            && debug_ps(ps) == mh3u_latte::translate::DebugPs::Off)
+            .then(|| translation_key("ps1", &code, &(&inputs.count, &inputs.flat, &inputs.locations, variant, &constants)));
+        if let Some(c) = self.found_on_disk("pixel shader", disk_key) {
+            self.caches.pixel.insert(key, Some(c.clone()));
+            return Some(Some(c));
+        }
+        if self.over_budget() {
+            return None;
         }
         self.caches.work.translated += 1;
+        let started = Instant::now();
         let PixelVariant { kinds, selects, alpha } = *variant;
-        let constants = loop_constants(g, g.u32(ps + 0xc8), g.u32(ps + 0xcc));
         let result = (|| {
             let decoded = decode(&code).map_err(|e| e.to_string())?;
             let kind = move |r: u32| kinds.get(r as usize).copied().unwrap_or(TexKind::D2);
@@ -993,17 +1099,17 @@ impl Gx2 {
             &code,
             result.as_ref().map(|t| t.wgsl.as_str()).map_err(String::as_str),
         );
-        let compiled = match result {
-            Ok(mut t) => {
-                if std::env::var_os("MH3U_GFX_SOLID").is_some() {
-                    // a debugging aid: every pixel drawn is red, to see where the geometry goes
-                    t.wgsl = t
-                        .wgsl
-                        .replace("    return o;\n}", "    o.c0 = vec4<f32>(1.0, 0.0, 0.0, 1.0);\n    return o;\n}");
-                }
-                let module = self.compile("pixel shader", &t.wgsl);
-                Some(Arc::new(Compiled::new(module, t.interface, t.wgsl)))
+        let result = result.map(|mut t| {
+            if solid {
+                // a debugging aid: every pixel drawn is red, to see where the geometry goes
+                t.wgsl = t
+                    .wgsl
+                    .replace("    return o;\n}", "    o.c0 = vec4<f32>(1.0, 0.0, 0.0, 1.0);\n    return o;\n}");
             }
+            t
+        });
+        let compiled = match self.translated("pixel shader", disk_key, result, started) {
+            Ok(c) => Some(c),
             Err(e) => {
                 self.diag.untranslated(format!("pixel shader {ps:#x}"), &e);
                 self.report(format!("pixel shader {ps:#x} not translated: {e}"));
@@ -1011,7 +1117,7 @@ impl Gx2 {
             }
         };
         self.caches.pixel.insert(key, compiled.clone());
-        compiled
+        Some(compiled)
     }
 
     /// Makes the texture at `t` (a `GX2Texture`) into a GPU texture, once until the game says it changed (and it did: an invalidated
@@ -1047,7 +1153,10 @@ impl Gx2 {
             None => false,
         };
         if !found {
-            self.decode_texture(g, t, key)?;
+            let started = Instant::now();
+            let made = self.decode_texture(g, t, key);
+            self.caches.work.decode_ms += started.elapsed().as_secs_f64() * 1000.0;
+            made?;
         }
         let cached = self.caches.textures.get_mut(&key)?;
         let slot = &mut cached.views[usize::from(kind == TexKind::Cube)];
@@ -1192,7 +1301,7 @@ impl Gx2 {
         format!(
             "shader fronts: vertex {}, pixel {}, geometry {}; translations: vertex {}, pixel {}, geometry {}; pipelines: {} by shader \
              address, {} made, {} being made, {} left from the disk; fetch shaders {} distinct; bind groups {}; textures {}; vertex \
-             streams {} ({:.1} MB); index lists {}; uniform blocks {}",
+             streams {} ({:.1} MB); index lists {}; uniform blocks {}; translations on disk {} ({} found, {} not found so far)",
             c.vertex_front.len(),
             c.pixel_front.len(),
             c.geometry_front.len(),
@@ -1209,7 +1318,10 @@ impl Gx2 {
             c.streams.len(),
             c.stream_bytes as f64 / 1e6,
             c.indices.len(),
-            c.uniforms.len()
+            c.uniforms.len(),
+            c.translations.len(),
+            c.translations.hits,
+            c.translations.misses
         )
     }
 
@@ -1884,6 +1996,7 @@ impl Gx2 {
     /// Once a second of frames: forgets the bind groups not used in that time (they keep their buffers and views alive), and the
     /// invalidated textures not drawn in that time.
     pub(crate) fn prune(&mut self) {
+        self.caches.spent = std::time::Duration::ZERO;
         let swaps = self.swaps;
         if swaps.is_multiple_of(60) {
             self.caches.bind_groups.retain(|_, e| e.1 + 60 >= swaps);
@@ -1985,6 +2098,10 @@ impl Gx2 {
             Some(x) => x.copy.clone(),
             None => {
                 let Some(vs) = self.vertex_shader(g, st.vertex_shader, &fetch, st.half_z) else {
+                    if std::mem::take(&mut self.caches.deferred) {
+                        *self.caches.skipped.entry("shader translated in a later frame").or_default() += 1;
+                        return;
+                    }
                     self.diag.skipped_for(format!("vertex shader {:#x}", st.vertex_shader));
                     *self.caches.skipped.entry("vertex shader not translated").or_default() += 1;
                     return;
@@ -1994,6 +2111,10 @@ impl Gx2 {
         };
         let semantics_at = geo.as_ref().map_or(st.vertex_shader + 0x10, |x| x.semantics_at);
         let Some(ps) = self.pixel_shader(g, st.pixel_shader, semantics_at, &variant) else {
+            if std::mem::take(&mut self.caches.deferred) {
+                *self.caches.skipped.entry("shader translated in a later frame").or_default() += 1;
+                return;
+            }
             self.diag.skipped_for(format!("pixel shader {:#x}", st.pixel_shader));
             *self.caches.skipped.entry("pixel shader not translated").or_default() += 1;
             return;
@@ -3175,6 +3296,91 @@ mod tests {
             uniform_as_before(&g, &small, 16)
         );
         assert_eq!(gx2.batch.slots_used, 0);
+    }
+
+    /// A `GX2PixelShader` at `ps` whose program (at `program`) exports R0 as colour 0 and ends.
+    fn tiny_pixel_shader(g: &Guest, ps: u32, program: u32) {
+        let code: Vec<u8> = [0u32, (0x28 << 23) | (1 << 21) | (3 << 9) | (2 << 6) | (1 << 3)]
+            .iter()
+            .flat_map(|w| w.to_le_bytes())
+            .collect();
+        g.write(program, &code);
+        g.put_u32(ps + 0x10, 0);
+        g.put_u32(ps + 0xa4, code.len() as u32);
+        g.put_u32(ps + 0xa8, program);
+        g.put_u32(ps + 0xc8, 0);
+    }
+
+    fn plain_variant() -> PixelVariant {
+        PixelVariant {
+            kinds: [TexKind::D2; 18],
+            selects: [IDENTITY_SELECT; 18],
+            alpha: (7, 0),
+        }
+    }
+
+    #[test]
+    fn a_shader_translated_in_one_run_is_found_on_disk_in_the_next() {
+        let root = std::env::temp_dir().join(format!("mh3u-shader-cache-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let mut m = vec![0u8; 0x1_0000];
+        let g = Guest::new(m.as_mut_ptr());
+        tiny_pixel_shader(&g, 0x1000, 0x2000);
+        let first = {
+            let mut gx2 = Gx2::new(crate::Display::noop());
+            gx2.caches.translations.open(&root).unwrap();
+            let c = gx2.pixel_shader(&g, 0x1000, 0x3000, &plain_variant()).expect("translated");
+            assert_eq!((gx2.caches.work.translated, gx2.caches.work.from_disk), (1, 0));
+            c
+        };
+        // the next run: found on disk, not translated; its module is the one the workers made for a pipeline read from the disk
+        let mut gx2 = Gx2::new(crate::Display::noop());
+        assert_eq!(gx2.caches.translations.open(&root).unwrap().1, 1);
+        let _ = gx2.pipes.module(first.id, &first.wgsl, "made by a worker");
+        let c = gx2.pixel_shader(&g, 0x1000, 0x3000, &plain_variant()).expect("found");
+        let w = gx2.caches.work;
+        assert_eq!((w.translated, w.from_disk, w.modules_reused, w.modules_made), (0, 1, 1, 0));
+        assert_eq!((c.id, &*c.wgsl), (first.id, &*first.wgsl));
+        assert_eq!(c.interface, first.interface);
+        // other program bytes are another key
+        g.write(0x2000, &[1, 0, 0, 0]);
+        gx2.pixel_shader(&g, 0x1000, 0x3000, &plain_variant());
+        assert_eq!(gx2.caches.work.from_disk, 1);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn shaders_past_the_frames_budget_wait_for_the_next_frame() {
+        let mut gx2 = Gx2::new(crate::Display::noop());
+        gx2.caches.budget = Some(std::time::Duration::from_nanos(1));
+        let mut m = vec![0u8; 0x1_0000];
+        let g = Guest::new(m.as_mut_ptr());
+        tiny_pixel_shader(&g, 0x1000, 0x2000);
+        tiny_pixel_shader(&g, 0x1100, 0x2000);
+        // the frame's first translation always goes ahead
+        assert!(gx2.pixel_shader(&g, 0x1000, 0x3000, &plain_variant()).is_some());
+        // the next is left for a later frame, and nothing about it is kept
+        assert!(gx2.pixel_shader(&g, 0x1100, 0x3000, &plain_variant()).is_none());
+        assert!(std::mem::take(&mut gx2.caches.deferred));
+        assert_eq!((gx2.caches.work.translated, gx2.caches.work.deferred), (1, 1));
+        // one already made is still found
+        assert!(gx2.pixel_shader(&g, 0x1000, 0x3000, &plain_variant()).is_some());
+        // next frame
+        gx2.swaps += 1;
+        gx2.prune();
+        assert!(gx2.pixel_shader(&g, 0x1100, 0x3000, &plain_variant()).is_some());
+        assert_eq!(gx2.caches.work.translated, 2);
+        assert!(!gx2.caches.deferred);
+    }
+
+    #[test]
+    fn the_budget_setting() {
+        let ms = std::time::Duration::from_millis;
+        assert_eq!(shader_budget(None), Some(ms(SHADER_BUDGET_MS)));
+        assert_eq!(shader_budget(Some("12")), Some(ms(12)));
+        assert_eq!(shader_budget(Some("0")), None);
+        assert_eq!(shader_budget(Some("off")), None);
+        assert_eq!(shader_budget(Some("lots")), Some(ms(SHADER_BUDGET_MS)));
     }
 
     #[test]

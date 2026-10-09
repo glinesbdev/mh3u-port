@@ -280,7 +280,15 @@ impl Gx2 {
             real_draws: 0,
             log: std::env::var_os("MH3U_GFX_LOG").is_some(),
             next_vsync: Instant::now(),
-            caches: Default::default(),
+            caches: crate::draw::DrawCaches {
+                // the tests translate as much as they ask for in a frame
+                budget: if cfg!(test) {
+                    None
+                } else {
+                    crate::draw::shader_budget(std::env::var("MH3U_GFX_SHADER_BUDGET_MS").ok().as_deref())
+                },
+                ..Default::default()
+            },
             last_tv_source: 0,
             save_every: std::env::var("MH3U_GFX_SAVE_EVERY")
                 .ok()
@@ -720,13 +728,27 @@ impl Gx2 {
     /// Keeps the pipelines made under `root` (`<out>/cache` for a run; MH3U_GFX_CACHE_DIR puts it elsewhere, MH3U_GFX_PIPELINE_CACHE=off
     /// turns it off), and starts making again, on the workers, those a run before made (see `pipelines.rs`).
     pub fn use_cache_dir(&mut self, root: &std::path::Path) {
-        let off = std::env::var("MH3U_GFX_PIPELINE_CACHE")
-            .is_ok_and(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "0" | "off" | "no" | "false"));
-        if off {
+        let off =
+            |name: &str| std::env::var(name).is_ok_and(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "0" | "off" | "no" | "false"));
+        let root = std::env::var_os("MH3U_GFX_CACHE_DIR").map_or_else(|| root.to_path_buf(), std::path::PathBuf::from);
+        if off("MH3U_GFX_SHADER_CACHE") {
+            eprintln!("[gfx] shader cache off (MH3U_GFX_SHADER_CACHE)");
+        } else {
+            match self.caches.translations.open(&root) {
+                Ok((dir, n)) => eprintln!(
+                    "[gfx] shader cache {}: {n} translations kept; at most {} of translating a frame (MH3U_GFX_SHADER_BUDGET_MS)",
+                    dir.display(),
+                    self.caches
+                        .budget
+                        .map_or("no limit".to_string(), |b| format!("{} ms", b.as_millis())),
+                ),
+                Err(e) => eprintln!("[gfx] shader cache under {} not opened: {e}", root.display()),
+            }
+        }
+        if off("MH3U_GFX_PIPELINE_CACHE") {
             eprintln!("[gfx] pipeline cache off (MH3U_GFX_PIPELINE_CACHE)");
             return;
         }
-        let root = std::env::var_os("MH3U_GFX_CACHE_DIR").map_or_else(|| root.to_path_buf(), std::path::PathBuf::from);
         let info = self.d.adapter.get_info();
         match self.pipes.open_disk(&root, &info) {
             Ok((dir, n)) => eprintln!(
@@ -1221,9 +1243,14 @@ impl Gx2Backend for Gx2 {
     }
 
     fn call_id(&mut self, id: Option<u32>, name: &str, c: &mut Ctx, g: &Guest) {
+        let started = self.perf.on.then(Instant::now);
         match id.and_then(|id| Call::ALL.get(id as usize)) {
             Some(&call) => self.run(call, c, g),
             None => self.call(name, c, g),
+        }
+        // the frame's time in graphics calls, for the area-change lines (the swap's own call counts in the next frame)
+        if let Some(t) = started {
+            self.perf.frame_gfx += t.elapsed();
         }
     }
 

@@ -226,11 +226,31 @@ with their text and the cloth background, upright, in the right places (the hunt
   - *Render pipelines* (`pipelines.rs`): found by the shaders' translations and the state the pipeline holds; a new one is made on a
     worker thread and its draw is not drawn until it is there (usually a frame or two; `MH3U_GFX_ASYNC_PIPELINES=off` makes the draw
     wait instead, as before). Each one made is written down under `<out>/cache/pipelines/<key>/` (its shaders' WGSL in `shaders/`,
-    its state as a line of `pipelines.txt`; the key is a hash of the build and the adapter and driver, written in `about.txt`), and all
+    its state as a line of `pipelines.txt`; the key is a hash of the graphics sources (`SHADER_SOURCE`, below) and the adapter and
+    driver, written in `about.txt`), and all
     of them are made again on the workers at the next start, found then by a hash of the WGSL whatever addresses the shaders have.
     `MH3U_GFX_PIPELINE_CACHE=off` turns the disk cache off, `MH3U_GFX_CACHE_DIR` puts it elsewhere; deleting the folder is always
     safe. `wgpu::PipelineCache` (Vulkan's own cache of compiled pipelines) is not used: making one is an `unsafe` call, and only
     `mh3u-rt` may have `unsafe` code.
+  - *Translated shaders on disk* (`translations.rs`): each vertex and pixel shader translated is written down under
+    `<out>/cache/translations/<SHADER_SOURCE>/`. Its WGSL goes in `shaders/<hash of the WGSL>.wgsl`, and a line in
+    `translations.txt` has its key and its interface, with a check hash at the end.
+    - The key is a hash of the program bytes and everything else the translation depends on: the fetch shader, half z,
+      the semantic table and the loop constants for a vertex shader; the inputs, the texture kinds and selectors, the alpha
+      test and the loop constants for a pixel shader.
+    - `SHADER_SOURCE` is a hash of the sources of `mh3u-latte` and `mh3u-gfx`, made by `build.rs`. The cache stays valid
+      across commits that do not touch them, and a build whose translator differs at all never reads it.
+    - A shader whose key is there is not translated. A line that does not check out, or whose WGSL is missing or changed,
+      is not used.
+    - Shader modules are kept by the hash of their WGSL and shared with the pipeline workers. The modules the workers make
+      at startup for the pipelines read from disk serve the draws too, so a translation found on disk usually costs no
+      module either.
+    - `MH3U_GFX_SHADER_CACHE=off` leaves this cache out. It is also left out while shader texts are kept for a frame dump,
+      with `MH3U_GFX_SOLID`, and with a pixel shader debug view on.
+    - Translating is limited to `MH3U_GFX_SHADER_BUDGET_MS` a frame (5 by default; `0` or `off`: no limit). The first
+      translation of a frame always goes ahead. A draw that needs another is not drawn that frame (counted as "shader
+      translated in a later frame"), and nothing is kept for it, so the next frame asks again. Geometry pipelines are not on
+      disk and not limited.
   - *Uploads*: what a batch's draws read (uniform blocks, indices, geometry parameters) is written into a copy of the arena in memory
     and uploaded with one write per arena when the batch is flushed. The vertex streams' start table lives with the cached streams,
     and the geometry draws use the stream cache too.
@@ -263,8 +283,12 @@ with their text and the cloth background, upright, in the right places (the hunt
   50 ms), `[gfx caches]` (the size of every cache: one that only grows shows here), `[gfx pipelines]` (made with the draw waiting,
   handed to workers, made by them and their time, draws not drawn while theirs was made, found made) and `[gfx invalidates]` (how many
   `GX2Invalidate`, how many reached the shader caches and how many index entries each looked at, and their time a frame); and a frame
-  that makes eight or more new pipelines or shader translations prints `[gfx] area change at frame N: ...`, then, 180 frames later,
-  how those frames went (the slowest, the mean, how many took over 50 ms, the pipelines made).
+  that makes eight or more new pipelines, shader translations, shaders found on disk or texture decodes prints `[gfx] area change at
+  frame N: <ms> (<ms> in graphics calls, <ms> in the game or the swap); <n> new pipelines; shaders: <n> translated (<ms>), <n> found
+  on disk, <n> modules made (<ms>) and <n> found made, <n> draws left for a later frame; textures: <n> decoded (<ms>)`. 180 frames
+  later it prints how those frames went: the slowest (with its time in graphics calls), the mean, how many took over 50 ms, the
+  pipelines, and the same shader and texture counts. `[gfx caches]` also shows the translations on disk and how many were found or
+  not.
 
   The reports: `MH3U_GFX_TIMES=1` gives each line as a total, a count, and both per frame (`[gfx times]` per graphics call, `[draw
   times]` per part of a draw, where "geometry pass" counts only the draws with a geometry shader), and `[draw counts]`: hits, checks

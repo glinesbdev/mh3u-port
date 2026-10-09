@@ -379,6 +379,25 @@ pub(crate) struct Pipelines {
     pub counts: PipelineCounts,
     /// Pipelines read from the disk at the start and not made yet.
     pub prebuilding: usize,
+    /// Shader modules by the hash of their WGSL, shared with the workers: the ones the workers make for the pipelines read from the
+    /// disk serve the draws too (a translation found on disk then costs no module).
+    modules: Modules,
+}
+
+type Modules = Arc<Mutex<HashMap<u64, wgpu::ShaderModule>>>;
+
+/// The module for WGSL with hash `id`: the one made before, or made now (outside the lock, so two threads making modules do not wait
+/// for each other). The second value says whether it was there.
+fn module_for(device: &wgpu::Device, modules: &Modules, id: u64, wgsl: &str, label: &str) -> (wgpu::ShaderModule, bool) {
+    if let Some(m) = modules.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get(&id) {
+        return (m.clone(), true);
+    }
+    let m = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some(label),
+        source: wgpu::ShaderSource::Wgsl(wgsl.into()),
+    });
+    let mut all = modules.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    (all.entry(id).or_insert(m).clone(), false)
 }
 
 impl Pipelines {
@@ -397,7 +416,13 @@ impl Pipelines {
             known: HashSet::new(),
             counts: PipelineCounts::default(),
             prebuilding: 0,
+            modules: Arc::default(),
         }
+    }
+
+    /// The shader module for WGSL with hash `id` (see `modules`), and whether it was made already.
+    pub(crate) fn module(&self, id: u64, wgsl: &str, label: &str) -> (wgpu::ShaderModule, bool) {
+        module_for(&self.device, &self.modules, id, wgsl, label)
     }
 
     /// The workers, started at the first job: a few threads (half the cores, at most three: the game's own threads and the render
@@ -406,7 +431,7 @@ impl Pipelines {
         if self.jobs.is_none() {
             let (tx, rx) = channel::<Job>();
             let rx = Arc::new(Mutex::new(rx));
-            let modules: Arc<Mutex<HashMap<u64, wgpu::ShaderModule>>> = Arc::default();
+            let modules = self.modules.clone();
             let n = std::thread::available_parallelism().map_or(2, |n| n.get() / 2).clamp(1, 3);
             for k in 0..n {
                 let (rx, done, device, modules, disk) = (
@@ -481,8 +506,8 @@ impl Pipelines {
     /// Returns the folder and how many pipelines were queued.
     pub(crate) fn open_disk(&mut self, root: &Path, adapter: &wgpu::AdapterInfo) -> std::io::Result<(PathBuf, usize)> {
         let about = format!(
-            "build {}\nadapter {}\nvendor {:#x} device {:#x}\ndriver {} {}\nbackend {:?}\n",
-            crate::BUILD,
+            "graphics sources {}\nadapter {}\nvendor {:#x} device {:#x}\ndriver {} {}\nbackend {:?}\n",
+            crate::SHADER_SOURCE,
             adapter.name,
             adapter.vendor,
             adapter.device,
@@ -564,27 +589,11 @@ impl Pipelines {
     }
 }
 
-fn work(
-    rx: &Mutex<Receiver<Job>>,
-    done: &Sender<Done>,
-    device: &wgpu::Device,
-    modules: &Mutex<HashMap<u64, wgpu::ShaderModule>>,
-    disk: &OnceLock<Disk>,
-) {
+fn work(rx: &Mutex<Receiver<Job>>, done: &Sender<Done>, device: &wgpu::Device, modules: &Modules, disk: &OnceLock<Disk>) {
     let module = |s: Source| -> wgpu::ShaderModule {
         match s {
             Source::Module(m) => m,
-            Source::Wgsl(id, wgsl) => {
-                let mut m = modules.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-                m.entry(id)
-                    .or_insert_with(|| {
-                        device.create_shader_module(wgpu::ShaderModuleDescriptor {
-                            label: Some("shader from the pipeline cache"),
-                            source: wgpu::ShaderSource::Wgsl(wgsl.as_ref().into()),
-                        })
-                    })
-                    .clone()
-            }
+            Source::Wgsl(id, wgsl) => module_for(device, modules, id, &wgsl, "shader from the pipeline cache").0,
         }
     };
     loop {
@@ -724,7 +733,11 @@ mod tests {
             assert!(p.get(&vs, &ps, &other).is_some());
             assert_eq!(std::fs::read_to_string(dir.join("pipelines.txt")).unwrap().lines().count(), 2);
             assert_eq!(std::fs::read_dir(dir.join("shaders")).unwrap().count(), 2);
-            assert!(std::fs::read_to_string(dir.join("about.txt")).unwrap().contains(crate::BUILD));
+            assert!(
+                std::fs::read_to_string(dir.join("about.txt"))
+                    .unwrap()
+                    .contains(crate::SHADER_SOURCE)
+            );
         }
         // the next run: both are made on the workers at the start, and the draw finds them without making one
         let mut p = Pipelines::new(d.device.clone());
