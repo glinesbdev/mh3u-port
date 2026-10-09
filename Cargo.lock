@@ -1024,6 +1024,7 @@ dependencies = [
  "libloading",
  "memmap2",
  "mh3u-formats",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

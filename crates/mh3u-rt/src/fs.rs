@@ -369,7 +369,11 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("mh3u-fs-test-{}", std::process::id()));
         std::fs::create_dir_all(dir.join("Sub")).unwrap();
         std::fs::write(dir.join("Sub/File.Arc"), b"x").unwrap();
-        assert_eq!(resolve(&dir, "/sub/file.arc"), Some(dir.join("Sub/File.Arc")));
+        let found = resolve(&dir, "/sub/file.arc").expect("found");
+        assert_eq!(std::fs::read(&found).unwrap(), b"x");
+        // (Windows matches without regard to case itself, and the path may keep the guest's spelling)
+        #[cfg(unix)]
+        assert_eq!(found, dir.join("Sub/File.Arc"));
         assert_eq!(resolve(&dir, "/sub/missing"), None);
         let _ = std::fs::remove_dir_all(&dir);
     }
