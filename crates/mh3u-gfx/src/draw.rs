@@ -2,11 +2,13 @@
 //! the recorded state, cached by what makes it different.
 
 use crate::gx2::Gx2;
+use crate::shader_cache::{FrontCache, Lookup, Ranges};
 use crate::state::State;
 use mh3u_latte::decode::decode;
 use mh3u_latte::translate::{Context, Interface, PixelInputs, TexKind, VertexAttribute, VertexInputs, translate_pixel, translate_vertex};
 use mh3u_rt::Guest;
 use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
 /// One element of a fetch shader's description (`GX2AttribStream`).
@@ -44,9 +46,27 @@ pub struct Compiled {
     pub interface: Interface,
 }
 
-/// A pipeline and what it was made from.
-/// The three translated stages of a geometry pipeline and how many vertices the geometry shader may emit.
-pub type GeometryShaders = (Arc<Compiled>, Arc<Compiled>, Arc<Compiled>, u32);
+/// A geometry pipeline: the three translated stages, how many vertices the geometry shader may emit, and the compute pipelines of the
+/// first two stages.
+pub struct GeometryEntry {
+    pub es: Arc<Compiled>,
+    pub gs: Arc<Compiled>,
+    pub copy: Arc<Compiled>,
+    pub max_vertices: u32,
+    pub es_pipeline: wgpu::ComputePipeline,
+    pub gs_pipeline: wgpu::ComputePipeline,
+}
+
+/// A fetch shader's streams, shared (see `Gx2::fetch_shaders`).
+pub type Fetch = Arc<[AttribStream]>;
+/// The front key of a vertex shader: (shader, program, size, fetch shader version, half z).
+pub type VertexFront = (u32, u32, u32, usize, bool);
+/// The front key of a pixel shader: (shader, program, size, hash of the words its inputs are made from, texture kinds).
+pub type PixelFront = (u32, u32, u32, u64, [u8; 18]);
+
+/// The front key of a geometry pipeline: the vertex and geometry shaders, their three programs (start, size), the fetch shader version,
+/// half z, and the ring item sizes (es and gs vec4s), everything its translation depends on besides the program bytes.
+pub type GeometryFront = (u32, u32, [(u32, u32); 3], usize, bool, u32, u32);
 
 pub struct CachedTexture {
     pub texture: wgpu::Texture,
@@ -113,6 +133,10 @@ const BIND_GROUP_LIMIT: usize = 16384;
 pub struct DrawCaches {
     pub vertex: HashMap<(u32, u32, u64), Option<Arc<Compiled>>>,
     pub pixel: HashMap<(u32, u64), Option<Arc<Compiled>>>,
+    /// The fronts of the two (see `shader_cache`): by (shader, program, size, fetch shader version, half z), and by (shader, program,
+    /// size, hash of the inputs' words, texture kinds).
+    pub vertex_front: FrontCache<VertexFront, (Option<Arc<Compiled>>, Fetch)>,
+    pub pixel_front: FrontCache<PixelFront, Option<Arc<Compiled>>>,
     pub pipelines: HashMap<PipelineKey, Arc<PipelineEntry>>,
     pub depth: HashMap<u32, DepthTarget>,
     pub fallback: HashMap<&'static str, (wgpu::Texture, wgpu::TextureView)>,
@@ -132,8 +156,9 @@ pub struct DrawCaches {
     pub uniforms: HashMap<(u32, u32, u64), BufRef>,
     /// A buffer reused for reading uniform blocks.
     pub scratch: Vec<u8>,
-    pub geometry: HashMap<String, Option<GeometryShaders>>,
-    pub compute: HashMap<String, wgpu::ComputePipeline>,
+    /// Geometry pipelines by the hashes of their programs and what else their translation depends on, with their front.
+    pub geometry: HashMap<(u32, u32, u64), Option<Arc<GeometryEntry>>>,
+    pub geometry_front: FrontCache<GeometryFront, (Option<Arc<GeometryEntry>>, Fetch)>,
     /// Why draws were not drawn, and how many.
     pub skipped: HashMap<&'static str, u64>,
     pub gs_draws: HashMap<(u32, u32, u32, u32, u32), u64>,
@@ -151,7 +176,7 @@ pub struct StreamEntry {
 }
 
 /// A quick hash of bytes (eight at a time), for telling whether vertex data is what it was.
-fn hash_fast(b: &[u8], seed: u64) -> u64 {
+pub(crate) fn hash_fast(b: &[u8], seed: u64) -> u64 {
     let mut h = seed ^ (b.len() as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
     let (words, rest) = b.as_chunks::<8>();
     for w in words {
@@ -164,13 +189,35 @@ fn hash_fast(b: &[u8], seed: u64) -> u64 {
     h ^ (h >> 32)
 }
 
-fn hash_bytes(b: &[u8]) -> u64 {
-    // FNV-1a
-    let mut h = 0xcbf2_9ce4_8422_2325u64;
-    for &x in b {
-        h = (h ^ u64::from(x)).wrapping_mul(0x0100_0000_01b3);
+/// A hash of the guest memory in `ranges` (the programs a cached translation was made from).
+pub(crate) fn hash_ranges(g: &Guest, ranges: &Ranges) -> u64 {
+    let mut h = 0x51u64;
+    let mut buf = Vec::new();
+    for &(at, len) in ranges.iter().filter(|r| r.1 != 0) {
+        buf.resize(len as usize, 0);
+        g.read(at, &mut buf);
+        h = hash_fast(&buf, h);
     }
     h
+}
+
+/// A hash of anything hashable, for the parts of a shader key that are not bytes.
+pub(crate) fn hash_of(v: &impl Hash) -> u64 {
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    v.hash(&mut h);
+    h.finish()
+}
+
+/// Counts a shader cache lookup in the timing report.
+pub(crate) fn count_lookup(how: &Lookup, hit: &'static str, checked: &'static str, miss: &'static str) {
+    Lap::count(
+        match how {
+            Lookup::Hit => hit,
+            Lookup::Checked => checked,
+            Lookup::Miss => miss,
+        },
+        1,
+    );
 }
 
 /// The attribute's components as raw 32-bit patterns (floats for the float and normalised formats, integers as they are for the others).
@@ -389,11 +436,38 @@ impl Gx2 {
         }
     }
 
-    fn vertex_shader(&mut self, g: &Guest, vs: u32, fetch: &[AttribStream], half_z: bool) -> Option<Arc<Compiled>> {
+    fn vertex_shader(&mut self, g: &Guest, vs: u32, fetch: &Arc<[AttribStream]>, half_z: bool) -> Option<Arc<Compiled>> {
         let (size, program) = (g.u32(vs + 0xd0), g.u32(vs + 0xd4));
-        let mut code = vec![0u8; size.min(1 << 20) as usize];
+        let size = size.min(1 << 20);
+        let front = (vs, program, size, Arc::as_ptr(fetch).cast::<u8>() as usize, half_z);
+        let swaps = self.swaps;
+        let (found, how) = self.caches.vertex_front.get(&front, swaps, |r| hash_ranges(g, r));
+        count_lookup(&how, "vertex shader hits", "vertex shader checks", "vertex shader misses");
+        if let Some((c, _)) = found {
+            return c;
+        }
+        let ranges = [(program, size), (0, 0), (0, 0)];
+        let compiled = self.vertex_shader_slow(g, vs, program, size, fetch, half_z);
+        let hash = hash_ranges(g, &ranges);
+        self.caches
+            .vertex_front
+            .insert(front, ranges, hash, swaps, (compiled.clone(), fetch.clone()));
+        compiled
+    }
+
+    /// The vertex shader from its program bytes: translated once for each program, fetch shader and depth range.
+    fn vertex_shader_slow(
+        &mut self,
+        g: &Guest,
+        vs: u32,
+        program: u32,
+        size: u32,
+        fetch: &[AttribStream],
+        half_z: bool,
+    ) -> Option<Arc<Compiled>> {
+        let mut code = vec![0u8; size as usize];
         g.read(program, &mut code);
-        let key = (vs, program, hash_bytes(&code) ^ hash_bytes(format!("{fetch:?}{half_z}").as_bytes()));
+        let key = (vs, program, hash_fast(&code, 0) ^ hash_of(&(fetch, half_z)));
         if let Some(c) = self.caches.vertex.get(&key) {
             return c.clone();
         }
@@ -439,7 +513,36 @@ impl Gx2 {
         compiled
     }
 
-    fn pixel_shader(&mut self, g: &Guest, ps: u32, semantics_at: u32, kinds: &[TexKind; 18]) -> Option<(Arc<Compiled>, PixelInputs)> {
+    fn pixel_shader(&mut self, g: &Guest, ps: u32, semantics_at: u32, kinds: &[TexKind; 18]) -> Option<Arc<Compiled>> {
+        // what the translation depends on besides the program: the words the inputs are made from, and the texture kinds
+        let count = g.u32(ps + 0x10).min(32);
+        let mut words = [0u32; 1 + 32 + 10];
+        words[0] = count;
+        for i in 0..count {
+            words[1 + i as usize] = g.u32(ps + 0x14 + 4 * i);
+        }
+        for k in 0..10 {
+            words[33 + k as usize] = g.u32(semantics_at + 4 * k);
+        }
+        let words_bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let (size, program) = (g.u32(ps + 0xa4), g.u32(ps + 0xa8));
+        let size = size.min(1 << 20);
+        let front = (ps, program, size, hash_fast(&words_bytes, 0x9), kinds.map(|k| k as u8));
+        let swaps = self.swaps;
+        let (found, how) = self.caches.pixel_front.get(&front, swaps, |r| hash_ranges(g, r));
+        count_lookup(&how, "pixel shader hits", "pixel shader checks", "pixel shader misses");
+        if let Some(c) = found {
+            return c;
+        }
+        let ranges = [(program, size), (0, 0), (0, 0)];
+        let compiled = self.pixel_shader_slow(g, ps, semantics_at, kinds);
+        let hash = hash_ranges(g, &ranges);
+        self.caches.pixel_front.insert(front, ranges, hash, swaps, compiled.clone());
+        compiled
+    }
+
+    /// The pixel shader from its program bytes and inputs: translated once for each.
+    fn pixel_shader_slow(&mut self, g: &Guest, ps: u32, semantics_at: u32, kinds: &[TexKind; 18]) -> Option<Arc<Compiled>> {
         // the inputs: pixel input i takes the vertex shader's output with the same semantic
         let count = g.u32(ps + 0x10).min(32);
         let vs_semantics: Vec<u32> = (0..40u32)
@@ -460,9 +563,12 @@ impl Gx2 {
         let (size, program) = (g.u32(ps + 0xa4), g.u32(ps + 0xa8));
         let mut code = vec![0u8; size.min(1 << 20) as usize];
         g.read(program, &mut code);
-        let key = (ps, hash_bytes(&code) ^ hash_bytes(format!("{inputs:?}{kinds:?}").as_bytes()));
+        let key = (
+            ps,
+            hash_fast(&code, 0) ^ hash_of(&(inputs.count, &inputs.flat, &inputs.locations, kinds.map(|k| k as u8))),
+        );
         if let Some(c) = self.caches.pixel.get(&key) {
-            return c.clone().map(|c| (c, inputs));
+            return c.clone();
         }
         let kinds = *kinds;
         let result = (|| {
@@ -492,7 +598,7 @@ impl Gx2 {
             }
         };
         self.caches.pixel.insert(key, compiled.clone());
-        compiled.map(|c| (c, inputs))
+        compiled
     }
 
     /// Makes the texture at `t` (a `GX2Texture`) into a GPU texture, once until the game says it changed.
@@ -591,6 +697,13 @@ impl Gx2 {
         });
         *slot = Some(view.clone());
         Some(view)
+    }
+
+    /// `GX2Invalidate` of shader memory: the translations made from programs there are looked up by their bytes again.
+    pub(crate) fn invalidate_shaders(&mut self, address: u32, size: u32) {
+        self.caches.vertex_front.invalidate(address, size);
+        self.caches.pixel_front.invalidate(address, size);
+        self.caches.geometry_front.invalidate(address, size);
     }
 
     pub(crate) fn invalidate_textures(&mut self, address: u32, size: u32) {
@@ -1079,7 +1192,7 @@ impl Gx2 {
             }
         };
         let semantics_at = geo.as_ref().map_or(st.vertex_shader + 0x10, |x| x.semantics_at);
-        let Some((ps, _inputs)) = self.pixel_shader(g, st.pixel_shader, semantics_at, &kinds) else {
+        let Some(ps) = self.pixel_shader(g, st.pixel_shader, semantics_at, &kinds) else {
             *self.caches.skipped.entry("pixel shader not translated").or_default() += 1;
             return;
         };

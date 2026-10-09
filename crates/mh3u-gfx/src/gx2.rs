@@ -128,7 +128,9 @@ pub struct Gx2 {
     pub(crate) caches: crate::draw::DrawCaches,
     pub(crate) last_tv_source: u32,
     save_every: u32,
-    pub(crate) fetch_shaders: HashMap<u32, Vec<crate::draw::AttribStream>>,
+    /// The fetch shaders by address. A shared slice: a new one for each `GX2InitFetchShaderEx`, so its address tells versions apart in the
+    /// shader caches' keys (which keep it alive).
+    pub(crate) fetch_shaders: HashMap<u32, std::sync::Arc<[crate::draw::AttribStream]>>,
     /// With MH3U_FPS set: when the frame rate was last printed, and the swap count then.
     fps: Option<(Instant, u32)>,
 }
@@ -767,14 +769,18 @@ impl Gx2 {
                 g.put_u32(fs + 8, (32 + 16 * count).div_ceil(16) * 16);
                 g.put_u32(fs + 0xc, buffer);
                 g.put_u32(fs + 0x10, count);
-                self.fetch_shaders.insert(fs, streams);
+                self.fetch_shaders.insert(fs, streams.into());
             }
             Call::CopySurface => self.copy_surface(g, c.r[3], c.r[6]),
-            // (mode, address, size): the CPU wrote memory the GPU may have cached; a texture there is read again next time
+            // (mode, address, size): the CPU wrote memory the GPU may have cached; a texture or a shader program there is read again
+            // next time
             Call::Invalidate => {
                 let (mode, address, size) = (a(0), a(1), a(2));
                 if mode & 2 != 0 || mode & 0x40 != 0 {
                     self.invalidate_textures(address, size);
+                }
+                if crate::shader_cache::invalidates_shaders(mode) {
+                    self.invalidate_shaders(address, size);
                 }
             }
             Call::InitSampler => {

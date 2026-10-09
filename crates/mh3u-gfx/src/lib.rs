@@ -3,6 +3,7 @@
 mod draw;
 mod geometry;
 mod gx2;
+mod shader_cache;
 mod state;
 mod texture;
 
