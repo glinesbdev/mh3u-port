@@ -12,7 +12,9 @@ With the work in PRs #1–#3 (`perf/regs-flags-dispatch` → `windows-build` →
   per-frame columns; `[draw counts]` for cache hits and misses; `[baton]` for guest thread handoffs.
 - With either of the two above, every window also has `[gfx frames]` (slowest frame, frames over 33 and 50 ms), `[gfx caches]`
   (cache sizes), `[gfx pipelines]` and `[gfx invalidates]`, and entering an area prints `[gfx] area change at frame N` and,
-  180 frames later, how those frames went (PR #5; `translator.md` has the details).
+  180 frames later, how those frames went (PR #5; `translator.md` has the details). Since PR #6 the first line also splits the
+  frame into time in graphics calls and in the game, and both lines give shaders translated, found on disk, modules made or
+  found, draws left for a later frame, and textures decoded, each with its ms.
 - A CPU profiler (Visual Studio on Windows). On `x86_64-pc-windows-gnullvm` the PDB only has public symbols, so a profiler
   gives each sample to the nearest public name before it: read names from `llvm-nm -n --demangle mh3u-tools.exe` instead
   (see `translator.md`).
@@ -49,9 +51,25 @@ move the village on its own.
    - First run: every new pipeline was made on a worker (11, 55, 73, 78 a window), "0 made with the draw waiting". On
      entering the field the frame with the change took 41.6 ms (12 new pipelines, 5 translations, 15 textures).
    - Second run: `217 pipelines to make again` loaded from disk and all were made on workers at startup (1.0 s of worker
-     time). After that, 0 new pipelines all run. The field change frame was 89.3 ms, all of it 31 shader translations and
-     34 texture decodes. Pipelines no longer cause the hitch; translation and decoding do, and these are not kept on disk
-     yet (a possible next step).
+     time). After that, 0 new pipelines all run. The field change frame was 89.3 ms, with 31 shader translations and 34
+     texture decodes in it. Pipelines no longer cause the hitch.
+   - Correction: the 89.3 ms is the whole frame, swap to swap, so it includes the game's own time. Texture decodes are cheap:
+     run 13's entry window had 75 decodes, 6 ms decoding and 4 ms uploading in total (about 0.13 ms each, so about 4.5 ms for
+     34). How the rest splits between translation, making shader modules and the game was not measured.
+   - **PR #6 (perf/area-entry, not yet measured in the game):**
+     - The area-change line now splits the frame: time in graphics calls versus in the game or the swap. Within graphics it
+       gives translating, making shader modules and decoding textures, each with a count and ms. It also shows shaders found
+       on disk, modules found made, and draws left for a later frame.
+     - Translations are kept on disk (`<out>/cache/translations/<graphics sources hash>`) and read back in later runs.
+     - Shader modules are shared with the pipeline workers, so a translation found on disk usually gets the module the workers
+       already made at startup for a pipeline read from the disk.
+     - Translating is limited to 5 ms a frame (`MH3U_GFX_SHADER_BUDGET_MS`). Draws needing more shaders wait a frame, as new
+       pipelines already do.
+     - Texture decodes stay on the render thread. At about 0.13 ms each, neither decoding on workers nor a disk cache of
+       decoded textures (several MB to read back per area) looked worth it. The new line shows the decode ms, so this can
+       be revisited if it turns out to be large.
+     - To verify: run twice. In the second run the area-change line should show shaders "found on disk", modules "found
+       made", 0 translated, and a slowest frame near the others.
    - The 593 and 645 ms frames at 2400 are `MH3U_GFX_DUMP_FRAME` writing a frame, not the game.
 3. **Shader cache misses that never stop, and a replay that slows down.** About 30 pixel and 22–30 vertex shader misses per frame
    even while standing still (run 11 in the field: ~48 pixel, ~28 vertex and 4 geometry pipeline misses a frame). In run 11 the

@@ -11,11 +11,15 @@ mod report;
 mod shader_cache;
 mod state;
 mod texture;
+mod translations;
 
 pub use gx2::Gx2;
 
 /// The commit this build was made from ("+changes" when the working tree differed), printed at start and written into frame dumps.
 pub const BUILD: &str = env!("MH3U_BUILD_COMMIT");
+
+/// A hash of the translator's and the graphics code's sources (see `build.rs`): what the on-disk caches are valid for.
+pub const SHADER_SOURCE: &str = env!("MH3U_SHADER_SOURCE");
 
 use anyhow::{Context, Result};
 use std::sync::Arc;
