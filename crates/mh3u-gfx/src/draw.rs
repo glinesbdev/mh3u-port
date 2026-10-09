@@ -53,25 +53,85 @@ pub struct CachedTexture {
     pub layers: u32,
     pub range: (u32, u32),
     pub mips: (u32, u32),
+    /// The views the shaders read it through, made once: as a 2D texture, and as a cube (see `texture_view`).
+    pub views: [Option<wgpu::TextureView>; 2],
 }
 
 pub struct PipelineEntry {
     pub pipeline: wgpu::RenderPipeline,
+    /// The layouts of its four bind groups, asked for once (the same objects the pipeline was made with).
+    pub layouts: [wgpu::BindGroupLayout; 4],
+    /// The shaders the pipeline's key names by address, kept alive so the address is not reused while the key is.
+    _shaders: (Arc<Compiled>, Arc<Compiled>),
 }
+
+/// What makes a render pipeline different. The shaders are named by the address of their translation (kept alive by the entry).
+#[derive(Clone, PartialEq, Eq, Hash)]
+pub(crate) struct PipelineKey {
+    vs: usize,
+    ps: usize,
+    topology: wgpu::PrimitiveTopology,
+    target_format: wgpu::TextureFormat,
+    blend: crate::state::Blend,
+    depth_format: Option<wgpu::TextureFormat>,
+    blend_on: u32,
+    masks: u32,
+    depth_test: bool,
+    depth_write: bool,
+    depth_func: u32,
+    cull: u8,
+    front_face: u32,
+}
+
+/// A depth buffer the game draws with, and its views (made once): the whole of it for drawing, its depth for sampling.
+pub struct DepthTarget {
+    pub texture: wgpu::Texture,
+    pub format: wgpu::TextureFormat,
+    pub view: wgpu::TextureView,
+    pub sample_view: wgpu::TextureView,
+}
+
+/// One resource of a bind group as a cache key: wgpu handles compare and hash by identity, so equal keys mean the same objects.
+#[derive(Clone, PartialEq, Eq, Hash)]
+pub(crate) enum Bound {
+    Buffer(wgpu::Buffer, u64, u64),
+    View(wgpu::TextureView),
+    Sampler(wgpu::Sampler),
+}
+
+/// A bind group's layout and what is bound at each binding.
+#[derive(Clone, PartialEq, Eq, Hash)]
+pub(crate) struct GroupKey {
+    layout: wgpu::BindGroupLayout,
+    entries: Vec<(u32, Bound)>,
+}
+
+/// How many bind groups are kept before the cache is emptied (it is also pruned of the ones not used for a second, see `prune`).
+const BIND_GROUP_LIMIT: usize = 16384;
 
 #[derive(Default)]
 pub struct DrawCaches {
     pub vertex: HashMap<(u32, u32, u64), Option<Arc<Compiled>>>,
     pub pixel: HashMap<(u32, u64), Option<Arc<Compiled>>>,
-    pub pipelines: HashMap<String, Arc<PipelineEntry>>,
-    pub depth: HashMap<u32, (wgpu::Texture, wgpu::TextureFormat)>,
-    pub fallback: HashMap<&'static str, wgpu::Texture>,
+    pub pipelines: HashMap<PipelineKey, Arc<PipelineEntry>>,
+    pub depth: HashMap<u32, DepthTarget>,
+    pub fallback: HashMap<&'static str, (wgpu::Texture, wgpu::TextureView)>,
     pub reported: std::collections::HashSet<String>,
     /// How many draws went to each colour buffer (by image address), for the log.
     pub drawn_into: HashMap<u32, u64>,
     /// Textures made from the guest's, by the address of their image and what they were read as, with the memory they cover.
     pub textures: HashMap<(u32, u32, u32, u32, u32), CachedTexture>,
-    pub samplers: HashMap<String, wgpu::Sampler>,
+    /// Samplers by the three words of the `GX2Sampler` they were made from, and the two that are not the game's.
+    pub samplers: HashMap<[u32; 3], wgpu::Sampler>,
+    pub default_sampler: Option<wgpu::Sampler>,
+    pub compare_sampler: Option<wgpu::Sampler>,
+    /// Bind groups by what they bind, with the swap they were last used in.
+    pub bind_groups: HashMap<GroupKey, (wgpu::BindGroup, u32)>,
+    /// The uniform blocks uploaded in this batch, by (address, vec4s, hash of the contents): a draw that reads the same contents again
+    /// reads the same bytes (they are compared, not only hashed). Emptied with the arenas.
+    pub uniforms: HashMap<(u32, u32, u64), BufRef>,
+    /// A buffer reused for reading uniform blocks.
+    pub scratch: Vec<u8>,
     pub geometry: HashMap<String, Option<GeometryShaders>>,
     pub compute: HashMap<String, wgpu::ComputePipeline>,
     /// Why draws were not drawn, and how many.
@@ -84,7 +144,8 @@ pub struct DrawCaches {
 
 pub struct StreamEntry {
     buffer: wgpu::Buffer,
-    meta: [[u32; 4]; 16],
+    /// Where each stream starts, as the shaders read it (a small buffer of its own, so a draw's bind group 3 is the same every frame).
+    meta: wgpu::Buffer,
     size: u64,
     used: u32,
 }
@@ -500,6 +561,7 @@ impl Gx2 {
                             layers: d.layers,
                             range: (h.image, h.image.saturating_add(h.image_size)),
                             mips: (h.mip_ptr, h.mip_ptr.saturating_add(h.mip_size)),
+                            views: [None, None],
                         },
                     );
                 }
@@ -512,15 +574,23 @@ impl Gx2 {
                 }
             }
         }
-        let cached = &self.caches.textures[&key];
-        Some(cached.texture.create_view(&wgpu::TextureViewDescriptor {
+        let cached = self.caches.textures.get_mut(&key)?;
+        let slot = &mut cached.views[usize::from(kind == TexKind::Cube)];
+        if let Some(view) = slot {
+            Lap::count("texture view hits", 1);
+            return Some(view.clone());
+        }
+        Lap::count("texture view misses", 1);
+        let view = cached.texture.create_view(&wgpu::TextureViewDescriptor {
             dimension: Some(match kind {
                 TexKind::Cube if cached.layers > 1 => wgpu::TextureViewDimension::D2Array,
                 _ => wgpu::TextureViewDimension::D2,
             }),
             array_layer_count: Some(if kind == TexKind::Cube { 6.min(cached.layers) } else { 1 }),
             ..Default::default()
-        }))
+        });
+        *slot = Some(view.clone());
+        Some(view)
     }
 
     pub(crate) fn invalidate_textures(&mut self, address: u32, size: u32) {
@@ -585,17 +655,17 @@ impl Gx2 {
                     );
                 }
             }
-            self.caches.fallback.insert(name, texture);
+            let view = texture.create_view(&wgpu::TextureViewDescriptor {
+                dimension: Some(match kind {
+                    TexKind::D3 => wgpu::TextureViewDimension::D3,
+                    TexKind::Cube => wgpu::TextureViewDimension::D2Array,
+                    _ => wgpu::TextureViewDimension::D2,
+                }),
+                ..Default::default()
+            });
+            self.caches.fallback.insert(name, (texture, view));
         }
-        let texture = &self.caches.fallback[name];
-        texture.create_view(&wgpu::TextureViewDescriptor {
-            dimension: Some(match kind {
-                TexKind::D3 => wgpu::TextureViewDimension::D3,
-                TexKind::Cube => wgpu::TextureViewDimension::D2Array,
-                _ => wgpu::TextureViewDimension::D2,
-            }),
-            ..Default::default()
-        })
+        self.caches.fallback[name].1.clone()
     }
 
     fn depth_target(&mut self, g: &Guest, db: u32) -> Option<(u32, wgpu::TextureFormat)> {
@@ -607,7 +677,7 @@ impl Gx2 {
             .caches
             .depth
             .get(&image)
-            .is_none_or(|(t, f)| t.width() != width || t.height() != height || *f != format);
+            .is_none_or(|d| d.texture.width() != width || d.texture.height() != height || d.format != format);
         if stale {
             let texture = self.d.device.create_texture(&wgpu::TextureDescriptor {
                 label: Some("depth buffer"),
@@ -626,7 +696,20 @@ impl Gx2 {
                     | wgpu::TextureUsages::COPY_DST,
                 view_formats: &[],
             });
-            self.caches.depth.insert(image, (texture, format));
+            let view = texture.create_view(&Default::default());
+            let sample_view = texture.create_view(&wgpu::TextureViewDescriptor {
+                aspect: wgpu::TextureAspect::DepthOnly,
+                ..Default::default()
+            });
+            self.caches.depth.insert(
+                image,
+                DepthTarget {
+                    texture,
+                    format,
+                    view,
+                    sample_view,
+                },
+            );
         }
         Some((image, format))
     }
@@ -634,7 +717,7 @@ impl Gx2 {
     pub(crate) fn clear_depth(&mut self, g: &Guest, db: u32, depth: f32, stencil: u32, mode: u32) {
         self.flush_draws();
         let Some((image, format)) = self.depth_target(g, db) else { return };
-        let view = self.caches.depth[&image].0.create_view(&Default::default());
+        let view = self.caches.depth[&image].view.clone();
         let has_stencil = format == wgpu::TextureFormat::Depth24PlusStencil8;
         let mut enc = self.d.device.create_command_encoder(&Default::default());
         {
@@ -726,7 +809,7 @@ impl Gx2 {
         start: u32,
         vertices: u32,
         instances: u32,
-    ) -> (BufRef, [[u32; 4]; 16]) {
+    ) -> (BufRef, BufRef) {
         let mut lap = Lap::new();
         let (mut h1, mut h2) = (0x1234_5678_9abc_def0u64, 0x0fed_cba9_8765_4321u64);
         let mut mix = |v: u64| {
@@ -786,9 +869,16 @@ impl Gx2 {
         if let Some(e) = self.caches.streams.get_mut(&key) {
             lap.mark("stream hit");
             e.used = swaps;
-            let (buffer, meta) = (e.buffer.clone(), e.meta);
+            let (buffer, meta) = (e.buffer.clone(), e.meta.clone());
             let size = e.size;
-            return (BufRef { buffer, offset: 0, size }, meta);
+            return (
+                BufRef { buffer, offset: 0, size },
+                BufRef {
+                    buffer: meta,
+                    offset: 0,
+                    size: 256,
+                },
+            );
         }
         let (data, meta) = self.decode_streams(g, st, fetch, start, vertices, instances);
         lap.mark("stream miss: decode");
@@ -807,6 +897,14 @@ impl Gx2 {
             mapped_at_creation: false,
         });
         self.d.queue.write_buffer(&buffer, 0, &data);
+        let meta_buffer = self.d.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("vertex stream starts"),
+            size: 256,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let meta_bytes: Vec<u8> = meta.iter().flatten().flat_map(|v| v.to_le_bytes()).collect();
+        self.d.queue.write_buffer(&meta_buffer, 0, &meta_bytes);
         // forget what has not been used for a while, or what is too much
         self.caches.stream_bytes += size;
         if self.caches.stream_bytes > (1 << 30) {
@@ -822,18 +920,29 @@ impl Gx2 {
             key,
             StreamEntry {
                 buffer: buffer.clone(),
-                meta,
+                meta: meta_buffer.clone(),
                 size,
                 used: swaps,
             },
         );
-        (BufRef { buffer, offset: 0, size }, meta)
+        (
+            BufRef { buffer, offset: 0, size },
+            BufRef {
+                buffer: meta_buffer,
+                offset: 0,
+                size: 256,
+            },
+        )
     }
 
     /// The upload of one uniform block: the guest's big-endian words as the shader reads them.
+    /// The same contents uploaded earlier in the batch are not uploaded again: the draw gets the same bytes (compared, not trusted to the
+    /// hash), which also lets it share the bind group of the draw before.
     pub(crate) fn uniform_buffer(&mut self, g: &Guest, block: &crate::state::UniformBlock, vec4s: u32) -> BufRef {
         let size = u64::from(vec4s.max(1)) * 16;
-        let mut bytes = vec![0u8; size as usize];
+        let mut bytes = std::mem::take(&mut self.caches.scratch);
+        bytes.clear();
+        bytes.resize(size as usize, 0);
         let have = (block.size as usize).min(bytes.len());
         if block.address != 0 && have > 0 {
             g.read(block.address, &mut bytes[..have]);
@@ -841,7 +950,75 @@ impl Gx2 {
                 w.reverse();
             }
         }
-        self.arena_write(&bytes, size)
+        let key = (block.address, vec4s, hash_fast(&bytes, 0x75));
+        let earlier = self.caches.uniforms.get(&key).filter(|r| self.arena_holds(r, &bytes)).cloned();
+        let r = match earlier {
+            Some(r) => {
+                Lap::count("uniform uploads shared", 1);
+                r
+            }
+            None => {
+                Lap::count("uniform uploads", 1);
+                let r = self.arena_write(&bytes, size);
+                self.caches.uniforms.insert(key, r.clone());
+                r
+            }
+        };
+        self.caches.scratch = bytes;
+        r
+    }
+
+    /// A bind group with these resources: the one made before for the same layout and resources, or a new one (which is kept unless
+    /// `keep` is false, for resources made for this draw only).
+    pub(crate) fn bind_group(&mut self, layout: &wgpu::BindGroupLayout, entries: Vec<(u32, Bound)>, keep: bool) -> wgpu::BindGroup {
+        let key = GroupKey {
+            layout: layout.clone(),
+            entries,
+        };
+        if keep && let Some(e) = self.caches.bind_groups.get_mut(&key) {
+            e.1 = self.swaps;
+            Lap::count("bind group hits", 1);
+            return e.0.clone();
+        }
+        let list: Vec<wgpu::BindGroupEntry> = key
+            .entries
+            .iter()
+            .map(|(binding, r)| wgpu::BindGroupEntry {
+                binding: *binding,
+                resource: match r {
+                    Bound::Buffer(buffer, offset, size) => wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                        buffer,
+                        offset: *offset,
+                        size: std::num::NonZeroU64::new(*size),
+                    }),
+                    Bound::View(v) => wgpu::BindingResource::TextureView(v),
+                    Bound::Sampler(s) => wgpu::BindingResource::Sampler(s),
+                },
+            })
+            .collect();
+        let group = self.d.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout,
+            entries: &list,
+        });
+        if keep {
+            Lap::count("bind group misses", 1);
+            if self.caches.bind_groups.len() >= BIND_GROUP_LIMIT {
+                self.caches.bind_groups.clear();
+            }
+            self.caches.bind_groups.insert(key, (group.clone(), self.swaps));
+        } else {
+            Lap::count("bind groups not kept", 1);
+        }
+        group
+    }
+
+    /// Once a second of frames: forgets the bind groups not used in that time (they keep their buffers and views alive).
+    pub(crate) fn prune(&mut self) {
+        let swaps = self.swaps;
+        if swaps.is_multiple_of(60) {
+            self.caches.bind_groups.retain(|_, e| e.1 + 60 >= swaps);
+        }
     }
 
     pub(crate) fn draw_call(&mut self, g: &Guest, primitive: u32, count: u32, indexed: Option<(u32, u32)>, first: u32, instances: u32) {
@@ -999,11 +1176,9 @@ impl Gx2 {
                 let highest = real().max().unwrap_or(0);
                 let indices: Vec<u32> = indices.iter().map(|&i| if i == u32::MAX { i } else { i - lowest }).collect();
                 let vertices = highest - lowest + 1;
-                let (va, meta) = self.cached_streams(g, &st, &fetch, lowest, vertices.min(1 << 22), instances);
+                let (va, meta_buffer) = self.cached_streams(g, &st, &fetch, lowest, vertices.min(1 << 22), instances);
                 lap.mark("decode streams");
                 // buffers
-                let meta_bytes: Vec<u8> = meta.iter().flatten().flat_map(|v| v.to_le_bytes()).collect();
-                let meta_buffer = self.arena_write(&meta_bytes, 256);
                 let index_bytes: Vec<u8> = indices.iter().flat_map(|i| i.to_le_bytes()).collect();
                 let index_buffer = self.arena_write(&index_bytes, index_bytes.len() as u64);
                 (va, meta_buffer, index_buffer, indices.len() as u32, topology)
@@ -1020,20 +1195,21 @@ impl Gx2 {
             topology,
             wgpu::PrimitiveTopology::TriangleStrip | wgpu::PrimitiveTopology::LineStrip
         );
-        let key = format!(
-            "{:p}{:p}{topology:?}{target_format:?}{:?}{:?}{}{}{}{}{}{}{}",
-            Arc::as_ptr(&vs),
-            Arc::as_ptr(&ps),
-            st.blend[0],
-            use_depth.map(|d| d.1),
-            st.colour_control[1] & 1,
-            st.target_masks & 0xf,
-            st.depth_test,
-            st.depth_write,
-            st.depth_func,
-            st.cull_front as u8 * 2 + st.cull_back as u8,
-            st.front_face,
-        );
+        let key = PipelineKey {
+            vs: Arc::as_ptr(&vs) as usize,
+            ps: Arc::as_ptr(&ps) as usize,
+            topology,
+            target_format,
+            blend: st.blend[0].clone(),
+            depth_format: use_depth.map(|d| d.1),
+            blend_on: st.colour_control[1] & 1,
+            masks: st.target_masks & 0xf,
+            depth_test: st.depth_test,
+            depth_write: st.depth_write,
+            depth_func: st.depth_func,
+            cull: st.cull_front as u8 * 2 + st.cull_back as u8,
+            front_face: st.front_face,
+        };
         let entry = match self.caches.pipelines.get(&key) {
             Some(e) => e.clone(),
             None => {
@@ -1118,47 +1294,31 @@ impl Gx2 {
                     multiview_mask: None,
                     cache: None,
                 });
-                let e = Arc::new(PipelineEntry { pipeline });
+                let layouts = std::array::from_fn(|n| pipeline.get_bind_group_layout(n as u32));
+                let e = Arc::new(PipelineEntry {
+                    pipeline,
+                    layouts,
+                    _shaders: (vs.clone(), ps.clone()),
+                });
                 self.caches.pipelines.insert(key, e.clone());
                 e
             }
         };
         lap.mark("pipeline");
-        // the bindings
-        let mut vs_entries = Vec::new();
-        let mut ps_entries = Vec::new();
-        let mut keep: Vec<BufRef> = Vec::new();
+        // the bindings: the uniform blocks (uploaded again only when their contents are new in this batch) and the bind groups (made
+        // again only when what they bind is new)
+        let mut vs_entries = Vec::with_capacity(vs.interface.banks.len());
         for (&bank, &len) in &vs.interface.banks {
-            keep.push(self.uniform_buffer(g, &st.vertex_blocks[(bank as usize).min(15)], len));
+            let r = self.uniform_buffer(g, &st.vertex_blocks[(bank as usize).min(15)], len);
+            vs_entries.push((bank, r.bound()));
         }
+        let mut ps_entries = Vec::with_capacity(ps.interface.banks.len());
         for (&bank, &len) in &ps.interface.banks {
-            keep.push(self.uniform_buffer(g, &st.pixel_blocks[(bank as usize).min(15)], len));
+            let r = self.uniform_buffer(g, &st.pixel_blocks[(bank as usize).min(15)], len);
+            ps_entries.push((bank, r.bound()));
         }
-        let mut at = 0;
-        for &bank in vs.interface.banks.keys() {
-            vs_entries.push(wgpu::BindGroupEntry {
-                binding: bank,
-                resource: keep[at].binding(),
-            });
-            at += 1;
-        }
-        for &bank in ps.interface.banks.keys() {
-            ps_entries.push(wgpu::BindGroupEntry {
-                binding: bank,
-                resource: keep[at].binding(),
-            });
-            at += 1;
-        }
-        let group0 = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: None,
-            layout: &entry.pipeline.get_bind_group_layout(0),
-            entries: &vs_entries,
-        });
-        let group1 = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: None,
-            layout: &entry.pipeline.get_bind_group_layout(1),
-            entries: &ps_entries,
-        });
+        let group0 = self.bind_group(&entry.layouts[0], vs_entries, true);
+        let group1 = self.bind_group(&entry.layouts[1], ps_entries, true);
         lap.mark("uniforms and groups 0, 1");
         // textures: white stand-ins until the real ones are decoded
         let draw_image = image;
@@ -1176,7 +1336,7 @@ impl Gx2 {
                 {
                     {
                         if image != draw_image {
-                            return (r, target.texture.create_view(&Default::default()));
+                            return (r, target.view.clone());
                         }
                         // the pass draws into what it samples: the shader gets a copy of how it was before
                         let copy = device.create_texture(&wgpu::TextureDescriptor {
@@ -1198,17 +1358,9 @@ impl Gx2 {
                     }
                 }
                 if k == TexKind::Depth2d
-                    && let Some((texture, _)) = self.caches.depth.get(&image)
+                    && let Some(depth) = self.caches.depth.get(&image)
                 {
-                    {
-                        return (
-                            r,
-                            texture.create_view(&wgpu::TextureViewDescriptor {
-                                aspect: wgpu::TextureAspect::DepthOnly,
-                                ..Default::default()
-                            }),
-                        );
-                    }
+                    return (r, depth.sample_view.clone());
                 }
                 if t != 0
                     && k != TexKind::Depth2d
@@ -1223,17 +1375,24 @@ impl Gx2 {
         let sampler_for = |this: &mut Gx2, unit: u32| -> wgpu::Sampler {
             let at = st.pixel_samplers.get(unit as usize).copied().unwrap_or(0);
             if at == 0 {
-                return this.d.device.create_sampler(&wgpu::SamplerDescriptor {
-                    mag_filter: wgpu::FilterMode::Linear,
-                    min_filter: wgpu::FilterMode::Linear,
-                    ..Default::default()
-                });
+                return this
+                    .caches
+                    .default_sampler
+                    .get_or_insert_with(|| {
+                        this.d.device.create_sampler(&wgpu::SamplerDescriptor {
+                            mag_filter: wgpu::FilterMode::Linear,
+                            min_filter: wgpu::FilterMode::Linear,
+                            ..Default::default()
+                        })
+                    })
+                    .clone();
             }
-            let d = crate::texture::Sampler::read(g, at);
-            let key = format!("{d:?}");
+            // the sampler is made from these three words only
+            let key = [g.u32(at), g.u32(at + 4), g.u32(at + 8)];
             if let Some(s) = this.caches.samplers.get(&key) {
                 return s.clone();
             }
+            let d = crate::texture::Sampler::read(g, at);
             let filter = |linear: bool| {
                 if linear {
                     wgpu::FilterMode::Linear
@@ -1260,61 +1419,36 @@ impl Gx2 {
             s
         };
         lap.mark("texture views");
-        let sampler_units: Vec<u32> = ps.interface.samplers.iter().copied().collect();
-        let sampler_list: Vec<(u32, wgpu::Sampler)> = sampler_units.iter().map(|s| (16 + s, sampler_for(self, *s))).collect();
-        let compare_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
-            compare: Some(wgpu::CompareFunction::LessEqual),
-            mag_filter: wgpu::FilterMode::Linear,
-            min_filter: wgpu::FilterMode::Linear,
-            ..Default::default()
-        });
+        let mut tex_entries: Vec<(u32, Bound)> = views.into_iter().map(|(r, v)| (r, Bound::View(v))).collect();
+        for &unit in &ps.interface.samplers {
+            tex_entries.push((16 + unit, Bound::Sampler(sampler_for(self, unit))));
+        }
+        if !ps.interface.compare_samplers.is_empty() {
+            let compare_sampler = self
+                .caches
+                .compare_sampler
+                .get_or_insert_with(|| {
+                    device.create_sampler(&wgpu::SamplerDescriptor {
+                        compare: Some(wgpu::CompareFunction::LessEqual),
+                        mag_filter: wgpu::FilterMode::Linear,
+                        min_filter: wgpu::FilterMode::Linear,
+                        ..Default::default()
+                    })
+                })
+                .clone();
+            for s in &ps.interface.compare_samplers {
+                tex_entries.push((32 + s, Bound::Sampler(compare_sampler.clone())));
+            }
+        }
         lap.mark("samplers");
-        let mut tex_entries: Vec<wgpu::BindGroupEntry> = Vec::new();
-        for (r, v) in &views {
-            tex_entries.push(wgpu::BindGroupEntry {
-                binding: *r,
-                resource: wgpu::BindingResource::TextureView(v),
-            });
-        }
-        for (binding, sampler) in &sampler_list {
-            tex_entries.push(wgpu::BindGroupEntry {
-                binding: *binding,
-                resource: wgpu::BindingResource::Sampler(sampler),
-            });
-        }
-        for s in &ps.interface.compare_samplers {
-            tex_entries.push(wgpu::BindGroupEntry {
-                binding: 32 + s,
-                resource: wgpu::BindingResource::Sampler(&compare_sampler),
-            });
-        }
-        let group2 = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: None,
-            layout: &entry.pipeline.get_bind_group_layout(2),
-            entries: &tex_entries,
-        });
+        // a snapshot is made for this draw only: its bind group is not kept
+        let group2 = self.bind_group(&entry.layouts[2], tex_entries, snapshots.is_empty());
         lap.mark("group 2");
-        let mut group3_entries = vec![
-            wgpu::BindGroupEntry {
-                binding: 0,
-                resource: va.binding(),
-            },
-            wgpu::BindGroupEntry {
-                binding: 1,
-                resource: meta_buffer.binding(),
-            },
-        ];
+        let mut group3_entries = vec![(0, va.bound()), (1, meta_buffer.bound())];
         if let Some(x) = &geo {
-            group3_entries.push(wgpu::BindGroupEntry {
-                binding: 2,
-                resource: x.ring_out.binding(),
-            });
+            group3_entries.push((2, x.ring_out.bound()));
         }
-        let group3 = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: None,
-            layout: &entry.pipeline.get_bind_group_layout(3),
-            entries: &group3_entries,
-        });
+        let group3 = self.bind_group(&entry.layouts[3], group3_entries, true);
         lap.mark("group 3");
         // the draws are recorded into one command buffer and one render pass for as long as they go to the same targets; the pass
         // and the buffer end at the next thing that is not such a draw (see `flush_draws`)
@@ -1339,8 +1473,8 @@ impl Gx2 {
         }
         if self.batch.key != Some(key) {
             self.end_pass();
-            let colour_view = self.targets[&image].texture.create_view(&Default::default());
-            let depth_view = use_depth.map(|(image, _)| self.caches.depth[&image].0.create_view(&Default::default()));
+            let colour_view = self.targets[&image].view.clone();
+            let depth_view = use_depth.map(|(image, _)| self.caches.depth[&image].view.clone());
             let enc = self
                 .batch
                 .enc
@@ -1418,6 +1552,11 @@ impl Gx2 {
 
     /// A part of an arena of at least `size` bytes (contents not defined).
     pub(crate) fn arena_alloc(&mut self, role: Role, size: u64) -> BufRef {
+        self.arena_place(role, size).0
+    }
+
+    /// The same, with which arena of the role it is in (none for a buffer too big to share).
+    fn arena_place(&mut self, role: Role, size: u64) -> (BufRef, Option<usize>) {
         let limits = self.d.device.limits();
         let align = u64::from(
             limits
@@ -1439,17 +1578,20 @@ impl Gx2 {
                 usage,
                 mapped_at_creation: false,
             });
-            return BufRef { buffer, offset: 0, size };
+            return (BufRef { buffer, offset: 0, size }, None);
         }
-        for a in &mut self.batch.arenas[role as usize] {
+        for (i, a) in self.batch.arenas[role as usize].iter_mut().enumerate() {
             let at = a.used.next_multiple_of(align);
             if at + size <= a.size {
                 a.used = at + size;
-                return BufRef {
-                    buffer: a.buffer.clone(),
-                    offset: at,
-                    size,
-                };
+                return (
+                    BufRef {
+                        buffer: a.buffer.clone(),
+                        offset: at,
+                        size,
+                    },
+                    Some(i),
+                );
             }
         }
         let buffer = self.d.device.create_buffer(&wgpu::BufferDescriptor {
@@ -1458,21 +1600,47 @@ impl Gx2 {
             usage,
             mapped_at_creation: false,
         });
-        self.batch.arenas[role as usize].push(Arena {
+        let arenas = &mut self.batch.arenas[role as usize];
+        arenas.push(Arena {
             buffer: buffer.clone(),
             size: ARENA_SIZE,
             used: size,
+            shadow: Vec::new(),
         });
-        BufRef { buffer, offset: 0, size }
+        (BufRef { buffer, offset: 0, size }, Some(arenas.len() - 1))
     }
 
-    /// The same, holding `data` (padded with zeros to `size` when that is more).
+    /// The same, holding `data` (padded with zeros to `size` when that is more). The bytes go to the arena's copy in memory, and the
+    /// arena is uploaded in one write when the batch is handed to the GPU (`flush_draws`), not one write per buffer.
     pub(crate) fn arena_write(&mut self, data: &[u8], size: u64) -> BufRef {
-        let r = self.arena_alloc(Role::Read, size.max(data.len() as u64));
-        if !data.is_empty() {
-            self.d.queue.write_buffer(&r.buffer, r.offset, data);
+        let (r, at) = self.arena_place(Role::Read, size.max(data.len() as u64));
+        match at {
+            Some(i) => {
+                let a = &mut self.batch.arenas[Role::Read as usize][i];
+                let (from, end) = (r.offset as usize, (r.offset + r.size) as usize);
+                if a.shadow.len() < end {
+                    a.shadow.resize(end, 0);
+                }
+                a.shadow[from..from + data.len()].copy_from_slice(data);
+                a.shadow[from + data.len()..end].fill(0);
+            }
+            None => {
+                if !data.is_empty() {
+                    self.d.queue.write_buffer(&r.buffer, r.offset, data);
+                }
+            }
         }
         r
+    }
+
+    /// Whether `r` (from `arena_write` in this batch) holds `bytes`.
+    fn arena_holds(&self, r: &BufRef, bytes: &[u8]) -> bool {
+        let from = r.offset as usize;
+        self.batch.arenas[Role::Read as usize]
+            .iter()
+            .find(|a| a.buffer == r.buffer)
+            .and_then(|a| a.shadow.get(from..from + bytes.len()))
+            .is_some_and(|held| held == bytes)
     }
 
     /// Ends the render pass the draws are recorded into (the command buffer stays open).
@@ -1485,6 +1653,18 @@ impl Gx2 {
     /// calls this first.
     pub(crate) fn flush_draws(&mut self) {
         self.end_pass();
+        // what the draws read, written into the arenas' copies, goes up first, one write per arena (the queue keeps writes before the
+        // commands submitted after them)
+        for a in &mut self.batch.arenas[Role::Read as usize] {
+            let used = a.used as usize;
+            if used > 0 {
+                if a.shadow.len() < used {
+                    a.shadow.resize(used, 0);
+                }
+                self.d.queue.write_buffer(&a.buffer, 0, &a.shadow[..used]);
+            }
+        }
+        self.caches.uniforms.clear();
         let mut work = Vec::new();
         if let Some(pre) = self.batch.pre.take() {
             work.push(pre.finish());
@@ -1607,6 +1787,8 @@ struct Arena {
     buffer: wgpu::Buffer,
     size: u64,
     used: u64,
+    /// For the arenas the shaders read: what is written into the buffer, kept here until the batch goes to the GPU.
+    shadow: Vec<u8>,
 }
 
 const ARENA_SIZE: u64 = 256 << 20;
@@ -1632,6 +1814,10 @@ pub(crate) struct BufRef {
 }
 
 impl BufRef {
+    pub(crate) fn bound(&self) -> Bound {
+        Bound::Buffer(self.buffer.clone(), self.offset, self.size)
+    }
+
     pub(crate) fn binding(&self) -> wgpu::BindingResource<'_> {
         wgpu::BindingResource::Buffer(wgpu::BufferBinding {
             buffer: &self.buffer,

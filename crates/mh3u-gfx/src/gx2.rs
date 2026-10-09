@@ -96,6 +96,8 @@ const TV: u32 = 1;
 pub(crate) struct Target {
     pub(crate) texture: wgpu::Texture,
     pub(crate) format: wgpu::TextureFormat,
+    /// The whole texture as one view, made with it (draws into it and samples of it use this).
+    pub(crate) view: wgpu::TextureView,
 }
 
 pub struct Gx2 {
@@ -292,7 +294,8 @@ impl Gx2 {
                     | wgpu::TextureUsages::COPY_DST,
                 view_formats: &[],
             });
-            self.targets.insert(image, Target { texture, format });
+            let view = texture.create_view(&Default::default());
+            self.targets.insert(image, Target { texture, format, view });
         }
         Some(image)
     }
@@ -349,7 +352,7 @@ impl Gx2 {
         self.flush_draws();
         let Some(image) = self.target(g, c.r[3]) else { return };
         let f = |n: usize| f64::from(f64::from_bits(c.f[n]) as f32);
-        let view = self.targets[&image].texture.create_view(&Default::default());
+        let view = self.targets[&image].view.clone();
         let mut enc = self.d.device.create_command_encoder(&Default::default());
         {
             let _pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -816,6 +819,7 @@ impl Gx2 {
                 self.present();
                 self.swaps += 1;
                 mh3u_rt::FRAMES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                self.prune();
                 if let Some((since, at)) = self.fps {
                     // the frame rate, swaps per second, every five seconds (for comparing builds)
                     let secs = since.elapsed().as_secs_f64();
