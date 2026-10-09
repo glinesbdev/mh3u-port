@@ -298,7 +298,21 @@ with their text and the cloth background, upright, in the right places (the hunt
     from the computed one, the vertex attribute formats with their swap mode, and once the `gx2` imports that do nothing here.
     `MH3U_GFX_DUMP_FRAME=<n>[,<n>...]` writes frame `n` (counting swaps) to `MH3U_GFX_DUMP_DIR` (`mh3u-frames` by default) as
     `frame-<n>/`: `draws.txt` (every draw's shaders, state, attributes, textures and whether it was drawn or why not),
-    `shaders/vs-*.txt` and `ps-*.txt` (listing and WGSL, or why not translated), `textures/*.png` and `tv.png`.
+    `shaders/vs-*.txt` and `ps-*.txt` (listing and WGSL, or why not translated), `textures/*.png` and `tv.png`. Each draw also lists
+    its sampler's settings, marks a texture that is a buffer drawn earlier in the frame (`[the colour buffer of draws a-b of this
+    frame]`), and shows its uniform blocks (the pixel shader's first 32 vec4s, the vertex shader's first 16, as floats and as hex
+    words); `targets.txt` is the frame's render-target chain (each image drawn into, by which draws, and which draws sampled it).
+  - **Pixel shader override**: `MH3U_GFX_DEBUG_PS=<mode>` replaces what pixel shaders put out (after the program, with no alpha test),
+    to tell apart where a wrong picture comes from; `MH3U_GFX_DEBUG_PS_ONLY=<hex addresses>` limits it to those shaders. Modes:
+    `white` (the geometry: what is covered), `alpha1` (the program's colour made opaque: a picture that appears means the alpha was
+    0 and blending hid it), `tex` (the first ordinary texture lookup's texels: black means the texture or its binding), `uv` (that
+    lookup's coordinates as red/green, `fract`ed: flat colour means the coordinates are wrong), `inputN` (input register N as it
+    arrives from the vertex shader, e.g. `input1` the vertex colour of many shaders: black means the vertex stream or the vertex
+    shader) and `normalN`/`normals` (the same mapped from -1..1). Magenta: the shader has no such lookup or input.
+  - **Shadow maps drawn as colour**: a buffer drawn into as colour (the village's 1024x1024 `r32f`) and read with a comparison
+    (`SAMPLE_C`) is copied into a depth texture (first component, clamped to 0..1) when it has changed since the last copy, and the
+    comparison is the sampler's own (`GX2InitSamplerDepthCompare`; less or equal when none was set). Before, such a lookup read a
+    1x1 depth stand-in.
 
 **Not done yet:** the rest of the sampler state (borders, the mip bias), separate stencil masks and depth bias for back faces, other
 geometry inputs (lines, triangles, instances), rects and other primitive types, stream out, a viewport larger than its target (it is

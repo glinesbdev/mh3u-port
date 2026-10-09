@@ -84,6 +84,54 @@ pub struct Context<'a> {
     /// The alpha test (a pixel shader only): the comparison (`GX2CompareFunction`, 0 never to 7 always) and the reference value. A
     /// pixel whose first colour output fails it is discarded.
     pub alpha_test: Option<(u32, f32)>,
+    /// A debugging override of what a pixel shader puts out (`MH3U_GFX_DEBUG_PS`); `DebugPs::Off` translates the program as it is.
+    pub debug: DebugPs,
+}
+
+/// What a pixel shader puts out instead of its first colour, to tell apart where a wrong picture comes from: the geometry (`White`),
+/// the blending of a transparent output (`Alpha1`), the first texture's coordinates (`Uv`) or texels (`Tex`), and the interpolated
+/// inputs from the vertex shader (`Input`). All but `Off` and `Alpha1` give an opaque colour and drop the alpha test.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum DebugPs {
+    #[default]
+    Off,
+    White,
+    /// The program's colour with alpha 1 (no alpha test).
+    Alpha1,
+    /// The colour of the program's first ordinary texture lookup, as read (magenta when it has none).
+    Tex,
+    /// The fractional part of that lookup's first two coordinates as red and green (magenta when it has none).
+    Uv,
+    /// The pixel shader's input register `n` (0 is the first interpolated value, R0), as it arrives; with `Signed` its components
+    /// are mapped from -1..1 to 0..1 (for normals).
+    Input {
+        n: u32,
+        signed: bool,
+    },
+}
+
+impl DebugPs {
+    /// The value of `MH3U_GFX_DEBUG_PS`: `white`, `alpha1`, `tex` (or `tex0`), `uv`, `inputN` and `normalN` (input N, signed), or
+    /// `normals` (input 1, signed). Anything else is `Off`.
+    pub fn parse(text: &str) -> DebugPs {
+        let t = text.trim().to_ascii_lowercase();
+        match t.as_str() {
+            "white" => DebugPs::White,
+            "alpha1" | "opaque" => DebugPs::Alpha1,
+            "tex" | "tex0" => DebugPs::Tex,
+            "uv" => DebugPs::Uv,
+            "normals" => DebugPs::Input { n: 1, signed: true },
+            _ => {
+                if let Some(n) = t.strip_prefix("input").and_then(|n| n.parse().ok()) {
+                    DebugPs::Input { n, signed: false }
+                } else if let Some(n) = t.strip_prefix("normal").and_then(|n| n.parse().ok()) {
+                    DebugPs::Input { n, signed: true }
+                } else {
+                    DebugPs::Off
+                }
+            }
+        }
+    }
 }
 
 /// The component selectors that change nothing.
@@ -105,6 +153,7 @@ impl<'a> Context<'a> {
             texture_select: &identity_select,
             loop_const: &no_loop_const,
             alpha_test: None,
+            debug: DebugPs::Off,
         }
     }
 }
@@ -147,6 +196,8 @@ struct Gen<'a> {
     loops: Vec<LoopFrame>,
     next_loop: u32,
     next_clause: u32,
+    /// Whether the first ordinary texture lookup has been kept for `DebugPs::Tex`/`Uv`.
+    debug_tex: bool,
 }
 
 const HEADER: &str = "diagnostic(off, derivative_uniformity);
@@ -696,6 +747,7 @@ fn translate(
         loops: Vec::new(),
         next_loop: 0,
         next_clause: 0,
+        debug_tex: false,
     };
     // a program that picks registers by an index has them as an array (only those: separate variables are faster)
     g.gpr_array = decoded.cf.iter().any(|c| match c {
@@ -1037,6 +1089,9 @@ fn declare_gpr(m: &mut String, g: &Gen, n: u32, init: &str) {
 /// The alpha test as a line of the pixel shader: a pixel whose first colour's alpha fails the comparison with the reference is not
 /// drawn. `None` when there is no test (or it always passes, or there is no first colour).
 fn alpha_test_line(g: &Gen) -> Option<String> {
+    if g.ctx.debug != DebugPs::Off {
+        return None;
+    }
     let (func, reference) = g.ctx.alpha_test?;
     if !g.iface.colour_outputs.contains(&0) {
         return None;
@@ -1055,6 +1110,31 @@ fn alpha_test_line(g: &Gen) -> Option<String> {
         "    if (!(out_0.w {op} {})) {{ discard; }}\n",
         literal(reference.to_bits())
     ))
+}
+
+/// The line that replaces the first colour for `DebugPs` (after the program, before the alpha test).
+fn debug_line(g: &Gen, inputs: &PixelInputs) -> Option<String> {
+    if !g.iface.colour_outputs.contains(&0) {
+        return None;
+    }
+    Some(match g.ctx.debug {
+        DebugPs::Off => return None,
+        DebugPs::White => "    out_0 = vec4<f32>(1.0);\n".into(),
+        DebugPs::Alpha1 => "    out_0.w = 1.0;\n".into(),
+        DebugPs::Tex => "    out_0 = vec4<f32>(debug_tex.xyz, 1.0);\n".into(),
+        DebugPs::Uv => "    out_0 = select(vec4<f32>(1.0, 0.0, 1.0, 1.0), vec4<f32>(fract(debug_uv), 0.0, 1.0), debug_have);\n".into(),
+        DebugPs::Input { n, signed } => {
+            let fed = n < inputs.count && inputs.locations.get(n as usize).copied().unwrap_or(n) != u32::MAX;
+            if !fed {
+                // no such input: magenta
+                "    out_0 = vec4<f32>(1.0, 0.0, 1.0, 1.0);\n".into()
+            } else if signed {
+                format!("    out_0 = vec4<f32>(in.i{n}.xyz * 0.5 + 0.5, 1.0);\n")
+            } else {
+                format!("    out_0 = vec4<f32>(in.i{n}.xyz, 1.0);\n")
+            }
+        }
+    })
 }
 
 fn assemble_pixel(m: &mut String, g: &Gen, inputs: &PixelInputs) {
@@ -1094,6 +1174,9 @@ fn assemble_pixel(m: &mut String, g: &Gen, inputs: &PixelInputs) {
         declare_gpr(m, g, n, &init);
     }
     m.push_str("    var pv = vec4<f32>(0.0);\n    var ps = 0.0;\n    var live = true;\n    var stack: array<bool, 16>;\n    var sp = 0;\n");
+    if matches!(g.ctx.debug, DebugPs::Tex | DebugPs::Uv) {
+        m.push_str("    var debug_tex = vec4<f32>(1.0, 0.0, 1.0, 1.0);\n    var debug_uv = vec2<f32>(0.0);\n    var debug_have = false;\n");
+    }
     for t in &g.iface.colour_outputs {
         let _ = writeln!(m, "    var out_{t} = vec4<f32>(0.0);");
     }
@@ -1101,6 +1184,9 @@ fn assemble_pixel(m: &mut String, g: &Gen, inputs: &PixelInputs) {
         m.push_str("    var out_z = 0.0;\n");
     }
     m.push_str(&g.out);
+    if let Some(line) = debug_line(g, inputs) {
+        m.push_str(&line);
+    }
     if let Some(test) = alpha_test_line(g) {
         m.push_str(&test);
     }
@@ -1307,6 +1393,16 @@ impl Gen<'_> {
             let v = format!("vec4<f32>({}, {}, {}, {})", pick(24), pick(16), pick(8), pick(0));
             self.line(2, &format!("let s = {v};"));
         }
+        if !compare && !self.debug_tex && matches!(self.ctx.debug, DebugPs::Tex | DebugPs::Uv) {
+            self.debug_tex = true;
+            self.line(
+                2,
+                &format!(
+                    "debug_tex = s; debug_uv = vec2<f32>({}, {}); debug_have = true;",
+                    coords[0], coords[1]
+                ),
+            );
+        }
         let dst = self.fetch_gpr(f.dst_gpr, f.dst_relative);
         for (k, &d) in f.dst_sel.iter().enumerate() {
             let value = match d {
@@ -1512,6 +1608,66 @@ mod tests {
         assert!(t.wgsl.contains("al = 2;"), "{}", t.wgsl);
         assert!(t.wgsl.contains("trips0 >= 5u"), "{}", t.wgsl);
         assert!(t.wgsl.contains("al = al + -1;"), "{}", t.wgsl);
+    }
+
+    /// A pixel shader that reads texture 1 at r1.xy and exports what it read as colour 0.
+    fn textured() -> Vec<u8> {
+        words(&[
+            // TEX clause at slot 2 (word 4), one fetch
+            2,
+            1 << 23,
+            // export colour 0 from r0 (x, y, z, w): end of program
+            0,
+            (0x28 << 23) | (1 << 21) | (3 << 9) | (2 << 6) | (1 << 3),
+            // SAMPLE, resource 1, from r1; to r0.xyzw; sampler 1, coordinates r1.x, r1.y, 0, 0
+            0x10 | (1 << 8) | (1 << 16),
+            (1 << 12) | (2 << 15) | (3 << 18),
+            (1 << 15) | (1 << 23) | (4 << 26) | (4 << 29),
+            0,
+        ])
+    }
+
+    #[test]
+    fn debug_overrides_replace_the_first_colour() {
+        let d = decode(&textured()).unwrap();
+        let inputs = PixelInputs {
+            count: 2,
+            flat: vec![],
+            locations: vec![],
+        };
+        let mut ctx = Context::new(&|_| TexKind::D2);
+        ctx.alpha_test = Some((4, 0.0));
+        let plain = translate_pixel(&d, &inputs, &ctx).unwrap();
+        valid(&plain.wgsl);
+        assert!(
+            plain.wgsl.contains("textureSample(tex1, smp1, vec2<f32>(r1.x, r1.y))"),
+            "{}",
+            plain.wgsl
+        );
+        assert!(!plain.wgsl.contains("debug"));
+        for (mode, wanted) in [
+            ("white", "out_0 = vec4<f32>(1.0);"),
+            ("alpha1", "out_0.w = 1.0;"),
+            ("tex0", "out_0 = vec4<f32>(debug_tex.xyz, 1.0);"),
+            ("uv", "fract(debug_uv)"),
+            ("input1", "out_0 = vec4<f32>(in.i1.xyz, 1.0);"),
+            ("normals", "in.i1.xyz * 0.5 + 0.5"),
+            ("input7", "out_0 = vec4<f32>(1.0, 0.0, 1.0, 1.0);"),
+        ] {
+            ctx.debug = DebugPs::parse(mode);
+            assert_ne!(ctx.debug, DebugPs::Off, "{mode}");
+            let t = translate_pixel(&d, &inputs, &ctx).unwrap();
+            valid(&t.wgsl);
+            assert!(t.wgsl.contains(wanted), "{mode}: {}", t.wgsl);
+            // the override comes after the program and no alpha test can hide what it shows
+            assert!(!t.wgsl.contains("discard"), "{mode}: {}", t.wgsl);
+        }
+        ctx.debug = DebugPs::Tex;
+        let t = translate_pixel(&d, &inputs, &ctx).unwrap();
+        assert!(t.wgsl.contains("debug_tex = s; debug_uv = vec2<f32>(r1.x, r1.y);"), "{}", t.wgsl);
+        assert_eq!(DebugPs::parse("nonsense"), DebugPs::Off);
+        assert_eq!(DebugPs::parse(" TEX "), DebugPs::Tex);
+        assert_eq!(DebugPs::parse("normal3"), DebugPs::Input { n: 3, signed: true });
     }
 
     #[test]

@@ -173,6 +173,17 @@ memory; `GX2CalcFetchShaderSizeEx` returned nothing to its caller the same way. 
 in an object) now run when they are made, recording or not, and `GX2InitFetchShaderEx` writes only the 0x20 bytes of the
 `GX2FetchShader` (it wrote 0x28).
 
+**3g. The village's black scenery (run 5).** With the fetch shaders right, the scenery has its shape but is black while the
+characters, particles and sky are right. The scenery's pixel shaders (`ps-17101480`, `ps-1724c040`; draws 228/229 of run 4's frame
+4800) are `vertex colour x texture 1`, fogged with a table read from uniform block 5 by index, with alpha = vertex alpha x texture
+alpha x a material byte from block 1; `ps-17101480` adds four shadow lookups (`SAMPLE_C`) of texture 5, the shadow pass's
+`r32f` colour buffer `0xf561e800`. Two things were clearly wrong and are fixed: that colour buffer was read through a 1x1 depth
+stand-in (a colour buffer is not a depth texture), and every comparison was "less or equal" whatever the sampler said. The cause of
+the black is not settled from the dumps on hand (run 5's frame dump was byte-identical to run 4's): the characters use the same
+fog table and shadow lookups and are right, which leaves the scenery's own inputs (vertex colour/alpha through the vertex shader's
+`INT_TO_FLT` path, texture 1, block 1's packed material bytes). `MH3U_GFX_DEBUG_PS` and the per-draw uniform blocks are there to
+settle it in one run.
+
 ## 4. Does the generated code compile in a reasonable time? (done: as C yes, as one Rust crate no)
 
 `mh3u-tools codegen-bench <dump> <out> --lang rust|c --functions N` translates an even sample of the game's functions (found as the

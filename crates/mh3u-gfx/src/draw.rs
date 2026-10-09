@@ -43,6 +43,32 @@ impl AttribStream {
     }
 }
 
+/// The debugging override of pixel shaders (`MH3U_GFX_DEBUG_PS`, see `DebugPs::parse`), for every pixel shader or, with
+/// `MH3U_GFX_DEBUG_PS_ONLY` (addresses in hex, comma-separated, as in `draws.txt`), only for those.
+fn debug_ps(ps: u32) -> mh3u_latte::translate::DebugPs {
+    static SETTING: std::sync::OnceLock<(mh3u_latte::translate::DebugPs, Option<Vec<u32>>)> = std::sync::OnceLock::new();
+    let (mode, only) = SETTING.get_or_init(|| {
+        let mode = std::env::var("MH3U_GFX_DEBUG_PS").map_or(Default::default(), |v| mh3u_latte::translate::DebugPs::parse(&v));
+        let only = std::env::var("MH3U_GFX_DEBUG_PS_ONLY").ok().map(|v| parse_addresses(&v));
+        (mode, only)
+    });
+    match only {
+        Some(list) if !list.contains(&ps) => Default::default(),
+        _ => *mode,
+    }
+}
+
+/// Addresses written in hex (with or without `0x`), separated by commas or spaces; what does not read as one is left out.
+pub(crate) fn parse_addresses(text: &str) -> Vec<u32> {
+    text.split([',', ' ', ';'])
+        .filter_map(|t| {
+            let t = t.trim();
+            let t = t.strip_prefix("0x").or_else(|| t.strip_prefix("0X")).unwrap_or(t);
+            (!t.is_empty()).then(|| u32::from_str_radix(t, 16).ok()).flatten()
+        })
+        .collect()
+}
+
 pub struct Compiled {
     pub module: wgpu::ShaderModule,
     pub interface: Interface,
@@ -205,7 +231,15 @@ pub struct DrawCaches {
     /// Samplers by the three words of the `GX2Sampler` they were made from, and the two that are not the game's.
     pub samplers: HashMap<[u32; 3], wgpu::Sampler>,
     pub default_sampler: Option<wgpu::Sampler>,
-    pub compare_sampler: Option<wgpu::Sampler>,
+    /// Comparison samplers by their `GX2CompareFunction` (15 when the game set none: less or equal).
+    pub compare_samplers: HashMap<u32, wgpu::Sampler>,
+    /// How many times each colour buffer (by image) has been drawn into, cleared or copied to: a copy made of it is stale when this
+    /// has moved on.
+    pub target_version: HashMap<u32, u64>,
+    /// Colour buffers a shader reads with a comparison (a shadow map drawn as `r32f` colour), copied into depth textures, with the
+    /// `target_version` they were copied at.
+    pub depth_copies: HashMap<u32, (wgpu::Texture, wgpu::TextureView, u64)>,
+    pub depth_copy_pipeline: Option<(wgpu::RenderPipeline, wgpu::BindGroupLayout)>,
     /// Bind groups by what they bind, with the swap they were last used in.
     pub bind_groups: HashMap<GroupKey, (wgpu::BindGroup, u32)>,
     /// The uniform blocks uploaded, by (address, vec4s, bytes read): the guest bytes of each upload of the current batch, so a draw
@@ -592,6 +626,79 @@ fn stencil_face(f: [u32; 4]) -> wgpu::StencilFaceState {
     }
 }
 
+/// The program that writes a colour texture's first component as depth: one triangle over the target.
+pub(crate) const DEPTH_COPY_WGSL: &str = "
+@group(0) @binding(0) var src: texture_2d<f32>;
+@vertex fn vs(@builtin(vertex_index) i: u32) -> @builtin(position) vec4<f32> {
+    let p = vec2<f32>(f32((i << 1u) & 2u), f32(i & 2u));
+    return vec4<f32>(p * 2.0 - 1.0, 0.0, 1.0);
+}
+struct DepthOut { @builtin(frag_depth) z: f32 }
+@fragment fn fs(@builtin(position) at: vec4<f32>) -> DepthOut {
+    var o: DepthOut;
+    o.z = clamp(textureLoad(src, vec2<i32>(at.xy), 0).x, 0.0, 1.0);
+    return o;
+}
+";
+
+fn depth_copy_pipeline(device: &wgpu::Device) -> (wgpu::RenderPipeline, wgpu::BindGroupLayout) {
+    let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("depth copy"),
+        source: wgpu::ShaderSource::Wgsl(DEPTH_COPY_WGSL.into()),
+    });
+    let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("depth copy"),
+        entries: &[wgpu::BindGroupLayoutEntry {
+            binding: 0,
+            visibility: wgpu::ShaderStages::FRAGMENT,
+            ty: wgpu::BindingType::Texture {
+                sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                view_dimension: wgpu::TextureViewDimension::D2,
+                multisampled: false,
+            },
+            count: None,
+        }],
+    });
+    let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("depth copy"),
+        bind_group_layouts: &[Some(&layout)],
+        immediate_size: 0,
+    });
+    let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("depth copy"),
+        layout: Some(&pipeline_layout),
+        vertex: wgpu::VertexState {
+            module: &module,
+            entry_point: Some("vs"),
+            compilation_options: Default::default(),
+            buffers: &[],
+        },
+        primitive: wgpu::PrimitiveState::default(),
+        depth_stencil: Some(wgpu::DepthStencilState {
+            format: wgpu::TextureFormat::Depth32Float,
+            depth_write_enabled: Some(true),
+            depth_compare: Some(wgpu::CompareFunction::Always),
+            stencil: Default::default(),
+            bias: Default::default(),
+        }),
+        multisample: Default::default(),
+        fragment: Some(wgpu::FragmentState {
+            module: &module,
+            entry_point: Some("fs"),
+            compilation_options: Default::default(),
+            targets: &[],
+        }),
+        multiview_mask: None,
+        cache: None,
+    });
+    (pipeline, layout)
+}
+
+/// The comparison of a shadow lookup's sampler: the sampler's own (`GX2CompareFunction`), or less or equal when it has none (15).
+fn compare_sampler_function(f: u32) -> wgpu::CompareFunction {
+    if f > 7 { wgpu::CompareFunction::LessEqual } else { compare(f) }
+}
+
 fn compare(f: u32) -> wgpu::CompareFunction {
     use wgpu::CompareFunction as C;
     match f {
@@ -809,6 +916,7 @@ impl Gx2 {
             ctx.texture_select = &select;
             ctx.loop_const = &loop_const;
             ctx.alpha_test = (alpha.0 != 7).then_some((alpha.0, f32::from_bits(alpha.1)));
+            ctx.debug = debug_ps(ps);
             translate_pixel(&decoded, &inputs, &ctx)
         })();
         self.keep_shader_text(
@@ -1019,6 +1127,94 @@ impl Gx2 {
             }
         }
         Lap::count("textures invalidated", marked);
+    }
+
+    /// The depth texture a colour buffer is copied into to be read with a comparison (made once, at the colour buffer's size).
+    fn depth_copy_view(&mut self, image: u32) -> wgpu::TextureView {
+        if let Some((_, view, _)) = self.caches.depth_copies.get(&image) {
+            return view.clone();
+        }
+        let (width, height) = {
+            let t = &self.targets[&image].texture;
+            (t.width(), t.height())
+        };
+        let texture = self.d.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("depth copy of a colour buffer"),
+            size: wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Depth32Float,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[],
+        });
+        let view = texture.create_view(&Default::default());
+        // u64::MAX: never copied yet
+        self.caches.depth_copies.insert(image, (texture, view.clone(), u64::MAX));
+        view
+    }
+
+    /// Copies the colour buffer's first component into its depth copy (clamped to 0..1), unless it has not changed since the last
+    /// copy. Recorded in the batch's encoder, outside any pass, before the draw that reads it.
+    fn refresh_depth_copy(&mut self, image: u32) {
+        let version = self.caches.target_version.get(&image).copied().unwrap_or(0);
+        let Some((texture, _, made)) = self.caches.depth_copies.get(&image) else {
+            return;
+        };
+        if *made == version {
+            return;
+        }
+        let depth_view = texture.create_view(&Default::default());
+        let Some(source) = self.targets.get(&image).map(|t| t.view.clone()) else {
+            return;
+        };
+        let device = self.d.device.clone();
+        let (pipeline, layout) = self
+            .caches
+            .depth_copy_pipeline
+            .get_or_insert_with(|| depth_copy_pipeline(&device))
+            .clone();
+        let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("depth copy"),
+            layout: &layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::TextureView(&source),
+            }],
+        });
+        self.end_pass();
+        let enc = self
+            .batch
+            .enc
+            .get_or_insert_with(|| device.create_command_encoder(&Default::default()));
+        {
+            let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("depth copy"),
+                color_attachments: &[],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: &depth_view,
+                    depth_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(1.0),
+                        store: wgpu::StoreOp::Store,
+                    }),
+                    stencil_ops: None,
+                }),
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            pass.set_pipeline(&pipeline);
+            pass.set_bind_group(0, &group, &[]);
+            pass.draw(0..3, 0..1);
+        }
+        if let Some(entry) = self.caches.depth_copies.get_mut(&image) {
+            entry.2 = version;
+        }
+        crate::draw::Lap::count("colour buffers copied for a comparison", 1);
     }
 
     fn fallback_texture(&mut self, kind: TexKind) -> wgpu::TextureView {
@@ -1628,6 +1824,7 @@ impl Gx2 {
             return;
         };
         *self.caches.drawn_into.entry(image).or_default() += 1;
+        *self.caches.target_version.entry(image).or_default() += 1;
         let (target_w, target_h, target_format) = {
             let t = &self.targets[&image];
             (t.texture.width(), t.texture.height(), t.format)
@@ -1904,6 +2101,7 @@ impl Gx2 {
         // textures: white stand-ins until the real ones are decoded
         let draw_image = image;
         let mut snapshots: Vec<(wgpu::Texture, wgpu::Texture)> = Vec::new();
+        let mut depth_reads: Vec<u32> = Vec::new();
         let views: Vec<(u32, wgpu::TextureView)> = ps
             .interface
             .textures
@@ -1942,6 +2140,11 @@ impl Gx2 {
                     && let Some(depth) = self.caches.depth.get(&image)
                 {
                     return (r, depth.sample_view.clone());
+                }
+                // a colour buffer read with a comparison (the village's shadow map is drawn as r32f colour): a depth copy of it
+                if k == TexKind::Depth2d && image != draw_image && self.targets.contains_key(&image) {
+                    depth_reads.push(image);
+                    return (r, self.depth_copy_view(image));
                 }
                 if t != 0
                     && k != TexKind::Depth2d
@@ -2003,22 +2206,28 @@ impl Gx2 {
         for &unit in &ps.interface.samplers {
             tex_entries.push((16 + unit, Bound::Sampler(sampler_for(self, unit))));
         }
-        if !ps.interface.compare_samplers.is_empty() {
-            let compare_sampler = self
+        for &unit in &ps.interface.compare_samplers {
+            // the comparison the game gave the sampler (`GX2InitSamplerDepthCompare`), less or equal when it gave none
+            let at = st.pixel_samplers.get(unit as usize).copied().unwrap_or(0);
+            let func = if at == 0 {
+                15
+            } else {
+                crate::texture::Sampler::read(g, at).compare.unwrap_or(15)
+            };
+            let sampler = self
                 .caches
-                .compare_sampler
-                .get_or_insert_with(|| {
+                .compare_samplers
+                .entry(func)
+                .or_insert_with(|| {
                     device.create_sampler(&wgpu::SamplerDescriptor {
-                        compare: Some(wgpu::CompareFunction::LessEqual),
+                        compare: Some(compare_sampler_function(func)),
                         mag_filter: wgpu::FilterMode::Linear,
                         min_filter: wgpu::FilterMode::Linear,
                         ..Default::default()
                     })
                 })
                 .clone();
-            for s in &ps.interface.compare_samplers {
-                tex_entries.push((32 + s, Bound::Sampler(compare_sampler.clone())));
-            }
+            tex_entries.push((32 + unit, Bound::Sampler(sampler)));
         }
         lap.mark("samplers");
         // a snapshot is made for this draw only: its bind group is not kept
@@ -2050,6 +2259,9 @@ impl Gx2 {
                     },
                 );
             }
+        }
+        for image in depth_reads {
+            self.refresh_depth_copy(image);
         }
         if self.batch.key != Some(key) {
             self.end_pass();
@@ -2691,6 +2903,55 @@ mod tests {
                 "block at {address:#x}, {size} bytes, {vec4s} vec4"
             );
         }
+    }
+
+    #[test]
+    fn a_shadow_map_drawn_as_colour_is_copied_into_depth_once_per_change() {
+        let mut gx2 = Gx2::new(crate::Display::noop());
+        // the copy's program and pipeline are valid (wgpu would panic on a validation error)
+        let _ = depth_copy_pipeline(&gx2.d.device);
+        let image = 0xf561_e800;
+        let texture = gx2.d.device.create_texture(&wgpu::TextureDescriptor {
+            label: None,
+            size: wgpu::Extent3d {
+                width: 16,
+                height: 16,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::R32Float,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[],
+        });
+        let view = texture.create_view(&Default::default());
+        gx2.targets.insert(
+            image,
+            crate::gx2::Target {
+                texture,
+                format: wgpu::TextureFormat::R32Float,
+                view,
+            },
+        );
+        let _ = gx2.depth_copy_view(image);
+        assert_eq!(gx2.caches.depth_copies[&image].2, u64::MAX);
+        gx2.refresh_depth_copy(image);
+        assert_eq!(gx2.caches.depth_copies[&image].2, 0);
+        assert_eq!(gx2.caches.depth_copies[&image].0.format(), wgpu::TextureFormat::Depth32Float);
+        // drawn into again: copied again
+        *gx2.caches.target_version.entry(image).or_default() += 1;
+        gx2.refresh_depth_copy(image);
+        assert_eq!(gx2.caches.depth_copies[&image].2, 1);
+        gx2.end_pass();
+    }
+
+    #[test]
+    fn shadow_samplers_use_the_games_comparison() {
+        assert_eq!(compare_sampler_function(15), wgpu::CompareFunction::LessEqual);
+        assert_eq!(compare_sampler_function(4), wgpu::CompareFunction::Greater);
+        assert_eq!(compare_sampler_function(1), wgpu::CompareFunction::Less);
+        assert_eq!(parse_addresses("0x17101480, 1724c040 ;zz,0X10"), [0x1710_1480, 0x1724_c040, 0x10]);
     }
 
     #[test]

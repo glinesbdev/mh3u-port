@@ -57,8 +57,49 @@ pub(crate) struct Diagnostics {
     pub shader_texts: HashMap<String, String>,
     written_shaders: HashSet<String>,
     written_textures: HashSet<u32>,
+    /// The render-target chain of the frame being written: each image drawn into (colour or depth) with the first and last draw
+    /// that did, and each image a draw sampled with the draws that did.
+    targets_written: BTreeMap<u32, (u32, u32, &'static str)>,
+    targets_sampled: BTreeMap<u32, Vec<u32>>,
     /// The folder of the frame just finished (its TV picture is written there).
     pub finished_dir: Option<PathBuf>,
+}
+
+/// Draw numbers, with runs shortened (`3-7, 9`).
+fn list_text(n: &[u32]) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    let mut i = 0;
+    while i < n.len() {
+        let mut j = i;
+        while j + 1 < n.len() && n[j + 1] == n[j] + 1 {
+            j += 1;
+        }
+        parts.push(if i == j { n[i].to_string() } else { format!("{}-{}", n[i], n[j]) });
+        i = j + 1;
+    }
+    parts.join(", ")
+}
+
+/// One uniform block of a draw: where it is, and its first `most` vec4s as floats with their words in hex (games pack integers and
+/// colours into them).
+fn block_text(g: &Guest, stage: &str, index: usize, b: &crate::state::UniformBlock, most: u32) -> String {
+    let mut t = String::new();
+    let vec4s = (b.size / 16).min(most);
+    let _ = writeln!(
+        t,
+        "  {stage} uniform block {index}: address {:#x} size {} (first {vec4s} vec4s)",
+        b.address, b.size
+    );
+    for k in 0..vec4s {
+        let w: Vec<u32> = (0..4).map(|c| g.u32(b.address + 16 * k + 4 * c)).collect();
+        let f: Vec<String> = w.iter().map(|&x| format!("{:.4}", f32::from_bits(x))).collect();
+        let _ = writeln!(
+            t,
+            "    [{k}] {} {} {} {} | {:08x} {:08x} {:08x} {:08x}",
+            f[0], f[1], f[2], f[3], w[0], w[1], w[2], w[3]
+        );
+    }
+    t
 }
 
 impl Diagnostics {
@@ -260,6 +301,7 @@ impl Diagnostics {
         let finished = was.then(|| self.dump_dir.clone());
         if let Some(dir) = &finished {
             let _ = std::fs::write(dir.join("draws.txt"), &self.draws_text);
+            let _ = std::fs::write(dir.join("targets.txt"), self.target_chain());
             eprintln!(
                 "[gfx] wrote a frame: {} draws, {} shaders, {} textures, in {}",
                 self.draw_index,
@@ -277,6 +319,8 @@ impl Diagnostics {
             let _ = std::fs::create_dir_all(self.dump_dir.join("shaders"));
             let _ = std::fs::create_dir_all(self.dump_dir.join("textures"));
             self.draws_text.clear();
+            self.targets_written.clear();
+            self.targets_sampled.clear();
             self.draw_index = 0;
             eprintln!("[gfx] writing frame {frame} to {}", self.dump_dir.display());
         }
@@ -340,6 +384,12 @@ impl Diagnostics {
             }
         };
         let _ = writeln!(t, "  colour buffer 0: {}; depth buffer: {}", surface(cb), surface(st.depth_buffer));
+        for (s, kind) in [(cb, "colour"), (st.depth_buffer, "depth")] {
+            if s != 0 && !outcome.starts_with("SKIPPED") {
+                let e = self.targets_written.entry(g.u32(s + 0x24)).or_insert((n, n, kind));
+                e.1 = n;
+            }
+        }
         let _ = writeln!(t, "  viewport {:?}, scissor {:?}, half z {}", st.viewport, st.scissor, st.half_z);
         let _ = writeln!(
             t,
@@ -388,15 +438,56 @@ impl Diagnostics {
             }
             let h = Header::read(g, tex);
             let file = self.write_texture(g, &h);
+            let target = match self.targets_written.get(&h.image) {
+                Some(&(a, b, kind)) => format!(" [the {kind} buffer of draws {a}-{b} of this frame]"),
+                None => String::new(),
+            };
+            let sampled = self.targets_sampled.entry(h.image).or_default();
+            if sampled.last() != Some(&n) {
+                sampled.push(n);
+            }
+            let sampler = st.pixel_samplers[unit];
+            let sampler_text = if sampler == 0 {
+                String::new()
+            } else {
+                format!(" {:?}", crate::texture::Sampler::read(g, sampler))
+            };
             let _ = writeln!(
                 t,
-                "  texture {unit}: {}, selectors {}, sampler {:#x} -> {file}",
+                "  texture {unit}: {}, selectors {}, sampler {sampler:#x}{sampler_text} -> {file}{target}",
                 header_text(&h),
                 select_text(g.u32(tex + 0x84) & 0x0707_0707),
-                st.pixel_samplers[unit]
             );
         }
+        // the uniform blocks: the pixel shader's in full up to 32 vec4s, the vertex shader's first 16
+        for (stage, blocks, most) in [("pixel", &st.pixel_blocks, 32), ("vertex", &st.vertex_blocks, 16)] {
+            for (i, b) in blocks.iter().enumerate() {
+                if b.address != 0 {
+                    t.push_str(&block_text(g, stage, i, b, most));
+                }
+            }
+        }
         self.draws_text.push_str(&t);
+    }
+
+    /// `targets.txt`: every image drawn into in the frame, by which draws, and which draws then sampled it (a pass that reads a
+    /// target before it is drawn in this frame reads the last frame's, or what the CPU wrote).
+    fn target_chain(&self) -> String {
+        let mut t = String::new();
+        for (image, &(a, b, kind)) in &self.targets_written {
+            let readers = self.targets_sampled.get(image).map_or(String::new(), |r| list_text(r));
+            let _ = writeln!(t, "image {image:#x}: {kind} buffer of draws {a}-{b}; sampled by draws [{readers}]");
+        }
+        for (image, readers) in &self.targets_sampled {
+            if !self.targets_written.contains_key(image) {
+                let _ = writeln!(
+                    t,
+                    "image {image:#x}: not drawn into this frame; sampled by draws [{}]",
+                    list_text(readers)
+                );
+            }
+        }
+        t
     }
 
     fn write_texture(&mut self, g: &Guest, h: &Header) -> String {
@@ -726,6 +817,28 @@ pub(crate) fn png(w: u32, h: u32, rgba: &[u8]) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn draw_lists_shorten_runs_and_blocks_show_floats_and_words() {
+        assert_eq!(list_text(&[1, 2, 3, 5, 7, 8]), "1-3, 5, 7-8");
+        assert_eq!(list_text(&[]), "");
+        let mut m = vec![0u8; 0x400];
+        let g = Guest::new(m.as_mut_ptr());
+        g.put_u32(0x100, 1.0f32.to_bits());
+        g.put_u32(0x10c, 0xff80_4020);
+        let b = crate::state::UniformBlock {
+            address: 0x100,
+            size: 0x1000,
+        };
+        let t = block_text(&g, "pixel", 1, &b, 2);
+        assert!(
+            t.starts_with("  pixel uniform block 1: address 0x100 size 4096 (first 2 vec4s)"),
+            "{t}"
+        );
+        assert!(t.contains("[0] 1.0000 0.0000 0.0000"), "{t}");
+        assert!(t.contains("3f800000 00000000 00000000 ff804020"), "{t}");
+        assert_eq!(t.lines().count(), 3);
+    }
 
     #[test]
     fn a_png_has_the_signature_and_the_right_checksums() {

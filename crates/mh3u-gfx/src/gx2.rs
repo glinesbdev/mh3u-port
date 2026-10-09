@@ -348,6 +348,8 @@ impl Gx2 {
             ));
             return;
         }
+        *self.caches.target_version.entry(to).or_default() += 1;
+        let (a, b) = (&self.targets[&from].texture, &self.targets[&to].texture);
         let mut enc = self.d.device.create_command_encoder(&Default::default());
         enc.copy_texture_to_texture(
             a.as_image_copy(),
@@ -364,6 +366,7 @@ impl Gx2 {
     fn clear(&mut self, g: &Guest, c: &Ctx) {
         self.flush_draws();
         let Some(image) = self.target(g, c.r[3]) else { return };
+        *self.caches.target_version.entry(image).or_default() += 1;
         let f = |n: usize| f64::from(f64::from_bits(c.f[n]) as f32);
         let view = self.targets[&image].view.clone();
         let mut enc = self.d.device.create_command_encoder(&Default::default());
@@ -1270,6 +1273,39 @@ mod tests {
         ] {
             assert!(!is_immediate(call), "{}", call.name());
         }
+    }
+
+    #[test]
+    fn a_fetch_shader_made_while_a_list_is_recorded_is_made_at_once() {
+        let mut gx2 = Gx2::new(crate::Display::noop());
+        let mut m = vec![0u8; 0x1_0000];
+        let g = Guest::new(m.as_mut_ptr());
+        let mut c = blank_ctx();
+        c.r[1] = 0x8000;
+        c.r[3] = 0x4000;
+        gx2.run(Call::BeginDisplayListEx, &mut c, &g);
+        c.r[3] = 1;
+        gx2.run(Call::CalcFetchShaderSizeEx, &mut c, &g);
+        assert_eq!(c.r[3], 48, "the size is the caller's now");
+        for (k, v) in [0u32, 0, 0, 0x811, 0, 0, 0x0001_0203, 3].iter().enumerate() {
+            g.put_u32(0x200 + 4 * k as u32, *v);
+        }
+        (c.r[3], c.r[4], c.r[5], c.r[6]) = (0x100, 0x400, 1, 0x200);
+        gx2.run(Call::InitFetchShaderEx, &mut c, &g);
+        // the caller's array is gone before the list is played
+        g.fill(0x200, 0, 32);
+        c.r[3] = 0x100;
+        gx2.run(Call::SetFetchShader, &mut c, &g);
+        gx2.run(Call::EndDisplayList, &mut c, &g);
+        let streams = gx2.fetch_shaders.get(&0x100).expect("made while recording");
+        assert_eq!(streams[0].format, 0x811);
+        c.r[3] = 0x4000;
+        gx2.run(Call::DirectCallDisplayList, &mut c, &g);
+        assert_eq!(
+            gx2.fetch_shaders[&0x100][0].format, 0x811,
+            "playing the list does not make it again"
+        );
+        assert_eq!(gx2.state().fetch_shader, 0x100);
     }
 
     #[test]
