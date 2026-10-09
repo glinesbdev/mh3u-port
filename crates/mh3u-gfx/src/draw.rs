@@ -315,112 +315,180 @@ pub(crate) fn count_lookup(how: &Lookup, hit: &'static str, checked: &'static st
     );
 }
 
-/// The attribute's components as raw 32-bit patterns (floats for the float and normalised formats, integers as they are for the others).
-fn decode_attribute(format: u32, endian: u32, bytes: &[u8]) -> [u32; 4] {
-    let kind = format & 0xff;
-    let class = (format >> 8) & 0xf;
-    // (components, bytes per component)
-    let (n, size) = match kind {
-        0x00 => (1, 1),
-        0x04 => (2, 1),
-        0x0a => (4, 1),
-        0x02 | 0x03 => (1, 2),
-        0x07 | 0x08 => (2, 2),
-        0x0e | 0x0f => (4, 2),
-        0x05 | 0x06 => (1, 4),
-        0x0c | 0x0d => (2, 4),
-        0x10 | 0x11 => (3, 4),
-        0x12 | 0x13 => (4, 4),
-        0x0b => (4, 0),
-        0x09 => (3, 0),
-        _ => (0, 0),
-    };
-    // 0 means the data is read in the order it is stored; everything else is a big-endian guest value
-    let swap = endian != 0;
-    let u = |at: usize, len: usize| -> u32 {
-        let mut v = 0u32;
-        for k in 0..len {
-            let byte = bytes.get(at + k).copied().unwrap_or(0);
-            if swap {
-                v = (v << 8) | u32::from(byte);
-            } else {
-                v |= u32::from(byte) << (8 * k);
-            }
-        }
-        v
-    };
-    let mut out = [0u32; 4];
-    if size == 0 {
-        // packed formats
-        let word = u(0, 4);
-        if kind == 0x0b {
-            let fields = [
-                (word & 0x3ff, 1023.0),
-                ((word >> 10) & 0x3ff, 1023.0),
-                ((word >> 20) & 0x3ff, 1023.0),
-                ((word >> 30) & 3, 3.0),
-            ];
-            for (k, (v, max)) in fields.iter().enumerate() {
-                out[k] = match class {
-                    0 => (*v as f32 / max).to_bits(),
-                    _ => *v,
-                };
-            }
-        } else if kind == 0x09 {
-            let f11 = |bits: u32| -> f32 {
-                let (e, m) = ((bits >> 6) & 0x1f, bits & 0x3f);
-                if e == 0 {
-                    m as f32 / 64.0 * 2f32.powi(-14)
-                } else if e == 31 {
-                    f32::INFINITY
-                } else {
-                    (1.0 + m as f32 / 64.0) * 2f32.powi(e as i32 - 15)
-                }
-            };
-            let f10 = |bits: u32| -> f32 {
-                let (e, m) = ((bits >> 5) & 0x1f, bits & 0x1f);
-                if e == 0 {
-                    m as f32 / 32.0 * 2f32.powi(-14)
-                } else if e == 31 {
-                    f32::INFINITY
-                } else {
-                    (1.0 + m as f32 / 32.0) * 2f32.powi(e as i32 - 15)
-                }
-            };
-            out = [
-                f11(word & 0x7ff).to_bits(),
-                f11((word >> 11) & 0x7ff).to_bits(),
-                f10(word >> 22).to_bits(),
-                0,
-            ];
-        }
-        return out;
+/// How the integer components of an attribute become what the shader reads (the `GX2AttribFormat` flags: `SCALED` 0x800 wins over
+/// `INTEGER` 0x100, as in the fetch instruction's number format).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NumFormat {
+    /// Normalised to 0..1 (or -1..1 when signed).
+    Norm,
+    /// Left as integers.
+    Int,
+    /// Converted to floats as they are ("integer to float").
+    Scaled,
+}
+
+/// What an attribute format is made of: the number of components, their sizes in bits (a packed format has several in one word,
+/// lowest bits first), whether they are floats, and how the integer ones are read. `None` for a type that is not known.
+fn attribute_layout(format: u32) -> Option<(&'static [u32], bool)> {
+    Some(match format & 0x3f {
+        0x00 => (&[8], false),
+        0x01 => (&[4, 4], false),
+        0x02 => (&[16], false),
+        0x03 => (&[16], true),
+        0x04 => (&[8, 8], false),
+        0x05 => (&[32], false),
+        0x06 => (&[32], true),
+        0x07 => (&[16, 16], false),
+        0x08 => (&[16, 16], true),
+        0x09 => (&[11, 11, 10], true),
+        0x0a => (&[8, 8, 8, 8], false),
+        0x0b => (&[10, 10, 10, 2], false),
+        0x0c => (&[32, 32], false),
+        0x0d => (&[32, 32], true),
+        0x0e => (&[16, 16, 16, 16], false),
+        0x0f => (&[16, 16, 16, 16], true),
+        0x10 => (&[32, 32, 32], false),
+        0x11 => (&[32, 32, 32], true),
+        0x12 => (&[32, 32, 32, 32], false),
+        0x13 => (&[32, 32, 32, 32], true),
+        _ => return None,
+    })
+}
+
+fn num_format(format: u32) -> NumFormat {
+    if format & 0x800 != 0 {
+        NumFormat::Scaled
+    } else if format & 0x100 != 0 {
+        NumFormat::Int
+    } else {
+        NumFormat::Norm
     }
-    for (k, slot) in out.iter_mut().enumerate().take(n) {
-        let raw = u(k * size, size);
-        *slot = match (class, size) {
-            // floating point
-            (8, 4) => raw,
-            (8, 2) => half_to_f32(raw as u16).to_bits(),
-            // unsigned normalised
-            (0, 1) => (raw as f32 / 255.0).to_bits(),
-            (0, 2) => (raw as f32 / 65535.0).to_bits(),
-            (0, 4) => (raw as f32 / 4_294_967_295.0).to_bits(),
-            // signed normalised
-            (2, 1) => ((raw as u8 as i8 as f32 / 127.0).max(-1.0)).to_bits(),
-            (2, 2) => ((raw as u16 as i16 as f32 / 32767.0).max(-1.0)).to_bits(),
-            // scaled: integers converted to floats
-            (4, _) => (raw as f32).to_bits(),
-            (5, 1) => (raw as u8 as i8 as f32).to_bits(),
-            (5, 2) => (raw as u16 as i16 as f32).to_bits(),
-            (5, _) => (raw as i32 as f32).to_bits(),
-            // integers stay integers (signed ones sign-extended)
-            (3, 1) => raw as u8 as i8 as i32 as u32,
-            (3, 2) => raw as u16 as i16 as i32 as u32,
-            _ => raw,
+}
+
+/// A short name of an attribute format, for reports (`snorm 16x4`, `float 32x3`, `uint->float 8x4`...).
+pub(crate) fn attribute_format_name(format: u32) -> String {
+    let Some((sizes, float)) = attribute_layout(format) else {
+        return format!("unknown {format:#x}");
+    };
+    let signed = format & 0x200 != 0;
+    let kind = if float {
+        "float"
+    } else {
+        match (num_format(format), signed) {
+            (NumFormat::Norm, false) => "unorm",
+            (NumFormat::Norm, true) => "snorm",
+            (NumFormat::Int, false) => "uint",
+            (NumFormat::Int, true) => "sint",
+            (NumFormat::Scaled, false) => "uint->float",
+            (NumFormat::Scaled, true) => "sint->float",
+        }
+    };
+    let degamma = if format & 0x400 != 0 { " srgb" } else { "" };
+    let parts: Vec<String> = sizes.iter().map(u32::to_string).collect();
+    format!("{kind} {}{degamma}", parts.join("_"))
+}
+
+/// The attribute's components as raw 32-bit patterns: floats for the float, normalised and scaled formats, integers (sign-extended
+/// when signed) for the integer ones. A component the format does not have reads as 0, and the fourth as 1.
+///
+/// `endian` is the stream's `GX2EndianSwapMode`: 0 reads the bytes as they are (little-endian); 1 swaps the bytes in every 16 bits, 2
+/// in every 32 bits, and 3 (the default) by the size of the components (none for 8-bit ones, 16 for 16-bit ones, 32 for the rest),
+/// which reads the big-endian values the game wrote.
+fn decode_attribute(format: u32, endian: u32, bytes: &[u8]) -> [u32; 4] {
+    let Some((sizes, float)) = attribute_layout(format) else {
+        return [0; 4];
+    };
+    let signed = format & 0x200 != 0;
+    let num = num_format(format);
+    let int_out = !float && num == NumFormat::Int;
+    let one = if int_out { 1 } else { 1.0f32.to_bits() };
+    let mut out = [0, 0, 0, one];
+    let total: u32 = sizes.iter().sum();
+    let len = total.div_ceil(8) as usize;
+    let mut buf = [0u8; 16];
+    for (k, b) in buf.iter_mut().enumerate().take(len) {
+        *b = bytes.get(k).copied().unwrap_or(0);
+    }
+    // the swap unit
+    let unit = match endian {
+        0 => 1,
+        1 => 2,
+        2 => 4,
+        // the default: none for 8-bit (and 4-bit) components, 16 for 16-bit ones, 32 for the rest (the packed formats too)
+        _ => match sizes[0] {
+            0..=8 => 1,
+            16 => 2,
+            _ => 4,
+        },
+    };
+    if unit > 1 && len >= unit {
+        for chunk in buf[..len - len % unit].chunks_mut(unit) {
+            chunk.reverse();
+        }
+    }
+    let mut bit = 0usize;
+    let read = |bit: usize, n: u32| -> u32 {
+        // little-endian bit stream
+        let mut v = 0u64;
+        for k in 0..n.div_ceil(8) as usize + 1 {
+            v |= u64::from(*buf.get(bit / 8 + k).unwrap_or(&0)) << (8 * k);
+        }
+        ((v >> (bit % 8)) & ((1u64 << n) - 1)) as u32
+    };
+    for (k, &n) in sizes.iter().enumerate() {
+        let raw = read(bit, n);
+        bit += n as usize;
+        out[k] = if float {
+            match n {
+                32 => raw,
+                16 => half_to_f32(raw as u16).to_bits(),
+                11 => small_float(raw, 6).to_bits(),
+                _ => small_float(raw, 5).to_bits(),
+            }
+        } else {
+            let value = if signed && n < 32 && raw >> (n - 1) & 1 == 1 {
+                (raw | !((1u32 << n) - 1)) as i32
+            } else {
+                raw as i32
+            };
+            match num {
+                NumFormat::Int => value as u32,
+                NumFormat::Scaled if signed => (value as f32).to_bits(),
+                NumFormat::Scaled => (raw as f32).to_bits(),
+                NumFormat::Norm if signed => {
+                    let max = ((1u64 << (n - 1)) - 1).max(1) as f64;
+                    ((f64::from(value) / max).max(-1.0) as f32).to_bits()
+                }
+                NumFormat::Norm => {
+                    let v = (f64::from(raw) / ((1u64 << n) - 1) as f64) as f32;
+                    if format & 0x400 != 0 && n == 8 && k < 3 {
+                        srgb_to_linear(v)
+                    } else {
+                        v
+                    }
+                    .to_bits()
+                }
+            }
         };
     }
     out
+}
+
+/// An unsigned float of the packed 11-11-10 format: 5 exponent bits and `mantissa` bits.
+fn small_float(bits: u32, mantissa: u32) -> f32 {
+    let (e, m) = ((bits >> mantissa) & 0x1f, bits & ((1 << mantissa) - 1));
+    let scale = (1u32 << mantissa) as f32;
+    if e == 0 {
+        m as f32 / scale * 2f32.powi(-14)
+    } else if e == 31 {
+        if m == 0 { f32::INFINITY } else { f32::NAN }
+    } else {
+        (1.0 + m as f32 / scale) * 2f32.powi(e as i32 - 15)
+    }
+}
+
+fn srgb_to_linear(c: f32) -> f32 {
+    if c <= 0.04045 { c / 12.92 } else { ((c + 0.055) / 1.055).powf(2.4) }
 }
 
 fn half_to_f32(h: u16) -> f32 {
@@ -437,15 +505,7 @@ fn half_to_f32(h: u16) -> f32 {
 
 /// How many bytes one element of an attribute format takes.
 fn attribute_size(format: u32) -> u32 {
-    match format & 0xff {
-        0x00 | 0x01 => 1,
-        0x02..=0x04 => 2,
-        0x05..=0x0b => 4,
-        0x0c..=0x0f => 8,
-        0x10 | 0x11 => 12,
-        0x12 | 0x13 => 16,
-        _ => 4,
-    }
+    attribute_layout(format).map_or(4, |(sizes, _)| sizes.iter().sum::<u32>().div_ceil(8))
 }
 
 fn blend_factor(f: u32) -> wgpu::BlendFactor {
@@ -2332,6 +2392,74 @@ type PassKey = (u32, Option<u32>, usize);
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn floats(v: [u32; 4]) -> [f32; 4] {
+        v.map(f32::from_bits)
+    }
+
+    #[test]
+    fn float_attributes_read_the_big_endian_values_with_the_default_swap() {
+        let mut b = Vec::new();
+        for f in [1.0f32, 2.0, -3.0] {
+            b.extend_from_slice(&f.to_be_bytes());
+        }
+        assert_eq!(floats(decode_attribute(0x811, 3, &b)), [1.0, 2.0, -3.0, 1.0]);
+        // swap 8 in 32 says the same; no swap reads the bytes as they are
+        assert_eq!(floats(decode_attribute(0x811, 2, &b)), [1.0, 2.0, -3.0, 1.0]);
+        let le: Vec<u8> = [1.0f32, 2.0].iter().flat_map(|f| f.to_le_bytes()).collect();
+        assert_eq!(floats(decode_attribute(0x80d, 0, &le)), [1.0, 2.0, 0.0, 1.0]);
+        // half floats: 1.0 and -2.0
+        assert_eq!(floats(decode_attribute(0x808, 3, &[0x3c, 0x00, 0xc0, 0x00])), [1.0, -2.0, 0.0, 1.0]);
+    }
+
+    #[test]
+    fn scaled_attributes_become_floats_of_their_integers() {
+        // sint 16 to float: -2, 300, 7, -32768
+        let b: Vec<u8> = [-2i16, 300, 7, -32768].iter().flat_map(|v| v.to_be_bytes()).collect();
+        assert_eq!(floats(decode_attribute(0xa0e, 3, &b)), [-2.0, 300.0, 7.0, -32768.0]);
+        // uint 8 to float
+        assert_eq!(floats(decode_attribute(0x80a, 3, &[1, 2, 3, 255])), [1.0, 2.0, 3.0, 255.0]);
+        // uint 16 to float (the scaled flag on a 16-bit type is not a half float)
+        assert_eq!(floats(decode_attribute(0x802, 3, &[0x01, 0x00])), [256.0, 0.0, 0.0, 1.0]);
+    }
+
+    #[test]
+    fn normalised_and_integer_attributes() {
+        assert_eq!(floats(decode_attribute(0x00a, 3, &[255, 0, 51, 255])), [1.0, 0.0, 0.2, 1.0]);
+        assert_eq!(floats(decode_attribute(0x207, 3, &[0x80, 0x00, 0x7f, 0xff])), [-1.0, 1.0, 0.0, 1.0]);
+        assert_eq!(
+            floats(decode_attribute(0x20a, 3, &[0x81, 0x7f, 0, 0xff])),
+            [-1.0, 1.0, 0.0, -1.0 / 127.0]
+        );
+        // integers stay integers, and the missing fourth component is the integer one
+        assert_eq!(decode_attribute(0x104, 3, &[7, 200]), [7, 200, 0, 1]);
+        assert_eq!(decode_attribute(0x304, 3, &[0xff, 2]), [u32::MAX, 2, 0, 1]);
+        assert_eq!(decode_attribute(0x107, 3, &[0x12, 0x34, 0, 1]), [0x1234, 1, 0, 1]);
+    }
+
+    #[test]
+    fn packed_attributes_are_read_from_the_lowest_bits() {
+        // 10-10-10-2 signed normalised: x = 511, y = -511, z = 0, w = 1
+        let word: u32 = 511 | ((-511i32 as u32 & 0x3ff) << 10) | (1 << 30);
+        let v = floats(decode_attribute(0x20b, 3, &word.to_be_bytes()));
+        assert_eq!(v, [1.0, -1.0, 0.0, 1.0]);
+        let word: u32 = 1023 | (3 << 30);
+        assert_eq!(floats(decode_attribute(0x00b, 3, &word.to_be_bytes())), [1.0, 0.0, 0.0, 1.0]);
+        // 11-11-10 float: 1.0 in each (exponent 15)
+        let word: u32 = (15 << 6) | ((15 << 6) << 11) | ((15 << 5) << 22);
+        assert_eq!(floats(decode_attribute(0x809, 3, &word.to_be_bytes())), [1.0, 1.0, 1.0, 1.0]);
+    }
+
+    #[test]
+    fn attribute_sizes_and_names() {
+        assert_eq!(attribute_size(0x811), 12);
+        assert_eq!(attribute_size(0xa0e), 8);
+        assert_eq!(attribute_size(0x00b), 4);
+        assert_eq!(attribute_size(0x001), 1);
+        assert_eq!(attribute_format_name(0xa0e), "sint->float 16_16_16_16");
+        assert_eq!(attribute_format_name(0x813), "float 32_32_32_32");
+        assert_eq!(attribute_format_name(0x20a), "snorm 8_8_8_8");
+    }
 
     /// A texture header at 0x100 with its image at 0x1000 (0x100 bytes) and its smaller levels at 0x2000 (0x40 bytes), in a buffer
     /// that stands for guest memory.
