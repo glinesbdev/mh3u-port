@@ -7,7 +7,7 @@ translated shaders, and reads keyboard, mouse and gamepads, and plays the game's
 [`docs/audio.md`](docs/audio.md)); much of the graphics is incomplete. Tested on
 Linux; the Windows build is checked from Linux (see [`docs/windows.md`](docs/windows.md) for building and running it there). Read [`docs/pc-port.md`](docs/pc-port.md) for what the project is meant to be, [`docs/spikes.md`](docs/spikes.md)
 for what was measured before it was built, [`docs/performance.md`](docs/performance.md) for measured costs and open performance concerns, and [`docs/translator.md`](docs/translator.md) for how the translator, the runtime and the
-graphics work and what is not done, and [`docs/audio.md`](docs/audio.md) for the sound. On Linux, building needs the ALSA development files
+graphics work and what is not done, and [`docs/audio.md`](docs/audio.md) for the sound; [`docs/roadmap.md`](docs/roadmap.md) for what comes next (mod hooks and an overlay). On Linux, building needs the ALSA development files
 (`alsa-lib` on Arch, `libasound2-dev` on Debian and Ubuntu).
 
 **You must own the game.** This repository contains no game code and no game data, and the port will not run without your own dump of
