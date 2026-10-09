@@ -257,6 +257,15 @@ without it the GPU's compiler may compute the position differently for the two p
 field itself is still to be seen; the dump's PNG of the r32f map is black (it is not read back from the GPU), so the precision is
 inferred from the format table, not measured.
 
+**3n. Run 11 (500c143): the field.** The log says `[gfx] build 500c143` and the dump's `draws.txt` begins `build 500c143`. Only
+frame 2400 was written (the run lasted about 5200 frames, so 7200 and later never came), and it is the field, not the village:
+base camp by area 1, 498 draws. The field has the village's shadow path, not a cascade of its own: one 1024x1024 r32f map
+(`0xf561e800`, draws 0-44) read by draws 196-372 with the same reference bias (pixel block 4 `[0].x` = 0.0115), so 3m's fix
+covers it, and the user saw no streaks in the field and the village unchanged. 105 draws have the polygon offset on (the field's
+decals and ground overlays). Nothing new stands out in the dump's picture; the base camp is hazy, which may be the game's
+morning fog. The user felt stutter on leaving the village; what the log shows about it is in `performance.md`
+("Area changes and the slowing replay").
+
 ## 4. Does the generated code compile in a reasonable time? (done: as C yes, as one Rust crate no)
 
 `mh3u-tools codegen-bench <dump> <out> --lang rust|c --functions N` translates an even sample of the game's functions (found as the
