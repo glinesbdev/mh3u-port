@@ -111,17 +111,81 @@ pub struct Kernel {
 unsafe impl Send for Kernel {}
 
 /// What the run records for its report.
+/// Kept on every system call, so it is all plain arrays indexed by import number (no map look-ups or allocations per call).
 pub struct Reporting {
     pub names: Vec<String>,
     pub handlers: Vec<Option<crate::cafe::Handler>>,
+    /// The imports in the order they were first called.
     pub first: Vec<u32>,
-    pub counts: BTreeMap<u32, u64>,
-    pub first_args: BTreeMap<u32, [u32; 4]>,
-    pub recent: VecDeque<(u32, [u32; 4], u32)>,
+    /// Calls of each import, and the arguments (r3 to r6) of its first call.
+    pub counts: Vec<u64>,
+    pub first_args: Vec<[u32; 4]>,
+    pub recent: Recent,
     pub calls: u64,
     pub max_imports: u64,
     /// Print every system call with its result (set MH3U_TRACE).
     pub trace: bool,
+    /// MH3U_TRACE_FROM=<seconds>: print them from that long after the start (read once; infinite when not set).
+    pub trace_from: f64,
+}
+
+impl Reporting {
+    pub fn new(handlers: Vec<Option<crate::cafe::Handler>>, names: Vec<String>, max_imports: u64) -> Reporting {
+        let n = names.len();
+        Reporting {
+            names,
+            handlers,
+            first: Vec::new(),
+            counts: vec![0; n],
+            first_args: vec![[0; 4]; n],
+            recent: Recent::default(),
+            calls: 0,
+            max_imports,
+            trace: std::env::var_os("MH3U_TRACE").is_some(),
+            trace_from: std::env::var("MH3U_TRACE_FROM")
+                .ok()
+                .and_then(|v| v.trim().parse::<f64>().ok())
+                .unwrap_or(f64::INFINITY),
+        }
+    }
+
+    /// Notes a call of import `number` with these arguments (r3 to r6), from `lr`.
+    pub fn note(&mut self, number: u32, args: [u32; 4], lr: u32) {
+        self.calls += 1;
+        let n = number as usize;
+        if n >= self.counts.len() {
+            self.counts.resize(n + 1, 0);
+            self.first_args.resize(n + 1, [0; 4]);
+        }
+        if self.counts[n] == 0 {
+            self.first.push(number);
+            self.first_args[n] = args;
+        }
+        self.counts[n] += 1;
+        self.recent.push((number, args, lr));
+    }
+}
+
+/// The last twelve system calls (import number, arguments, return address), in a fixed ring.
+#[derive(Default)]
+pub struct Recent {
+    items: [(u32, [u32; 4], u32); 12],
+    next: usize,
+    len: usize,
+}
+
+impl Recent {
+    pub fn push(&mut self, item: (u32, [u32; 4], u32)) {
+        self.items[self.next] = item;
+        self.next = (self.next + 1) % self.items.len();
+        self.len = (self.len + 1).min(self.items.len());
+    }
+
+    /// Oldest first.
+    pub fn iter(&self) -> impl Iterator<Item = &(u32, [u32; 4], u32)> {
+        let n = self.items.len();
+        (0..self.len).map(move |k| &self.items[(self.next + n - self.len + k) % n])
+    }
 }
 
 /// Where the calls to functions found by name at run time go (no code is there).
@@ -311,5 +375,39 @@ pub fn retire(mut guard: MutexGuard<'static, Option<Kernel>>) -> ! {
     BATON.notify_all();
     loop {
         guard = BATON.wait(guard).unwrap_or_else(std::sync::PoisonError::into_inner);
+    }
+}
+
+#[cfg(test)]
+mod reporting_tests {
+    use super::*;
+
+    #[test]
+    fn recent_keeps_the_last_twelve_oldest_first() {
+        let mut r = Recent::default();
+        assert_eq!(r.iter().count(), 0);
+        for n in 0..5 {
+            r.push((n, [n; 4], n));
+        }
+        assert_eq!(r.iter().map(|e| e.0).collect::<Vec<_>>(), [0, 1, 2, 3, 4]);
+        for n in 5..30 {
+            r.push((n, [n; 4], n));
+        }
+        assert_eq!(r.iter().map(|e| e.0).collect::<Vec<_>>(), (18..30).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn counts_and_first_calls() {
+        let mut r = Reporting::new(vec![None; 3], vec!["a".into(), "b".into(), "c".into()], 100);
+        r.note(2, [1, 2, 3, 4], 0x10);
+        r.note(0, [5, 6, 7, 8], 0x20);
+        r.note(2, [9, 9, 9, 9], 0x30);
+        assert_eq!(r.first, [2, 0]);
+        assert_eq!(r.counts, [1, 0, 2]);
+        assert_eq!(r.first_args[2], [1, 2, 3, 4]);
+        assert_eq!(r.calls, 3);
+        // a number past the names grows the arrays instead of failing
+        r.note(5, [0; 4], 0);
+        assert_eq!(r.counts[5], 1);
     }
 }

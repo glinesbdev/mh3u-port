@@ -16,8 +16,7 @@ macro_rules! calls {
         }
 
         impl Call {
-            #[cfg(test)]
-            pub(crate) const ALL: &'static [Call] = &[$(Call::$variant,)*];
+                        pub(crate) const ALL: &'static [Call] = &[$(Call::$variant,)*];
 
             pub(crate) fn name(self) -> &'static str {
                 match self {
@@ -988,8 +987,27 @@ impl Gx2Backend for Gx2 {
         Call::from_name(name).is_some()
     }
 
+    fn resolve(&self, name: &str) -> Option<u32> {
+        Call::from_name(name).map(|c| c as u32)
+    }
+
+    fn call_id(&mut self, id: Option<u32>, name: &str, c: &mut Ctx, g: &Guest) {
+        match id.and_then(|id| Call::ALL.get(id as usize)) {
+            Some(&call) => self.run(call, c, g),
+            None => self.call(name, c, g),
+        }
+    }
+
     fn call(&mut self, name: &str, c: &mut Ctx, g: &Guest) {
-        let Some(call) = Call::from_name(name) else { return };
+        if let Some(call) = Call::from_name(name) {
+            self.run(call, c, g);
+        }
+    }
+}
+
+impl Gx2 {
+    /// A call from the game: the display list ones here, the others recorded into the list being made or run now.
+    fn run(&mut self, call: Call, c: &mut Ctx, g: &Guest) {
         match call {
             Call::BeginDisplayListEx => self.recording = Some((c.r[3], Vec::new())),
             Call::EndDisplayList => {
@@ -1035,6 +1053,16 @@ mod tests {
         assert_eq!(Call::ALL.len(), 50);
         assert_eq!(Call::from_name("gx2:GX2Nothing"), None);
         assert_eq!(Call::from_name("coreinit:GX2DrawEx"), None);
+    }
+
+    #[test]
+    fn resolved_numbers_name_the_same_call() {
+        let gx2_names: Vec<&str> = Call::ALL.iter().map(|c| c.name()).collect();
+        for (i, name) in gx2_names.iter().enumerate() {
+            let id = Call::from_name(name).map(|c| c as u32);
+            assert_eq!(id, Some(i as u32));
+            assert_eq!(Call::ALL[i].name(), *name);
+        }
     }
 
     #[test]

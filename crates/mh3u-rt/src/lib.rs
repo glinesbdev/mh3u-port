@@ -44,6 +44,14 @@ pub trait Gx2Backend: Send {
     /// Whether the backend does something for this import ("gx2:GX2SwapScanBuffers"); the others stay stubs.
     fn implements(&self, name: &str) -> bool;
     fn call(&mut self, name: &str, c: &mut Ctx, g: &Guest);
+    /// A number for an import the backend implements, asked once when the game is loaded; calls then come to `call_id` with it, so a
+    /// backend need not match names on every call. None (the default) keeps them coming by name.
+    fn resolve(&self, _name: &str) -> Option<u32> {
+        None
+    }
+    fn call_id(&mut self, _id: Option<u32>, name: &str, c: &mut Ctx, g: &Guest) {
+        self.call(name, c, g);
+    }
 }
 
 /// Frames shown so far: the graphics backend counts its swaps here, so the timing reports (MH3U_GFX_TIMES) can give per-frame averages.
