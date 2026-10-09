@@ -25,7 +25,10 @@ pub fn find(name: &str) -> Option<Handler> {
     if let Some(h) = crate::sync::find(name).or_else(|| crate::fs::find(name)) {
         return Some(Handler::Kernel(h));
     }
-    simple(name).or_else(|| crate::gx2::find(name)).map(Handler::Simple)
+    simple(name)
+        .or_else(|| crate::axfx::find(name))
+        .or_else(|| crate::gx2::find(name))
+        .map(Handler::Simple)
 }
 
 fn simple(name: &str) -> Option<SimpleHandler> {
@@ -243,6 +246,83 @@ fn simple(name: &str) -> Option<SimpleHandler> {
             let at = c.r[4];
             os.ax.voice(c.r[3]).adpcm_loop = (g.u16(at), g.u16(at + 2) as i16, g.u16(at + 4) as i16);
         },
+        // the voice's one-pole low-pass filter: `AXPBLPF` is on, yn1, a0, b0 (Q15: y = a0 x + b0 y1)
+        "snd_core.rpl:AXSetVoiceLpf" => |os, g, c| {
+            let at = c.r[4];
+            let v = os.ax.voice(c.r[3]);
+            v.lpf = (g.u16(at) != 0).then(|| (g.u16(at + 4), g.u16(at + 6)));
+            v.lpf_y = f32::from(g.u16(at + 2) as i16);
+        },
+        "snd_core.rpl:AXSetVoiceLpfCoefs" => |os, _, c| {
+            let v = os.ax.voice(c.r[3]);
+            v.lpf = Some((c.r[4] as u16, c.r[5] as u16));
+        },
+        "snd_core.rpl:AXComputeLpfCoefs" => |os, g, c| {
+            let (a0, b0) = lpf_coefs(c.r[3], os.ax.rate);
+            g.put_u16(c.r[4], a0);
+            g.put_u16(c.r[5], b0);
+        },
+        // the auxiliary buses' callbacks (device type 0 TV, 1 GamePad; device 0; bus A, B, C) and the devices' final mix callbacks
+        "snd_core.rpl:AXRegisterAuxCallback" => |os, _, c| {
+            let (device, id, bus) = (c.r[3] as usize, c.r[4], c.r[5] as usize);
+            c.r[3] = if device < 2 && id == 0 && bus < 3 {
+                os.ax.aux_callbacks[device][bus] = (c.r[6], c.r[7]);
+                0
+            } else {
+                // AX_RESULT_INVALID_DEVICE_CONFIG
+                (-13i32) as u32
+            };
+        },
+        "snd_core.rpl:AXGetAuxCallback" => |os, g, c| {
+            let (device, id, bus) = (c.r[3] as usize, c.r[4], c.r[5] as usize);
+            let (cb, user) = if device < 2 && id == 0 && bus < 3 {
+                os.ax.aux_callbacks[device][bus]
+            } else {
+                (0, 0)
+            };
+            if c.r[6] != 0 {
+                g.put_u32(c.r[6], cb);
+            }
+            if c.r[7] != 0 {
+                g.put_u32(c.r[7], user);
+            }
+            c.r[3] = 0;
+        },
+        "snd_core.rpl:AXSetAuxReturnVolume" => |os, _, c| {
+            if c.r[3] == 0 && c.r[4] == 0 && c.r[5] < 3 {
+                os.ax.aux_return[c.r[5] as usize] = c.r[6] as u16;
+            }
+            c.r[3] = 0;
+        },
+        "snd_core.rpl:AXRegisterDeviceFinalMixCallback" => |os, _, c| {
+            if let Some(slot) = os.ax.final_mix.get_mut(c.r[3] as usize) {
+                *slot = c.r[4];
+            }
+            c.r[3] = 0;
+        },
+        // bookkeeping the mixer has no use for: the GamePad's virtual surround, the mixer selection, the resampler's kind (linear is
+        // the only one), the voice's type, and the "user" protection around voice changes (the mixer runs under the kernel's lock)
+        "snd_core.rpl:AXGetDRCVSMode" => |_, g, c| {
+            if c.r[3] != 0 {
+                g.put_u32(c.r[3], 0);
+            }
+            c.r[3] = 0;
+        },
+        "snd_core.rpl:AXSetDRCVSMode"
+        | "snd_core.rpl:AXSetDRCVSDownmixBalance"
+        | "snd_core.rpl:AXSetDRCVSLC"
+        | "snd_core.rpl:AXSetDRCVSOutputGain"
+        | "snd_core.rpl:AXSetDRCVSSpeakerPosition"
+        | "snd_core.rpl:AXSetDRCVSSurroundDepth"
+        | "snd_core.rpl:AXSetDRCVSSurroundLevelGain"
+        | "snd_core.rpl:AXSetDefaultMixerSelect"
+        | "snd_core.rpl:AXSetVoiceMixerSelect"
+        | "snd_core.rpl:AXSetVoiceSrcType"
+        | "snd_core.rpl:AXSetVoiceType"
+        | "snd_core.rpl:AXUserBegin"
+        | "snd_core.rpl:AXUserEnd"
+        | "snd_core.rpl:AXUserIsProtected"
+        | "snd_core.rpl:AXQuit" => |_, _, c| c.r[3] = 0,
         "snd_core.rpl:AXGetDeviceMode" => |_, g, c| {
             // stereo ("surround" is 2)
             g.put_u32(c.r[4], 1);
@@ -493,6 +573,11 @@ pub struct Os {
     free_voices: Vec<u32>,
     /// The audio system's voices and mixer.
     pub ax: mh3u_audio::Ax,
+    /// The `AXFX` reverbs the game made, by the address of its structure, and the kinds whose settings were logged.
+    pub reverbs: BTreeMap<u32, crate::axfx::Fx>,
+    pub fx_logged: std::collections::BTreeSet<String>,
+    /// Where the audio thread puts the buses it hands to the game's callbacks (carved when it starts).
+    pub ax_buffers: u32,
     /// The buttons held at the last read of the GamePad (to tell what was just pressed).
     pub pad_before: u32,
     pad_edges: (u32, u32),
@@ -523,6 +608,17 @@ pub fn audio_imports(names: &[String]) -> Vec<String> {
         ));
     }
     out
+}
+
+/// `AXComputeLpfCoefs(frequency)`: the one-pole low-pass filter's coefficients (Q15) for a cutoff in Hz at the renderer's rate. The
+/// console takes them from a table; this is the filter whose response is 3 dB down at the cutoff (b0 from the cutoff, a0 = 1 - b0, so
+/// that it passes the lows at full level).
+pub fn lpf_coefs(frequency: u32, rate: u32) -> (u16, u16) {
+    let w = 2.0 * std::f64::consts::PI * f64::from(frequency) / f64::from(rate);
+    let k = 2.0 - w.cos();
+    let b = (k - (k * k - 1.0).sqrt()).clamp(0.0, 1.0);
+    let b0 = (b * 32768.0).round().min(32767.0) as u16;
+    (0x8000 - b0.min(0x7fff), b0)
 }
 
 /// The size of an `AXVoice`.
@@ -594,7 +690,14 @@ impl Os {
             ipc_pools: BTreeMap::new(),
             voices: 0,
             free_voices: Vec::new(),
-            ax: mh3u_audio::Ax::default(),
+            ax: {
+                let mut ax = mh3u_audio::Ax::default();
+                ax.fx = mh3u_audio::audio_on(std::env::var("MH3U_AUDIO_FX").ok().as_deref());
+                ax
+            },
+            reverbs: BTreeMap::new(),
+            fx_logged: std::collections::BTreeSet::new(),
+            ax_buffers: 0,
             pad_before: 0,
             pad_edges: (0, 0),
             pad_read_at: std::time::Instant::now(),
@@ -784,7 +887,7 @@ mod audio_tests {
         let names: Vec<String> = [
             "coreinit:memset",
             "snd_core.rpl:AXSetVoiceVe",
-            "snd_core.rpl:AXSetVoiceLpf",
+            "snd_core.rpl:AXSetVoiceBiquad",
             "snd_user.rpl:MIXSetInput",
         ]
         .map(String::from)
@@ -793,10 +896,174 @@ mod audio_tests {
         assert_eq!(
             lines,
             [
-                "[audio] snd_core: 2 imported, 1 done; not done: AXSetVoiceLpf",
+                "[audio] snd_core: 2 imported, 1 done; not done: AXSetVoiceBiquad",
                 "[audio] snd_user: 1 imported, 0 done; not done: MIXSetInput"
             ]
         );
+    }
+
+    /// The imports called as the game calls them: a name, r3 onwards; gives r3.
+    fn caller(g: &Guest) -> impl Fn(&mut Os, &str, &[u32]) -> u32 + '_ {
+        move |os: &mut Os, name: &str, r: &[u32]| -> u32 {
+            let mut c = crate::game::new_ctx(std::ptr::null_mut());
+            c.r[3..3 + r.len()].copy_from_slice(r);
+            let Some(Handler::Simple(h)) = find(name) else { panic!("{name}") };
+            h(os, g, &mut c);
+            c.r[3]
+        }
+    }
+
+    #[test]
+    fn every_audio_import_the_game_has_is_done() {
+        // the lists of run 23
+        let core = "AXComputeLpfCoefs AXGetAuxCallback AXGetDRCVSMode AXQuit AXRegisterAuxCallback AXRegisterDeviceFinalMixCallback \
+            AXSetDRCVSDownmixBalance AXSetDRCVSLC AXSetDRCVSMode AXSetDRCVSOutputGain AXSetDRCVSSpeakerPosition AXSetDRCVSSurroundDepth \
+            AXSetDRCVSSurroundLevelGain AXSetDefaultMixerSelect AXSetVoiceLpf AXSetVoiceLpfCoefs AXSetVoiceMixerSelect AXSetVoiceSrcType \
+            AXSetVoiceType AXUserBegin AXUserEnd AXUserIsProtected";
+        let user = "AXFXMultiChReverbCallback AXFXMultiChReverbInit AXFXMultiChReverbSettingsUpdate AXFXMultiChReverbShutdown \
+            AXFXReverbHiCallback AXFXReverbHiCallbackDpl2 AXFXReverbHiExpCallback AXFXReverbHiExpCallbackDpl2 AXFXReverbHiExpInit \
+            AXFXReverbHiExpInitDpl2 AXFXReverbHiExpSettings AXFXReverbHiExpSettingsDpl2 AXFXReverbHiExpShutdown AXFXReverbHiExpShutdownDpl2 \
+            AXFXReverbHiInit AXFXReverbHiInitDpl2 AXFXReverbHiSettings AXFXReverbHiSettingsDpl2 AXFXReverbHiShutdown AXFXReverbHiShutdownDpl2 \
+            AXFXReverbStdCallback AXFXReverbStdCallbackDpl2 AXFXReverbStdExpCallback AXFXReverbStdExpCallbackDpl2 AXFXReverbStdExpInit \
+            AXFXReverbStdExpInitDpl2 AXFXReverbStdExpSettings AXFXReverbStdExpSettingsDpl2 AXFXReverbStdExpShutdown \
+            AXFXReverbStdExpShutdownDpl2 AXFXReverbStdInit AXFXReverbStdInitDpl2 AXFXReverbStdSettings AXFXReverbStdSettingsDpl2 \
+            AXFXReverbStdShutdown AXFXReverbStdShutdownDpl2 AXFXSetHooks";
+        let names: Vec<String> = core
+            .split_whitespace()
+            .map(|n| format!("snd_core.rpl:{n}"))
+            .chain(user.split_whitespace().map(|n| format!("snd_user.rpl:{n}")))
+            .collect();
+        assert_eq!(
+            audio_imports(&names),
+            [
+                "[audio] snd_core: 22 imported, 22 done; not done: none",
+                "[audio] snd_user: 37 imported, 37 done; not done: none"
+            ]
+        );
+    }
+
+    #[test]
+    fn the_low_pass_filter_is_set_and_its_coefficients_computed() {
+        let mut memory = crate::memory::GuestMemory::reserve().expect("guest memory");
+        let g = Guest::new(memory.as_mut_ptr());
+        let mut os = Os::new(&g);
+        let call = caller(&g);
+        // AXPBLPF: on, yn1, a0, b0
+        g.put_u16(0x1000, 1);
+        g.put_u16(0x1002, 0);
+        g.put_u16(0x1004, 0x2000);
+        g.put_u16(0x1006, 0x6000);
+        call(&mut os, "snd_core.rpl:AXSetVoiceLpf", &[0x500, 0x1000]);
+        assert_eq!(os.ax.voices[&0x500].lpf, Some((0x2000, 0x6000)));
+        call(&mut os, "snd_core.rpl:AXSetVoiceLpfCoefs", &[0x500, 0x7000, 0x1000]);
+        assert_eq!(os.ax.voices[&0x500].lpf, Some((0x7000, 0x1000)));
+        g.put_u16(0x1000, 0);
+        call(&mut os, "snd_core.rpl:AXSetVoiceLpf", &[0x500, 0x1000]);
+        assert_eq!(os.ax.voices[&0x500].lpf, None);
+        // the coefficients sum to one; a low cutoff keeps much of the last output, one near the Nyquist frequency little
+        call(&mut os, "snd_core.rpl:AXComputeLpfCoefs", &[500, 0x1010, 0x1012]);
+        let (a0, b0) = (g.u16(0x1010), g.u16(0x1012));
+        assert_eq!(u32::from(a0) + u32::from(b0), 0x8000);
+        assert!(b0 > 0x6000, "{b0:#x}");
+        let (_, b_high) = lpf_coefs(15_000, 32_000);
+        assert!(b_high < 0x2000 && b_high < b0 / 4, "{b_high:#x}");
+        // 3 dB down at the cutoff: |a / (1 - b e^-jw)|^2 = 1/2
+        let (a, b) = lpf_coefs(1000, 32_000);
+        let (a, b) = (f64::from(a) / 32768.0, f64::from(b) / 32768.0);
+        let w = 2.0 * std::f64::consts::PI * 1000.0 / 32_000.0;
+        let gain = a * a / (1.0 - 2.0 * b * w.cos() + b * b);
+        assert!((gain - 0.5).abs() < 0.01, "{gain}");
+    }
+
+    #[test]
+    fn the_aux_callbacks_are_kept_per_bus_and_read_back() {
+        let mut memory = crate::memory::GuestMemory::reserve().expect("guest memory");
+        let g = Guest::new(memory.as_mut_ptr());
+        let mut os = Os::new(&g);
+        let call = caller(&g);
+        assert_eq!(
+            call(&mut os, "snd_core.rpl:AXRegisterAuxCallback", &[0, 0, 1, 0x0300_1234, 0x4000]),
+            0
+        );
+        assert_eq!(os.ax.aux_callbacks[0], [(0, 0), (0x0300_1234, 0x4000), (0, 0)]);
+        call(&mut os, "snd_core.rpl:AXGetAuxCallback", &[0, 0, 1, 0x1000, 0x1004]);
+        assert_eq!((g.u32(0x1000), g.u32(0x1004)), (0x0300_1234, 0x4000));
+        assert_ne!(call(&mut os, "snd_core.rpl:AXRegisterAuxCallback", &[0, 0, 5, 1, 2]), 0);
+        call(&mut os, "snd_core.rpl:AXRegisterDeviceFinalMixCallback", &[0, 0x0300_5678]);
+        assert_eq!(os.ax.final_mix[0], 0x0300_5678);
+    }
+
+    /// A reverb set up through its imports, and frames of a bus with a click at the start through its callback; gives the left
+    /// channel's output.
+    fn reverb_through_the_imports(fx: bool, settings: &[(u32, f32)]) -> (Vec<i32>, Os) {
+        let mut memory = crate::memory::GuestMemory::reserve().expect("guest memory");
+        let g = Guest::new(memory.as_mut_ptr());
+        let mut os = Os::new(&g);
+        os.ax.fx = fx;
+        let call = caller(&g);
+        let reverb = 0x2000;
+        for &(o, v) in settings {
+            g.put_u32(reverb + o, v.to_bits());
+        }
+        assert_eq!(call(&mut os, "snd_user.rpl:AXFXReverbHiExpInit", &[reverb]), 1);
+        // the bus as the audio thread hands it over: three channel pointers, 96 samples each (32 kHz)
+        let buffers = 0x3000;
+        for k in 0..3 {
+            g.put_u32(buffers + 4 * k, 0x4000 + 0x200 * k);
+        }
+        let mut out = Vec::new();
+        for frame in 0..40 {
+            for k in 0..3 {
+                for i in 0..96 {
+                    let click = frame == 0 && i == 0 && k < 2;
+                    g.put_u32(0x4000 + 0x200 * k + 4 * i, if click { 20000 } else { 0 });
+                }
+            }
+            call(&mut os, "snd_user.rpl:AXFXReverbHiExpCallback", &[buffers, reverb]);
+            out.extend((0..96).map(|i| g.u32(0x4000 + 4 * i) as i32));
+        }
+        (out, os)
+    }
+
+    /// HiExp's settings as decided in `axfx`: pre-delay, time, coloration, damping, crosstalk, early, fused, out.
+    const HI_EXP: [(u32, f32); 8] = [
+        (0x114, 0.02),
+        (0x11c, 2.0),
+        (0x120, 0.5),
+        (0x124, 0.3),
+        (0x128, 0.0),
+        (0x12c, 1.0),
+        (0x130, 1.0),
+        (0x13c, 1.0),
+    ];
+
+    #[test]
+    fn an_axfx_reverb_reads_its_settings_and_reverberates_its_bus_in_place() {
+        let (out, os) = reverb_through_the_imports(true, &HI_EXP);
+        let p = os.reverbs[&0x2000].reverb.params;
+        assert_eq!((p.pre_delay, p.time, p.damping, p.out_gain), (0.02, 2.0, 0.3, 1.0));
+        // nothing during the pre-delay (640 samples at 32 kHz), then the reflections and the tail
+        assert!(out[..640].iter().all(|&s| s == 0));
+        assert!(out[640..].iter().any(|&s| s != 0));
+        // and the shutdown forgets it
+        let mut os = os;
+        let g = Guest::new(std::ptr::null_mut());
+        let mut c = crate::game::new_ctx(std::ptr::null_mut());
+        c.r[3] = 0x2000;
+        let Some(Handler::Simple(h)) = find("snd_user.rpl:AXFXReverbHiExpShutdown") else {
+            panic!()
+        };
+        h(&mut os, &g, &mut c);
+        assert!(os.reverbs.is_empty());
+    }
+
+    #[test]
+    fn a_reverb_with_effects_off_is_silent_and_one_with_unreadable_settings_is_a_default_room() {
+        let (out, _) = reverb_through_the_imports(false, &HI_EXP);
+        assert!(out.iter().all(|&s| s == 0));
+        let (out, os) = reverb_through_the_imports(true, &[(0x11c, f32::NAN)]);
+        assert_eq!(os.reverbs[&0x2000].reverb.params, mh3u_audio::fx::Params::default());
+        assert!(out.iter().any(|&s| s != 0));
     }
 
     #[test]

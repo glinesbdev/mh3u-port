@@ -364,11 +364,54 @@ pub fn spawn_audio(k: &mut Kernel) {
             guard = lock();
             let k = guard.as_mut().expect("kernel");
             let guest = k.guest;
-            let (frame, stopped) = k.os.ax.mix_frame(&guest);
+            if k.os.ax_buffers == 0 {
+                k.os.ax_buffers = k.os.carve(&guest, AX_BUFFERS_SIZE);
+            }
+            let buf = k.os.ax_buffers;
+            let mut frame = k.os.ax.mix_voices(&guest);
             // a voice that played its last sample says so in its `AXVoice`
-            for at in stopped {
+            for &at in &frame.stopped {
                 guest.put_u32(at + 4, 0);
             }
+            // the TV's auxiliary buses through the game's callbacks (an AXFX reverb's is its import: see `axfx`), as the hardware
+            // hands them over: a pointer to each channel's 32-bit samples, and the channels and samples
+            let (aux, final_mix) = (k.os.ax.aux_callbacks[0], k.os.ax.final_mix[0]);
+            let n = frame.main[0].len() as u32;
+            for (bus, &(cb, user)) in aux.iter().enumerate() {
+                if cb == 0 {
+                    continue;
+                }
+                write_channels(&guest, buf, &frame.aux[bus]);
+                guest.put_u32(buf + 0x20, mh3u_audio::voice::TV_CHANNELS as u32);
+                guest.put_u32(buf + 0x24, n);
+                drop(guard);
+                c.r[3] = buf;
+                c.r[4] = user;
+                c.r[5] = buf + 0x20;
+                // SAFETY: the library is loaded for the rest of the run
+                unsafe { call(&mut c, cb) };
+                guard = lock();
+                read_channels(&guest, buf, &mut frame.aux[bus]);
+            }
+            let k = guard.as_mut().expect("kernel");
+            k.os.ax.return_aux(&mut frame);
+            if final_mix != 0 {
+                // `AXDeviceFinalMixData`: the channel pointers, channels, samples, devices, channels out
+                write_channels(&guest, buf, &frame.main);
+                guest.put_u32(buf + 0x28, buf);
+                guest.put_u16(buf + 0x2c, mh3u_audio::voice::TV_CHANNELS as u16);
+                guest.put_u16(buf + 0x2e, n as u16);
+                guest.put_u16(buf + 0x30, 1);
+                guest.put_u16(buf + 0x32, mh3u_audio::voice::TV_CHANNELS as u16);
+                drop(guard);
+                c.r[3] = buf + 0x28;
+                // SAFETY: as above
+                unsafe { call(&mut c, final_mix) };
+                guard = lock();
+                read_channels(&guest, buf, &mut frame.main);
+            }
+            let k = guard.as_mut().expect("kernel");
+            let frame = k.os.ax.finish(&frame);
             if let Some(o) = output.as_mut() {
                 o.set_renderer_rate(k.os.ax.rate);
                 o.push(&frame);
@@ -376,6 +419,31 @@ pub fn spawn_audio(k: &mut Kernel) {
             wait = pacer.wait(std::time::Instant::now(), output.as_ref().map(|o| o.queued()));
         }
     });
+}
+
+/// The audio thread's area for the buses it hands to the game: six channel pointers, the `AXAuxCallbackData` at 0x20, the
+/// `AXDeviceFinalMixData` at 0x28, and from 0x40 six channels of 144 32-bit samples.
+const AX_BUFFERS_SIZE: u32 = 0x40 + 6 * 144 * 4;
+
+/// Channels into the area at `buf`, as 32-bit samples of 16-bit range, with their pointers.
+fn write_channels(g: &crate::guest::Guest, buf: u32, channels: &[Vec<f32>]) {
+    for (k, ch) in channels.iter().enumerate().take(6) {
+        let at = buf + 0x40 + (k * 144 * 4) as u32;
+        g.put_u32(buf + 4 * k as u32, at);
+        for (i, s) in ch.iter().take(144).enumerate() {
+            g.put_u32(at + 4 * i as u32, s.round().clamp(-32768.0, 32767.0) as i32 as u32);
+        }
+    }
+}
+
+/// What the game's callback left in the area.
+fn read_channels(g: &crate::guest::Guest, buf: u32, channels: &mut [Vec<f32>]) {
+    for (k, ch) in channels.iter_mut().enumerate().take(6) {
+        let at = buf + 0x40 + (k * 144 * 4) as u32;
+        for (i, s) in ch.iter_mut().take(144).enumerate() {
+            *s = (g.u32(at + 4 * i as u32) as i32).clamp(-32768, 32767) as f32;
+        }
+    }
 }
 
 /// Starts the thread that runs the handlers of the game's alarms when they are due.
