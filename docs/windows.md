@@ -92,6 +92,52 @@ number to play. The variables of `translator.md` work the same in PowerShell: `$
 swapped, `$env:MH3U_PAD_LAYOUT = 'nintendo'` swaps A with B and X with Y (the log's `[gamepad] … is the GamePad's …` lines say what each
 face button was taken as).
 
+### The same with the scripts
+
+`scripts\win-build.ps1` and `scripts\win-run.ps1` do the steps above, for Windows PowerShell 5.1 or PowerShell 7. They take the
+games from `-Games` (`$env:USERPROFILE\Downloads\wiiu` by default) and put the C, `game.dll` and its caches in `-Out`
+(`$env:LOCALAPPDATA\mh3u\c` by default). Paths with square brackets, such as the dumps' own folders, are fine. Run them from the
+repository or from anywhere:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\win-build.ps1            # cargo build --release -p mh3u-tools, then build-game --native
+powershell -ExecutionPolicy Bypass -File scripts\win-build.ps1 -Lto       # build-game --native --lto
+powershell -ExecutionPolicy Bypass -File scripts\win-build.ps1 -Profile   # with PDBs, for Visual Studio's profiler
+powershell -ExecutionPolicy Bypass -File scripts\win-run.ps1              # play; what it prints also goes to .\mh3u_latest.log
+powershell -ExecutionPolicy Bypass -File scripts\win-run.ps1 -Fps         # MH3U_FPS and MH3U_GFX_TIMES
+powershell -ExecutionPolicy Bypass -File scripts\win-run.ps1 -Dump frames -Frames 2400,3000 -Report
+powershell -ExecutionPolicy Bypass -File scripts\win-run.ps1 -DebugPs tex -PadLayout nintendo -Log tex.log
+```
+
+**`win-build.ps1`:**
+- It translates first when `-Out` has no `game.h`. `-Translate` makes it translate again, which is needed after the translator
+  changes.
+- `-Profile` sets `RUSTFLAGS='-C debuginfo=1 -C link-arg=-Wl,--pdb='` for cargo and `MH3U_CFLAGS='-g -gcodeview -Wl,--pdb='` for
+  `build-game`, then puts both back. Changing `RUSTFLAGS` rebuilds every crate once, both when turning it on and when turning it
+  off.
+
+**`win-run.ps1`:**
+- It first clears the debugging variables an earlier run may have left in the session: `MH3U_FPS`, `MH3U_GFX_TIMES`,
+  `MH3U_GFX_REPORT`, `MH3U_GFX_LOG`, `MH3U_GFX_DUMP_*`, `MH3U_GFX_DEBUG_PS*`, `MH3U_GFX_SOLID`, `MH3U_GFX_DEPTH_BIAS`,
+  `MH3U_GFX_TEXDUMP`, `MH3U_GFX_SAVE*` and `MH3U_PAD_LAYOUT`.
+- Then it sets the ones its switches ask for:
+  - `-Fps`: `MH3U_FPS` and `MH3U_GFX_TIMES`;
+  - `-Report`: `MH3U_GFX_REPORT`;
+  - `-Dump <dir>`: `MH3U_GFX_DUMP_DIR`, with `-Frames` (2400 by default) as `MH3U_GFX_DUMP_FRAME`;
+  - `-DebugPs <mode>`: `MH3U_GFX_DEBUG_PS`;
+  - `-PadLayout xbox|nintendo`: `MH3U_PAD_LAYOUT`.
+
+  It removes them again when the game ends.
+- It lists any other `MH3U_` variable still set (the cache and budget switches) as `also set:`.
+- It writes the output to `.\mh3u_latest.log` as UTF-8, after renaming an older `mh3u_latest.log` to
+  `mh3u_<time it was written>.log`. `-Log <file>` writes somewhere else instead.
+- Lines the game writes to stderr come out as plain text, without Windows PowerShell's `NativeCommandError`/`RemoteException`
+  wrapping.
+- It returns the game's exit code.
+
+On Linux, `scripts/run.sh` does the same as `win-run.ps1` (`--fps`, `--report`, `--dump DIR --frames N`, `--debug-ps MODE`,
+`--pad-layout L`, `--log FILE`; `--games` and `--out`, or `MH3U_GAMES` and `MH3U_OUT`).
+
 ## Comparing builds (frame rate)
 
 `MH3U_FPS=1` prints the frame rate (swaps per second) every five seconds, as `[fps] 16.3`. Build each variant into its own folder and

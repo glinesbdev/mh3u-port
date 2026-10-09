@@ -56,7 +56,7 @@ move the village on its own.
    - Correction: the 89.3 ms is the whole frame, swap to swap, so it includes the game's own time. Texture decodes are cheap:
      run 13's entry window had 75 decodes, 6 ms decoding and 4 ms uploading in total (about 0.13 ms each, so about 4.5 ms for
      34). How the rest splits between translation, making shader modules and the game was not measured.
-   - **PR #6 (perf/area-entry, not yet measured in the game):**
+   - **PR #6 (perf/area-entry, merged in 33f473d):**
      - The area-change line now splits the frame: time in graphics calls versus in the game or the swap. Within graphics it
        gives translating, making shader modules and decoding textures, each with a count and ms. It also shows shaders found
        on disk, modules found made, and draws left for a later frame.
@@ -70,6 +70,22 @@ move the village on its own.
        be revisited if it turns out to be large.
      - To verify: run twice. In the second run the area-change line should show shaders "found on disk", modules "found
        made", 0 translated, and a slowest frame near the others.
+   - **Runs 16 (cold caches) and 17 (warm), b1462e0:**
+     - Run 17 started with `118 translations kept` and `241 pipelines to make again` (0.84 s of worker time at startup).
+     - The area-change frame went from 35–51 ms in run 16 to 11–17 ms in run 17. In run 16 it was nearly all graphics
+       calls, and most of that was making shader modules, not translating:
+       - village: 8 modules took 28.9 ms, 8 translations 2.6 ms;
+       - leaving the village: 7 modules 24.6 ms, 7 translations 2.5 ms;
+       - the field: 5 modules 25.5 ms, 5 translations 2.8 ms.
+
+       A module (wgpu parsing and checking the WGSL) costs 3–5 ms; a translation about 0.4 ms. In run 17 every shader
+       was found on disk, and its module was found made.
+     - The slowest frame in the 180 after entering the field went from 118.1 ms (frame 1609, 112 ms in graphics calls;
+       38 modules took 117 ms and 40 translations 9.7 ms in those frames) to 39.4 ms (frame 1561, 34.0 ms in graphics
+       calls). The second entry was 38.9 ms (frame 2166, 31.2 ms in graphics calls). Those 180 frames still decoded 57
+       and 75 textures (7.7 and 17.7 ms in all), with 0 translations and 0 modules made. What the remaining 30–40 ms frames
+       are is open (see concern 7).
+     - Moga Woods then held 66–72 FPS, against about 115 in the village.
    - The 593 and 645 ms frames at 2400 are `MH3U_GFX_DUMP_FRAME` writing a frame, not the game.
 3. **Shader cache misses that never stop, and a replay that slows down.** About 30 pixel and 22–30 vertex shader misses per frame
    even while standing still (run 11 in the field: ~48 pixel, ~28 vertex and 4 geometry pipeline misses a frame). In run 11 the
@@ -132,6 +148,22 @@ move the village on its own.
    per frame now, cheap after the fix; a bigger change for later.
 6. **Build size and time** from keeping registers in locals (#1): measured on random code only (C source 16 → 25 MB, `.so`
    18 → 30 MB); not measured on the game.
+
+7. **The field's steady cost, and the 30–40 ms frames after entering it.** Runs 16 and 17, per `[draw times]` window. The
+   field costs about 9 ms a frame in `GX2DirectCallDisplayList` against 1.5 ms in the village. The windows can only rank
+   candidates:
+   - **`arena uploads`:** 2.5–2.6 s a window in the field, about 3.7 ms a frame, against 0.48 ms in the village. That is
+     about 12 `write_buffer` calls a frame, roughly 300 µs each in the field against about 50 µs in the village.
+   - **Bind groups:** about 110 made a frame in the field (68–77 thousand misses a window) against about 1 in the village.
+   - **Vertex streams:** about 20 new ones a frame (each two buffers and two writes). Their buffer creation was not timed.
+   - **`submit`:** about 0.65 ms a frame.
+   - **Texture decodes:** 57–75 in the 180 frames after an entry (7.7–17.7 ms in all). Too little to explain a 39 ms frame
+     alone, but they cluster.
+
+   Branch `perf/entry-dips` (0382f7b, no PR yet) adds `[gfx slow frame]`. Any frame of 25 ms or more (`MH3U_GFX_SLOW_MS`)
+   prints its twelve longest steps, including each non-draw graphics call, with that frame's counts. It also times stream
+   buffer creation and bind group creation, and counts arena uploads and their bytes. The user is profiling the entry in
+   Visual Studio.
 
 ## Fixed (for the record)
 
