@@ -1,6 +1,6 @@
 //! Opens the window, says which GPU and API it got, shows a colour for a few seconds and exits.
 fn main() -> anyhow::Result<()> {
-    mh3u_gfx::run(false, |d| {
+    mh3u_gfx::run(false, None, |d| {
         let info = d.adapter.get_info();
         println!("adapter: {} ({:?}, {:?})", info.name, info.backend, info.device_type);
         let (window, surface) = (d.window.as_ref().expect("a window"), d.surface.as_ref().expect("a surface"));

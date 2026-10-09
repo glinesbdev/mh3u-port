@@ -6,6 +6,7 @@ mod draw;
 mod draw_bench;
 mod geometry;
 mod gx2;
+pub mod kbm;
 pub mod overlay;
 mod perf;
 mod pipelines;
@@ -122,6 +123,10 @@ struct App<F: FnOnce(Display) + Send + 'static> {
     fullscreen: bool,
     alt: bool,
     cursor_shown: bool,
+    /// Keyboard and mouse controls (none with `MH3U_KBM=off`), whether the window has the focus, and whether the cursor is grabbed.
+    kbm: Option<kbm::Bindings>,
+    focused: bool,
+    grabbed: bool,
 }
 
 /// Whether fullscreen is asked for: `--fullscreen`, or `MH3U_FULLSCREEN=1`.
@@ -190,40 +195,48 @@ fn borderless(on: bool) -> Option<winit::window::Fullscreen> {
 }
 
 impl<F: FnOnce(Display) + Send + 'static> App<F> {
-    /// Passes the keys on to the input state: buttons, and the sticks' axes (two keys of one axis cancel).
+    /// Passes the keys and mouse buttons held on to the input state: the GamePad's buttons and the left stick (keyboard and mouse
+    /// controls; nothing with them off).
     fn keys_changed(&self) {
-        use mh3u_rt::input::{INPUT, key_axis, key_button};
-        for code in [
-            "Enter",
-            "Backspace",
-            "KeyX",
-            "KeyC",
-            "KeyI",
-            "KeyK",
-            "KeyJ",
-            "KeyL",
-            "KeyQ",
-            "KeyE",
-            "Digit1",
-            "Digit3",
-            "KeyP",
-            "KeyO",
-            "Home",
-            "ShiftLeft",
-            "ShiftRight",
-        ] {
-            if let Some(mask) = key_button(code) {
-                INPUT.set_keyboard_button(mask, self.keys.contains(code));
+        use mh3u_rt::input::INPUT;
+        let (buttons, (x, y)) = self
+            .kbm
+            .as_ref()
+            .map_or((0, (0.0, 0.0)), |b| (b.buttons(&self.keys), b.left_stick(&self.keys)));
+        INPUT.set_keyboard_buttons(buttons);
+        for (i, v) in [x, y, 0.0, 0.0].into_iter().enumerate() {
+            INPUT.set_keyboard_axis(i, v);
+        }
+    }
+
+    /// Grabs the cursor (kept in the window and hidden) while playing with keyboard and mouse, lets it go otherwise, and shows it
+    /// when it is not grabbed (except in fullscreen with the overlay closed).
+    fn update_cursor(&mut self) {
+        let open = mh3u_rt::input::OVERLAY_OPEN.load(std::sync::atomic::Ordering::Relaxed);
+        let Some(w) = self.window.clone() else { return };
+        let grab = kbm::grab(self.kbm.is_some(), self.focused, open);
+        if grab != self.grabbed {
+            use winit::window::CursorGrabMode;
+            let done = if grab {
+                w.set_cursor_grab(CursorGrabMode::Locked)
+                    .or_else(|_| w.set_cursor_grab(CursorGrabMode::Confined))
+            } else {
+                w.set_cursor_grab(CursorGrabMode::None)
+            };
+            if let Err(e) = done {
+                eprintln!("[window] the cursor could not be {}: {e}", if grab { "grabbed" } else { "let go" });
+            }
+            self.grabbed = grab;
+            if !grab {
+                // what the mouse held is let go
+                self.keys.retain(|k| !k.starts_with("Mouse"));
+                self.keys_changed();
             }
         }
-        let mut axes = [0.0f32; 4];
-        for code in &self.keys {
-            if let Some((axis, v)) = key_axis(code) {
-                axes[axis] += v;
-            }
-        }
-        for (i, v) in axes.iter().enumerate() {
-            INPUT.set_keyboard_axis(i, *v);
+        let show = !grab && cursor_visible(self.fullscreen, open);
+        if show != self.cursor_shown {
+            w.set_cursor_visible(show);
+            self.cursor_shown = show;
         }
     }
 
@@ -279,17 +292,11 @@ impl<F: FnOnce(Display) + Send + 'static> ApplicationHandler for App<F> {
         if let WindowEvent::ModifiersChanged(m) = &event {
             self.alt = m.state().alt_key();
         }
-        // the cursor follows fullscreen and the overlay (which the gamepad can open too, so this looks at every event)
-        let show = cursor_visible(
-            self.fullscreen,
-            mh3u_rt::input::OVERLAY_OPEN.load(std::sync::atomic::Ordering::Relaxed),
-        );
-        if show != self.cursor_shown
-            && let Some(w) = &self.window
-        {
-            w.set_cursor_visible(show);
-            self.cursor_shown = show;
+        if let WindowEvent::Focused(f) = event {
+            self.focused = f;
         }
+        // the cursor follows the focus, fullscreen and the overlay (which the gamepad can open too, so this looks at every event)
+        self.update_cursor();
         if let WindowEvent::KeyboardInput { event: k, .. } = &event
             && let PhysicalKey::Code(code) = k.physical_key
             && is_fullscreen_toggle(code, self.alt)
@@ -360,6 +367,18 @@ impl<F: FnOnce(Display) + Send + 'static> ApplicationHandler for App<F> {
                 self.cursor = (position.x as f32, position.y as f32);
                 self.touch_changed();
             }
+            WindowEvent::MouseInput { state, button, .. } if self.kbm.is_some() => {
+                // the mouse's buttons are GamePad buttons, while the cursor is grabbed (the click that gives the window the focus
+                // is not one); a release always counts
+                if let Some(name) = kbm::mouse_name(button) {
+                    if state == ElementState::Pressed && self.grabbed {
+                        self.keys.insert(name.to_string());
+                    } else if state == ElementState::Released {
+                        self.keys.remove(name);
+                    }
+                    self.keys_changed();
+                }
+            }
             WindowEvent::MouseInput {
                 state,
                 button: MouseButton::Left,
@@ -371,11 +390,41 @@ impl<F: FnOnce(Display) + Send + 'static> ApplicationHandler for App<F> {
             _ => {}
         }
     }
+
+    /// The mouse's raw motion: the right stick, while the cursor is grabbed.
+    fn device_event(&mut self, _: &ActiveEventLoop, _: winit::event::DeviceId, event: winit::event::DeviceEvent) {
+        if let winit::event::DeviceEvent::MouseMotion { delta } = event
+            && self.grabbed
+        {
+            mh3u_rt::input::INPUT
+                .mouse
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .add(delta.0 as f32, delta.1 as f32);
+        }
+    }
 }
 
 /// Opens the window on this thread (the one that called `main`; borderless fullscreen with `fullscreen`), then calls `start` with the display on a new thread, where the game
 /// runs. Returns when the window is closed.
-pub fn run<F: FnOnce(Display) + Send + 'static>(fullscreen: bool, start: F) -> Result<()> {
+/// `bindings` is the keyboard and mouse bindings' file (made with the defaults when missing); none, or `MH3U_KBM=off`, leaves the
+/// keyboard and mouse without controls (the mouse is then the GamePad's touch screen).
+pub fn run<F: FnOnce(Display) + Send + 'static>(fullscreen: bool, bindings: Option<std::path::PathBuf>, start: F) -> Result<()> {
+    let kbm = bindings
+        .filter(|_| kbm::enabled(std::env::var("MH3U_KBM").ok().as_deref()))
+        .map(|path| {
+            let (b, note) = kbm::load_or_create(&path);
+            if let Some(note) = note {
+                eprintln!("[input] {note}");
+            }
+            eprintln!(
+                "[input] keyboard and mouse controls on ({}; MH3U_KBM=off turns them off)",
+                path.display()
+            );
+            b.mouse_stick(&mut mh3u_rt::input::INPUT.mouse.lock().unwrap_or_else(|e| e.into_inner()));
+            *overlay::CONTROLS.lock().unwrap_or_else(|e| e.into_inner()) = b.lines();
+            b
+        });
     let event_loop = EventLoop::new().context("starting the window system")?;
     event_loop.set_control_flow(ControlFlow::Wait);
     let mut app = App {
@@ -390,6 +439,9 @@ pub fn run<F: FnOnce(Display) + Send + 'static>(fullscreen: bool, start: F) -> R
         fullscreen,
         alt: false,
         cursor_shown: true,
+        kbm,
+        focused: true,
+        grabbed: false,
     };
     event_loop.run_app(&mut app).context("running the window")?;
     match app.failed {

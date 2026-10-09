@@ -18,6 +18,8 @@ egui = "0.36"
 egui-wgpu = { version = "0.36", default-features = false }
 egui-winit = { version = "0.36", default-features = false }
 mh3u-mods.workspace = true
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 pollster = "0.4"
 xxhash-rust = { version = "0.8.19", features = ["xxh3"] }
 
