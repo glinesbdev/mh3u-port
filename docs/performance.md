@@ -208,6 +208,33 @@ move the village on its own.
    should show `vertex streams given buffers` well under the old ~20 stream misses a frame, and `[gfx caches]` should show fewer
    bind groups. `command encoding (finish)` gives the steady cost that is left.
 
+   **Runs 19 (cold caches) and 20 (warm), PR #7 (b9e3ead):**
+   - **The once-a-second dips are gone.** Neither run has a `[gfx slow frame]` every 60 frames in the field.
+     - Pruning at the swap costs about 0.11 ms a frame there.
+     - It lets go of about 20 streams and 70–84 bind groups a frame, a few at a time.
+     - `vertex streams given buffers` is 0.3 a frame standing still and 0.8 in the window of an entry, against about 20 new
+       streams a frame with buffers before.
+   - **Moga Woods holds 82 FPS** (82.0–82.6), up from 63–64 in run 18. The village stays at the display's 120.
+   - **The steady field cost per frame (run 20):**
+     - `GX2DirectCallDisplayList`: 7.1 ms, down from 9.25.
+     - `command encoding (finish)`: 2.75 ms.
+     - `arena uploads`, now only the writes: 0.05 ms.
+     - `submit`: 0.59 ms.
+     - The cheaper timing shows too: `GX2SetPixelSampler`'s ~2,700 calls a frame took 0.10 ms, against 0.53 ms in run 18.
+   - **Warm area changes take 10.0–16.9 ms** (run 20), against 35.8–49.4 ms cold (run 19). Cold, the frame went to making shader
+     modules (5–8 modules, 18–26 ms).
+   - **Still slow:**
+     - *About 37–41 ms after entering the field (warm).* Run 20 frame 1374 (41.1 ms): `decode streams` 14.3 ms over 302 draws,
+       12.1 ms of it decoding 170 new streams. Frame 2013 (37.2 ms): texture views 9.8 ms (61 decodes, 5.9 ms) and streams
+       5.4 ms.
+     - *Cold, worse.* Run 19 frame 1521 took 118 ms: `shaders` 80 ms over 382 draws (shader modules made on the render thread),
+       plus the same stream decoding.
+     - *Frame 71:* `geometry pass` 35.8–36.1 ms, both runs. Geometry pipelines are made on the render thread, warm or cold.
+     - *Loading screens:* 206–209 ms frames with 177–179 ms decoding 3 textures, and a 25 ms frame decoding one texture (21 ms).
+     - *One warm field frame,* run 20 frame 2687 (26.4 ms), spent 11.2 ms in `shaders`.
+
+     These are what PR #8 (decoding on workers) is for.
+
 ## Fixed (for the record)
 
 - Field slowdown while standing still (runs 11–13): vertex streams made every frame were kept until 1 GiB, and wgpu's per-pass
