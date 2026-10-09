@@ -13,6 +13,9 @@ use std::collections::BTreeSet;
 use std::io::Write;
 use std::process::{Command, Stdio};
 
+/// Whose each state is, in the messages: the C program's first, the interpreter's second.
+const C_VS_INTERPRETER: [&str; 2] = ["c", "interpreter"];
+
 /// The flags the tests add (MH3U_TEST_CFLAGS), split at spaces.
 fn extra_flags() -> Vec<String> {
     std::env::var("MH3U_TEST_CFLAGS")
@@ -247,15 +250,10 @@ fn the_translated_c_of_every_instruction_does_what_the_interpreter_does() {
         for (k, st) in it.states.iter().enumerate() {
             match interpret(&[it.word], st, k) {
                 Ok((ours, _)) => {
-                    let mut d = differences(it.op, &c_states[k], &ours);
-                    d.extend(ps_differences(&c_states[k], &ours));
+                    let mut d = differences_named(it.op, &c_states[k], &ours, C_VS_INTERPRETER);
+                    d.extend(ps_differences_named(&c_states[k], &ours, C_VS_INTERPRETER));
                     if !d.is_empty() {
-                        failures.push(format!(
-                            "{} {:#010x} case {k}: {} (c first, interpreter second)",
-                            it.op.name(),
-                            it.word,
-                            d.join("; ")
-                        ));
+                        failures.push(format!("{} {:#010x} case {k}: {}", it.op.name(), it.word, d.join("; ")));
                         break;
                     }
                 }
@@ -322,9 +320,9 @@ fn the_translated_branches_go_where_the_interpreter_goes() {
         let c_states = run_program(&exe, i, &states).expect("the program ran");
         for (k, st) in states.iter().enumerate() {
             let (ours, _) = interpret(words, st, k).expect("the interpreter ran");
-            let d = differences(Add, &c_states[k], &ours);
+            let d = differences_named(Add, &c_states[k], &ours, C_VS_INTERPRETER);
             if !d.is_empty() {
-                failures.push(format!("{} {words:08x?} case {k}: {} (c first)", kinds[i], d.join("; ")));
+                failures.push(format!("{} {words:08x?} case {k}: {}", kinds[i], d.join("; ")));
                 break;
             }
         }
@@ -377,8 +375,8 @@ fn the_translated_switch_goes_where_the_interpreter_goes() {
     let mut failures = Vec::new();
     for (k, st) in states.iter().enumerate() {
         let (ours, _) = interpret(&words, st, k).expect("the interpreter ran");
-        let mut d = differences(Add, &c_states[k], &ours);
-        d.extend(ps_differences(&c_states[k], &ours));
+        let mut d = differences_named(Add, &c_states[k], &ours, C_VS_INTERPRETER);
+        d.extend(ps_differences_named(&c_states[k], &ours, C_VS_INTERPRETER));
         if !d.is_empty() {
             failures.push(format!("r3 = {}: {}", st.gpr[3], d.join("; ")));
         }
@@ -426,7 +424,7 @@ fn the_translated_reservation_pair_matches_the_interpreter() {
         let c_states = run_program(&exe, i, &states).expect("the program ran");
         for (k, st) in states.iter().enumerate() {
             let (ours, _) = interpret(words, st, k).expect("the interpreter ran");
-            let d = differences(Add, &c_states[k], &ours);
+            let d = differences_named(Add, &c_states[k], &ours, C_VS_INTERPRETER);
             if !d.is_empty() {
                 failures.push(format!("larx {words:08x?} case {k}: {}", d.join("; ")));
                 break;

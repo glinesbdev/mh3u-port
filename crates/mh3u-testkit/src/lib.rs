@@ -595,12 +595,18 @@ pub fn interpret(words: &[u32], st: &St, i: usize) -> Result<(St, usize), Stop> 
     Ok((out, mem.outside))
 }
 
-/// What differs between two states, ignoring what the harness uses.
+/// What differs between QEMU's state and the interpreter's, ignoring what the harness uses.
 pub fn differences(op: Op, qemu: &St, ours: &St) -> Vec<String> {
+    differences_named(op, qemu, ours, ["qemu", "interpreter"])
+}
+
+/// What differs between two states, ignoring what the harness uses; `names` say whose each is in the messages.
+pub fn differences_named(op: Op, qemu: &St, ours: &St, names: [&str; 2]) -> Vec<String> {
+    let [x, y] = names;
     let mut d = Vec::new();
     for r in 0..30 {
         if qemu.gpr[r] != ours.gpr[r] {
-            d.push(format!("r{r}: qemu {:#010x}, interpreter {:#010x}", qemu.gpr[r], ours.gpr[r]));
+            d.push(format!("r{r}: {x} {:#010x}, {y} {:#010x}", qemu.gpr[r], ours.gpr[r]));
         }
     }
     for f in 0..32 {
@@ -611,25 +617,25 @@ pub fn differences(op: Op, qemu: &St, ours: &St) -> Vec<String> {
             a == b
         };
         if !same {
-            d.push(format!("f{f}: qemu {a:#018x}, interpreter {b:#018x}"));
+            d.push(format!("f{f}: {x} {a:#018x}, {y} {b:#018x}"));
         }
     }
     if qemu.cr != ours.cr {
-        d.push(format!("cr: qemu {:#010x}, interpreter {:#010x}", qemu.cr, ours.cr));
+        d.push(format!("cr: {x} {:#010x}, {y} {:#010x}", qemu.cr, ours.cr));
     }
     if qemu.xer & 0xe000_007f != ours.xer & 0xe000_007f {
-        d.push(format!("xer: qemu {:#010x}, interpreter {:#010x}", qemu.xer, ours.xer));
+        d.push(format!("xer: {x} {:#010x}, {y} {:#010x}", qemu.xer, ours.xer));
     }
     if qemu.lr != ours.lr {
-        d.push(format!("lr: qemu {:#010x}, interpreter {:#010x}", qemu.lr, ours.lr));
+        d.push(format!("lr: {x} {:#010x}, {y} {:#010x}", qemu.lr, ours.lr));
     }
     if qemu.ctr != ours.ctr {
-        d.push(format!("ctr: qemu {:#010x}, interpreter {:#010x}", qemu.ctr, ours.ctr));
+        d.push(format!("ctr: {x} {:#010x}, {y} {:#010x}", qemu.ctr, ours.ctr));
     }
     if qemu.scratch != ours.scratch {
         let at = qemu.scratch.iter().zip(&ours.scratch).position(|(a, b)| a != b).unwrap_or(0);
         d.push(format!(
-            "memory at +{at}: qemu {:02x?}, interpreter {:02x?}",
+            "memory at +{at}: {x} {:02x?}, {y} {:02x?}",
             &qemu.scratch[at..at + 8.min(256 - at)],
             &ours.scratch[at..at + 8.min(256 - at)]
         ));
@@ -725,14 +731,20 @@ pub fn run_sequence(name: &str, words: &[u32], states: &[St], note: &dyn Fn(&St)
 
 /// What differs in the second halves of the registers and the quantization registers (QEMU has neither, so `differences` leaves them).
 pub fn ps_differences(a: &St, b: &St) -> Vec<String> {
+    ps_differences_named(a, b, ["", ""])
+}
+
+/// `ps_differences`, with whose each state is in the messages.
+pub fn ps_differences_named(a: &St, b: &St, names: [&str; 2]) -> Vec<String> {
+    let [x, y] = names.map(|n| if n.is_empty() { String::new() } else { format!("{n} ") });
     let mut d = Vec::new();
     for f in 0..32 {
         if a.ps1[f] != b.ps1[f] {
-            d.push(format!("ps1 of f{f}: {:#018x}, {:#018x}", a.ps1[f], b.ps1[f]));
+            d.push(format!("ps1 of f{f}: {x}{:#018x}, {y}{:#018x}", a.ps1[f], b.ps1[f]));
         }
     }
     if a.gqr != b.gqr {
-        d.push(format!("gqr: {:x?}, {:x?}", a.gqr, b.gqr));
+        d.push(format!("gqr: {x}{:x?}, {y}{:x?}", a.gqr, b.gqr));
     }
     d
 }
