@@ -12,7 +12,7 @@ architecture book. It is what everything else is compared with. Not modelled: th
 game's code never touches the register: spike 2), the hardware's estimate tables for `fres` and `frsqrte` (the exact reciprocal is used,
 within the hardware's stated error), and the privileged and 64-bit instructions (the game uses none).
 
-## QEMU as the oracle (`crates/mh3u-ppc/tests/`)
+## QEMU as the oracle (`crates/mh3u-testkit/tests/`)
 
 `qemu-ppc-static` (QEMU's user-mode PowerPC emulator, `-cpu 750`) is an independent implementation of the instruction set. The tests
 build a small static 32-bit big-endian ELF for each case, with no linker: a stub loads a whole register state (32 GPRs, 32 FPRs, CR, XER,
@@ -202,8 +202,8 @@ with their text and the cloth background, upright, in the right places (the hunt
 
 **Not done yet:** 3D textures, the component selectors of a texture (`compMap`), the rest of the sampler state (borders, the mip bias), alpha
 test and stencil, depth bias, other geometry inputs (lines, triangles, instances), loops and relative
-addressing in vertex shaders, rects and other primitive types, stream out, the second render target (the GamePad's picture is
-drawn but not shown), and speed: every draw makes its own buffers and render pass.
+addressing in vertex shaders, rects and other primitive types, stream out, and the second render target (the GamePad's picture is
+drawn but not shown). (Speed is in "Speed" above: draws are batched and their buffers come from arenas.)
 
 Looking at what it draws: `MH3U_GFX_SAVE=<folder>` writes the TV picture as a PPM every `MH3U_GFX_SAVE_EVERY` swaps (120 by default),
 `MH3U_GFX_SAVE_IMAGE=<hex image address>` saves a given colour buffer instead; `MH3U_GFX_SOLID=1` makes every pixel red (to see

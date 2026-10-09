@@ -1,8 +1,12 @@
 # mh3u-port
 
-Groundwork for a native PC port of Monster Hunter 3 Ultimate (Wii U) for Linux and Windows. **Private for now.** Nothing here runs
-the game yet; read [`docs/pc-port.md`](docs/pc-port.md) for what the project is meant to be, and [`docs/spikes.md`](docs/spikes.md)
-for what has been measured so far.
+A native PC port of Monster Hunter 3 Ultimate (Wii U) for Linux and Windows, in progress. **Private for now.** The game's PowerPC code
+is translated ahead of time into C, built into a library on the owner's machine, and run against a runtime in Rust that stands in for
+the console's system libraries, with the graphics on `wgpu`. It starts, reaches its character screen and the village, draws them with
+translated shaders, and reads keyboard, mouse and gamepads; much of the graphics is incomplete and there is no sound yet. Tested on
+Linux only so far. Read [`docs/pc-port.md`](docs/pc-port.md) for what the project is meant to be, [`docs/spikes.md`](docs/spikes.md)
+for what was measured before it was built, and [`docs/translator.md`](docs/translator.md) for how the translator, the runtime and the
+graphics work and what is not done.
 
 **You must own the game.** This repository contains no game code and no game data, and the port will not run without your own dump of
 your own copy of the Wii U game (base game `0005000010118300` and its update `0005000e10118300`). See the first section of
@@ -14,10 +18,14 @@ your own copy of the Wii U game (base game `0005000010118300` and its update `00
 |---|---|
 | `mh3u-formats` | the game's executable (`.rpx`: sections, imports), archives (`.arc`) and text (`.gmd`), with bounded decompression and tests on damaged files |
 | `mh3u-dump` | finds the owner's dump and checks that it is this game |
-| `mh3u-ppc` | decodes the Wii U's PowerPC instructions (spike 2) |
-| `mh3u-latte` | reads the Wii U GPU's shader programs and counts what is in them (spike 3) |
+| `mh3u-ppc` | decodes the Wii U's PowerPC instructions, and a reference interpreter checked against QEMU |
+| `mh3u-recomp` | the translator: each function of the game's code as C (`ppc.h` gives each instruction its meaning), function discovery, switch tables |
+| `mh3u-rt` | the runtime: guest memory, threads, the system libraries' functions, input; loads the translated library and runs the game (the one crate that may use `unsafe`) |
+| `mh3u-gfx` | the graphics: GX2 calls to `wgpu` (state, draws, textures, geometry shaders as compute shaders) |
+| `mh3u-latte` | reads the Wii U GPU's shader programs and translates them to WGSL |
+| `mh3u-testkit` | the tests of the interpreter against QEMU and of the translated C against the interpreter |
 | `mh3u-cemu` | reads the memory of a running Cemu (Linux), to compare the port with the emulator |
-| `mh3u-tools` | explorers: `dump`, `sections`, `imports`, `coverage`, `shaders` (spike 3), `scan-shaders` (spike 3, needs Cemu), `program-census`, `section`, `codegen-bench` (spike 4), `arcls`, `arcx`, `gmd`, `arcsearch` |
+| `mh3u-tools` | the program and the explorers: `translate`, `build-game`, `run`, `disasm`, `functions`, `dump`, `sections`, `imports`, `coverage`, `shaders`, `latte-*`, `scan-shaders` (needs Cemu), `program-census`, `section`, `codegen-bench` (spike 4), `arcls`, `arcx`, `gmd`, `arcsearch` |
 
 ```
 cargo run -p mh3u-tools -- dump "/path/to/your/games folder"

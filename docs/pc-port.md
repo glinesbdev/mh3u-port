@@ -1,7 +1,10 @@
 # A PC port of Monster Hunter 3 Ultimate: a proposal
 
-Status: **a proposal; the groundwork exists and spike 1 is done (see `docs/spikes.md`), nothing of the port itself is built.** This document says what the project would be, what it needs from you, how it would be
-built and in what order, and what is not known. It is meant to be argued with before any of it is started. The companion app in this
+Status: **written as a proposal before the port was built; the spikes are done (`docs/spikes.md`) and the port now exists.** The
+translator, the runtime and the graphics run the game to its character screen and the village (steps 4 to 6 below, and input from step 7);
+`docs/translator.md` says how, and what is not done. The plan below is kept as it was argued, with the crate table brought up to date.
+This document says what the project would be, what it needs from you, how it would be
+built and in what order, and what is not known. It was meant to be argued with before any of it was started. The companion app in this
 repository was the groundwork; this repository started from copies of its readers (see "What the companion app gave"), and the port
 itself is new crates here.
 
@@ -88,14 +91,17 @@ New crates, beside the existing ones (nothing is renamed):
 
 | Crate | What it does | Built from |
 |---|---|---|
-| `mh3u-core` | the game's files and the save, as now | exists |
-| `mh3u-dump` | finds and **verifies the owner's dump** (title ids, sizes, hashes) and says what is wrong; the only way any other crate learns where the game is | new |
-| `mh3u-ppc` | decodes Espresso instructions and translates them to C (the recompiler); the decoder exists | decoder done |
-| `mh3u-rt` | the runtime: guest memory, threads, the Cafe OS functions, the entry point. **The one crate that may use `unsafe`** | new |
-| `mh3u-gfx` | GX2 to `wgpu`: shaders, textures, render state | new |
-| `mh3u-platform` | window, input, audio, saves on disk | new |
-| `mh3u-port` | the program: asks for the dump, runs the recompiler on first start, then the game | new |
-| `mh3u-tools` | explorers (`imports`, a disassembly listing, coverage) | exists, grows |
+| `mh3u-formats` | the game's files (planned as `mh3u-core`; the save is not read here) | exists |
+| `mh3u-dump` | finds the owner's dump and checks that it is this game (title ids and files; the hash check is not written yet); the only way any other crate learns where the game is | exists |
+| `mh3u-ppc` | decodes Espresso instructions; the reference interpreter | exists |
+| `mh3u-recomp` | translates the code to C (the recompiler; planned as part of `mh3u-ppc`) | exists |
+| `mh3u-rt` | the runtime: guest memory, threads, the Cafe OS functions, the entry point, input. **The one crate that may use `unsafe`** | exists |
+| `mh3u-gfx` | GX2 to `wgpu`: render state, draws, textures, the window | exists |
+| `mh3u-latte` | the GPU's shader programs, to WGSL | exists |
+| `mh3u-testkit` | the interpreter against QEMU, the translated C against the interpreter | exists |
+| `mh3u-platform` | window, input, audio, saves on disk | not made: the window is in `mh3u-gfx`, input and saves in `mh3u-rt`, no audio |
+| `mh3u-port` | the program: asks for the dump, runs the recompiler on first start, then the game | not made: `mh3u-tools translate`, `build-game` and `run` do it by hand |
+| `mh3u-tools` | explorers, and the commands that translate, build and run the game | exists |
 
 First start: the owner points the port at their dump; `mh3u-dump` verifies it; `mh3u-ppc` reads the executable from it and writes
 the translated program into the owner's own cache folder (never into the repository); later starts reuse it. Delete the cache and

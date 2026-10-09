@@ -8,7 +8,7 @@ edition = "2024"
 license = "Unlicense"
 
 [workspace.lints.rust]
-# nothing needs unsafe yet; the runtime crate, when there is one, is the only place that may (see docs/pc-port.md)
+# the runtime crate (mh3u-rt) is the only place that may use unsafe; it allows it in its own Cargo.toml (see docs/code-guidelines.md)
 unsafe_code = "forbid"
 
 [workspace.dependencies]

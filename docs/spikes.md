@@ -54,7 +54,8 @@ book.
   Direct branches are easy. The 4,822 indirect jumps are jump tables (switch statements) and tail calls, and each one has to be
   resolved to the list of places it can go; that is the known hard part of a static recompiler and it is a few thousand, not tens of
   thousands. The 30,605 indirect calls (function pointers and virtual calls) go through a table from the game's own addresses to the
-  translated functions, filled at start: they cost a lookup each and need no analysis.
+  translated functions, filled at start: they cost a lookup each and need no analysis. *(Later note: the table is a hash table made by
+  the translator in `dispatch.c`; see "The whole executable" in `translator.md`.)*
 
 Reading it:
 
@@ -63,7 +64,7 @@ Reading it:
 - **The size is not small.** 4.6 million instructions translate to many millions of lines of generated code. Whether that compiles in
   a reasonable time, and as what (Rust, or C for a C compiler the owner must then have), is **not known**, and `pc-port.md` plans to
   generate Rust. A spike to settle it is needed before going on: translate a few thousand functions, compile them as Rust and as C,
-  and time both (spike 4 below).
+  and time both (spike 4 below). *(Later note: spike 4 settled it, and the translator emits C; see `translator.md`.)*
 - About 127,000 returns means on the order of a hundred thousand functions: the translated program is split into many files, which the
   owner's machine builds once, on first start.
 
