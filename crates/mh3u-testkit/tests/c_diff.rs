@@ -5,6 +5,7 @@
 
 use mh3u_ppc::Op::{self, *};
 use mh3u_ppc::{Insn, interp::Stop};
+use mh3u_recomp::toolchain::Toolchain;
 use mh3u_recomp::{CFlags, RUNTIME_H, emit_function, function_name};
 use mh3u_testkit::harness::*;
 use mh3u_testkit::*;
@@ -12,23 +13,55 @@ use std::collections::BTreeSet;
 use std::io::Write;
 use std::process::{Command, Stdio};
 
-/// A C compiler, if there is one.
-fn compiler() -> Option<&'static str> {
-    ["clang", "cc", "gcc"].into_iter().find(|c| {
-        Command::new(c)
-            .arg("--version")
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .is_ok_and(|s| s.success())
-    })
+/// The flags the tests add (MH3U_TEST_CFLAGS), split at spaces.
+fn extra_flags() -> Vec<String> {
+    std::env::var("MH3U_TEST_CFLAGS")
+        .unwrap_or_default()
+        .split_whitespace()
+        .map(str::to_string)
+        .collect()
+}
+
+/// How to start a test program: directly, or through MH3U_TEST_RUNNER (such as `wine`, with MH3U_TEST_CFLAGS=--target=x86_64-w64-windows-gnu,
+/// to check the Windows build of the C from Linux).
+fn launcher(exe: &std::path::Path) -> Command {
+    match std::env::var("MH3U_TEST_RUNNER") {
+        Ok(r) if !r.trim().is_empty() => {
+            let mut words = r.split_whitespace();
+            let mut c = Command::new(words.next().expect("a runner"));
+            c.args(words).arg(exe);
+            c
+        }
+        _ => Command::new(exe),
+    }
+}
+
+/// The C compiler `build-game` would use (see `mh3u_recomp::toolchain`), if there is one.
+fn compiler() -> Option<Toolchain> {
+    match Toolchain::detect(&extra_flags()) {
+        Ok(t) => Some(t),
+        Err(e) => {
+            eprintln!("no usable C compiler: {e}");
+            None
+        }
+    }
 }
 
 const MAIN: &str = r#"
 #include "ppc.h"
 #include <stdio.h>
 #include <stdlib.h>
+#ifdef _WIN32
+#include <fcntl.h>
+#include <io.h>
+/* not windows.h: its names (recv and others) clash with ppc.h's */
+__declspec(dllimport) void *__stdcall VirtualAlloc(void *, size_t, unsigned long, unsigned long);
+#define MEM_COMMIT 0x1000
+#define MEM_RESERVE 0x2000
+#define PAGE_READWRITE 0x04
+#else
 #include <sys/mman.h>
+#endif
 #define STATE 0x400
 #define IN_BASE 0x10002000u
 #define SCRATCH_AT 0x200
@@ -49,8 +82,17 @@ static void put64(uint8_t *p, uint64_t v) { put32(p, v >> 32); put32(p + 4, (uin
 int main(int argc, char **argv) {
     int idx = atoi(argv[1]);
     size_t n = (size_t)atoi(argv[2]);
+    /* the states and their scratch memory at a fixed place, where the guest addresses are host addresses (c.mem is 0); the call fails
+       rather than replace something already there */
+#ifdef _WIN32
+    _setmode(_fileno(stdin), _O_BINARY);
+    _setmode(_fileno(stdout), _O_BINARY);
+    uint8_t *mem = VirtualAlloc((void *)0x10000000, 0x800000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+    if (mem != (uint8_t *)0x10000000) return 2;
+#else
     uint8_t *mem = mmap((void *)0x10000000, 0x800000, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
     if (mem == MAP_FAILED) return 2;
+#endif
     uint8_t *in = malloc(n * STATE), *out = calloc(n, STATE);
     if (fread(in, 1, n * STATE, stdin) != n * STATE) return 3;
     for (size_t i = 0; i < n; i++) {
@@ -91,7 +133,7 @@ fn build_program(programs: &[Vec<u32>], tag: &str) -> Result<std::path::PathBuf,
 
 /// Compile translated functions (`src`) into a program whose table holds the functions `entries`.
 fn compile(src: &str, entries: &[String], tag: &str) -> Result<std::path::PathBuf, String> {
-    let cc = compiler().ok_or("no C compiler")?;
+    let tc = compiler().ok_or("no C compiler")?;
     let dir = std::env::temp_dir().join(format!("mh3u-c-diff-{}-{tag}", std::process::id()));
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     std::fs::write(dir.join("ppc.h"), RUNTIME_H).map_err(|e| e.to_string())?;
@@ -103,19 +145,18 @@ fn compile(src: &str, entries: &[String], tag: &str) -> Result<std::path::PathBu
     src.push_str("};\n");
     std::fs::write(dir.join("gen.c"), src).map_err(|e| e.to_string())?;
     std::fs::write(dir.join("main.c"), MAIN).map_err(|e| e.to_string())?;
-    let exe = dir.join("prog");
+    let exe = dir.join(format!("prog{}", tc.exe_suffix()));
     // the flags the library is built with (MH3U_TEST_CFLAGS adds more, such as -march=native, to check a build for this machine)
-    let extra = std::env::var("MH3U_TEST_CFLAGS").unwrap_or_default();
-    let out = Command::new(cc)
+    let out = Command::new(&tc.cc)
         .args(CFlags::default().args())
-        .args(extra.split_whitespace())
+        .args(extra_flags())
         .args(["-w", "-I"])
         .arg(&dir)
         .arg(dir.join("gen.c"))
         .arg(dir.join("main.c"))
         .arg("-o")
         .arg(&exe)
-        .arg("-lm")
+        .args(tc.link_args())
         .output()
         .map_err(|e| e.to_string())?;
     if !out.status.success() {
@@ -132,7 +173,7 @@ fn run_program(exe: &std::path::Path, idx: usize, states: &[St]) -> Result<Vec<S
     for s in states {
         input.extend(state_bytes(s));
     }
-    let mut child = Command::new(exe)
+    let mut child = launcher(exe)
         .arg(idx.to_string())
         .arg(states.len().to_string())
         .stdin(Stdio::piped())
