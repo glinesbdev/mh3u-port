@@ -4,3 +4,13 @@
 # No real addresses yet (step 5 of the plan finds them). To try the mechanism, list any function the translator found, e.g. one
 # from an [enter] or [watch] log line, or an f_XXXXXXXX name in game.h:
 # 0x02000000 example
+
+# Run 30 candidates (docs/hooks.md, "Hook points"): what each function was seen writing in the live save.
+0x0219acec pouch_set_slot     # writes a pouch slot's id/count (item added to or taken from the pouch)
+0x0219ae84 pouch_clear_slot   # zeroes a pouch slot (last one used or dropped)
+0x02199408 box_set_count      # changes an item box slot's count
+0x02198770 box_take           # lowers/clears item box slots (moved to the pouch, or used as materials)
+0x02199438 box_put            # puts a new item into an empty item box slot
+0x0219c720 money_set          # writes the money (+0x48); called from shop, smithy and quest code
+0x0216afd4 money_set_quest    # writes the money once, at the quest start/return
+0x02198d40 loadout_write      # rewrites the records at +0x50..+0xbf (twice: quest start and return?)

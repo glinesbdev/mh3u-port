@@ -238,8 +238,10 @@ impl Overlay {
                         mods::watch(&[(at, live::LEN)]);
                         // MH3U_WATCH=live: log the stores to it, to find the functions to hook (docs/hooks.md)
                         let (lo, hi) = live::WATCH_SPAN;
-                        if mods::watch_writes(at + lo, at + hi, Box::new(move |a| live::field(a - at))) {
-                            // and the working copies of the pouch, if the save is only the save image
+                        if mods::watch_writes(at + lo, at + hi, Box::new(move |a| live::field(a - at)))
+                            && std::env::var_os("MH3U_WATCH_COPY").is_some()
+                        {
+                            // and, asked for with MH3U_WATCH_COPY, other copies of the pouch (run 30 found the save itself is the one written)
                             const POUCH: i64 = 0xd0;
                             mods::watch_copies(
                                 at + POUCH as u32,

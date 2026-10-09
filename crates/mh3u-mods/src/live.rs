@@ -244,13 +244,14 @@ pub(crate) mod tests {
 
 /// The part of the live save `MH3U_WATCH=live` watches (offsets from the block): money, the worn equipment, the pouch, the item box
 /// and the equipment box.
-pub const WATCH_SPAN: (u32, u32) = (0x49, 0x1150 + 1000 * 16);
+pub const WATCH_SPAN: (u32, u32) = (0x48, 0x1150 + 1000 * 16);
 
 /// What a byte of the live save at `offset` is, for the write log: `pouch 3 count`, `box 120 id`, `equipment 7`, `money`...
 pub fn field(offset: u32) -> String {
     let slot = |base: u32, len: u32| ((offset - base) / len, (offset - base) % len);
     match offset {
-        0x49..0x4d => "money".into(),
+        // run 30: the game writes the money as a word at +0x48 (the companion reads it from +0x49)
+        0x48..0x4c => "money".into(),
         0xc0..0xd0 => "worn equipment".into(),
         0xd0..0x130 => {
             let (n, b) = slot(0xd0, 4);
@@ -270,7 +271,8 @@ mod field_tests {
     #[test]
     fn writes_are_named_by_field() {
         use super::field;
-        assert_eq!(field(0x4a), "money");
+        assert_eq!(field(0x48), "money");
+        assert_eq!(field(0x4c), "save +0x4c");
         assert_eq!(field(0xd0), "pouch 0 id");
         assert_eq!(field(0xd6), "pouch 1 count");
         assert_eq!(field(0x1b0 + 4 * 120), "box 120 id");

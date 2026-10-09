@@ -87,16 +87,30 @@ for other copies of those 96 bytes. It logs them all (`[watch-live] the pouch is
 around the copy; where the layout differs, labels read `pouch -N` or `save +0x…`. The pouch needs at least 3 items for the
 search.
 
-Hook-point table (filled in from the next log):
+### Run 30 (user): writers found
 
-| Action | Function | Confidence |
-|---|---|---|
-| item added (pickup) | not found yet | – |
-| item used / removed | not found yet | – |
-| pouch <-> box | not found yet | – |
-| money (buy/sell) | not found yet | – |
-| craft / upgrade | not found yet | – |
-| quest start / end | not found yet (second pass) | – |
+The save block **is** written during play. Run 29's empty log is unexplained; maybe the save was found after the actions.
+- **The copy search** found nothing to add (it is now off unless `MH3U_WATCH_COPY` is set).
+- **The overlay already re-parses this block every frame**, so its counts are live.
+- **Money** is the word at `+0x48` (the labels are fixed; the write at `+0x4c`, 0x7b6b, comes before any action and is still
+  unknown).
+- **Not seen:** no write reached the equipment box, so crafting or upgrading armour isn't found. Neither is quest start/end as
+  such.
+- **Host copies:** two runtime copies (`[watch-host]`) wrote the 96-byte pouch, one early and one at the end, probably the
+  supplies after the quest.
+
+Hook-point table. The actions are matched by the order of the lines and the values written, so they are guesses until the
+confirm run:
+
+| Action | Function (`mods/hooks.txt` name) | Evidence | Confidence |
+|---|---|---|---|
+| use / drop a pouch item | `f_0219ae84` `pouch_clear_slot`, `f_0219acec` `pouch_set_slot` | pouch 4 count 0, id 0 | medium |
+| item into the pouch (pickup, or from the box) | `f_0219acec` `pouch_set_slot` | pouch 4 <- id 0x18, count 1 | medium |
+| move box -> pouch / materials used | `f_02198770` `box_take` | box 124 count 0x13, box 126 cleared | medium |
+| item into the box | `f_02199438` `box_put`, `f_02199408` `box_set_count` | box 126 <- id 0x45e, count 1; box 35 count 12 | low–medium |
+| buy / sell, smithy fee | `f_0219c720` `money_set` | +0x48: 24015 -> 23815 (lr 0x2217cd4, 0x22087d4) | high (that it writes money) |
+| quest start / return | `f_0216afd4` `money_set_quest`, `f_02198d40` `loadout_write` | money 23505 then back to 23815 at the end; +0x50..+0xbf rewritten twice | low |
+| craft / upgrade equipment | not found | no equipment-box write | – |
 
 From that log, the functions that wrote each field go into `mods/hooks.txt`. Menu-open and quest hooks need a second pass:
 `MH3U_ENTER_LR` on the callers found here, or watching a menu or quest field once one is known.
@@ -115,6 +129,6 @@ From that log, the functions that wrote each field go into `mods/hooks.txt`. Men
 
 See the bottom of this file. It is updated with each commit of PR #13.
 
-- Status: run 29 found no writes, because the watched block is the save image. The tool now finds and watches the working copies
-  of the pouch (PR #14). `mods/hooks.txt` has no candidates yet.
-- Next: the user rebuilds the watch build and repeats the 6 actions with at least 3 items in the pouch, then sends `watch.log`.
+- Status: the run 30 candidates are in `mods/hooks.txt` and the table (PR #14).
+- Next: a confirm run with a normal build and `MH3U_HOOK_LOG=1` (steps in the PR #14 report), to tie each hook to its action.
+  Craft and quest need a second pass.
