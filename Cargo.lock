@@ -1007,6 +1007,9 @@ version = "0.1.0"
 [[package]]
 name = "mh3u-ppc"
 version = "0.1.0"
+dependencies = [
+ "libm",
+]
 
 [[package]]
 name = "mh3u-recomp"

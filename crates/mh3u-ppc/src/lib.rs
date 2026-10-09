@@ -42,6 +42,7 @@ pub enum Class {
     Only64,
 }
 
+pub mod fused;
 pub mod insn;
 pub mod interp;
 pub mod paired;

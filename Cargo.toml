@@ -16,6 +16,7 @@ anyhow = "1"
 flate2 = "1"
 clap = { version = "4", features = ["derive"] }
 memchr = "2"
+libm = "0.2"
 mh3u-formats = { path = "crates/mh3u-formats" }
 mh3u-dump = { path = "crates/mh3u-dump" }
 mh3u-cemu = { path = "crates/mh3u-cemu" }
