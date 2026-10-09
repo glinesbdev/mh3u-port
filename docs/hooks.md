@@ -5,7 +5,9 @@ Mods so far only read memory (`overlay.md`). Hooks let a mod run native code whe
 
 ## Design
 
-- **The list:** `mods/hooks.txt` in the repo, one hook per line (`0x02123456 name`; the address is hex and the `0x` is optional; `#` starts a comment). The translated
+- **The list:** `mods/hooks.txt` in the repo, one hook per line (`0x02123456 name`; the address is hex and the `0x` is optional; `#` starts a comment). `in:0xADDR name` hooks the function *containing*
+  that address: the translator takes the nearest function start at or below it, and prints `[hooks] in:0x… name is in f_…
+  (+0x…)`. The translated
   functions are named `f_XXXXXXXX` in the build's `game.h` and `part_*.c` (`f_02123456` is `0x02123456`), which is where to
   look for addresses. It holds addresses
   and names only, nothing from the game. `mh3u-tools translate` reads it and copies it to the build (`<c dir>/hooks.txt`), so the
@@ -141,6 +143,49 @@ Still missing, with the cheapest next step for each:
   live watch again on that pouch slot.
 - **Menu open:** no data field is known. `MH3U_PROFILE` with the menu open versus closed would show the menu's functions.
 
+### Craft and quest hooks (PR #15)
+
+The `money_add` call sites from run 31 are hooked through the functions that contain them (`in:` entries): `craft_jewel` (lr
+`0x22087d4`), `craft_armour` (`0x220715c`), `quest_accept` (`0x21e3724`) and `quest_abandon` (`0x2172ca4`). The translator
+prints which `f_` each one is.
+- **Shared functions:** if two land in one function, its name is `a+b`. Such a function, or one that also fires on other
+  frames, is shared code, not the action; then hook one level up (the lr of its log line).
+- **Not hooked yet:** weapon craft or upgrade, and the quest reward. They are likely other callers of `money_add`. Its
+  `[hook] money_add ... lr 0x…` lines give their call sites, which become new `in:` entries.
+
+### Run 32 (user): craft and quest hooks
+
+| Hook | Function | Verdict | Arguments | Seen on |
+|---|---|---|---|---|
+| `craft_jewel` | `f_02208758` | **confirmed** | r4 = 5, r3 = the smithy (0x2e6607c0) | crafting a jewel (-200) |
+| `craft_equipment` (was craft_armour) | `f_022070cc` | **confirmed** | r4 = 7 for both armour and a Great Sword (not the kind) | crafting armour (-300) and a Great Sword (-750) |
+| `upgrade_equipment` | containing lr `0x220c078` | new | – | upgrading a weapon (-4000) |
+| `quest_accept` | `f_021e355c` | **confirmed** | r4 = the quest's data, r5 = the quest's number (0x4b2, 0x450) | accepting two quests (-100 each) |
+| `quest_end` (was quest_abandon) | `f_0217242c` | **confirmed** | r4 = 1 both times (not the outcome) | abandoning, then a refund of +100 (lr `0x2172ca4`); completing, then the payments below |
+| `quest_fee_back` | containing lr `0x21794c8` | new | – | +200 just before `quest_end` on completion |
+| `quest_reward` | containing lr `0x217f12c` | new, likely | – | +800 after completion |
+| `quest_reward_items` | containing lr `0x217f5b0` | new, low | – | 10 small payments (8 to 0x87) after completion |
+
+`quest_end`'s r4 does not tell an abandon from a completion. What follows does: a `money_add` from lr `0x2172ca4` means
+abandoned; `quest_fee_back` and `quest_reward` mean completed.
+
+### Run 33 (user): upgrade and quest reward
+
+| Hook | Function | Verdict | Arguments | Seen on |
+|---|---|---|---|---|
+| `upgrade_equipment` | `f_0220b93c` | **confirmed** | r4 = 5, r3 = the smithy | a weapon upgrade, then `money_add` -4000 |
+| `quest_reward` | `f_0217ef68` | **confirmed** | r3/r4 = the reward screen; r5 = 1, then 5 (a step?) | twice after `quest_end`, then `money_add` +1000 (lr `0x217f12c`) |
+| `quest_fee_back` | containing lr `0x21794c8` | not seen in run 33: off (commented out) | – | run 32 only |
+| `quest_reward_items` | containing lr `0x217f5b0` | not seen in run 33: off | – | run 32 only (maybe a sale of commodities) |
+
+**Where `item_gain` puts the item:** r3 and r4 never change, and r5 is the item id. Only the lr tells where it goes:
+- `0x219b080`: the pouch (pickups in the field, and box -> pouch in run 31);
+- `0x2199574`: the box (the box slot write in run 30);
+- `0x219950c`: the box (the quest's reward items).
+
+The confidence is medium; a callback can switch on `h.ctx.lr`. Hooking the callers (`in:0x219b080` and so on) would give
+separate hooks, if those functions are not shared.
+
 ## Plan
 
 1. Write this doc. **(done)**
@@ -155,6 +200,7 @@ Still missing, with the cheapest next step for each:
 
 See the bottom of this file. It is updated with each commit of PR #13.
 
-- Status: step 5 is done for money and item gain (run 31). Four hooks are kept, four are rejected (PR #14, ready for review).
-- Next: craft and quest hooks through the callers of `money_add` (the lrs above); then step 6 (exit hooks), or step 7 (a hook
-  that drives the overlay: refresh the wishlist on `item_gain` and `money_add`).
+- Status: runs 32–33 confirmed the craft, upgrade and quest hooks (craft_jewel, craft_equipment, upgrade_equipment,
+  quest_accept, quest_end, quest_reward) and `item_gain`'s destination by lr. PR #15 is ready.
+- Next: step 7, an overlay feature driven by hooks (refresh the wishlist on `item_gain` and `money_add`, a toast on
+  `quest_reward`), or step 6 (exit hooks).

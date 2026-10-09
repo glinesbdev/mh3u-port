@@ -249,11 +249,11 @@ fn main() -> Result<()> {
             // the hooks list (docs/hooks.md): MH3U_HOOKS, or mods/hooks.txt when there is one
             let hooks_path = std::env::var_os("MH3U_HOOKS").map_or_else(|| PathBuf::from("mods/hooks.txt"), PathBuf::from);
             let hooks = match std::fs::read_to_string(&hooks_path) {
-                Ok(t) => mh3u_recomp::parse_hooks(&t).map_err(|e| anyhow::anyhow!("{}: {e}", hooks_path.display()))?,
+                Ok(t) => mh3u_recomp::parse_hook_list(&t).map_err(|e| anyhow::anyhow!("{}: {e}", hooks_path.display()))?,
                 Err(_) => Default::default(),
             };
-            if !hooks.is_empty() {
-                println!("{} hooks from {}", hooks.len(), hooks_path.display());
+            if hooks != mh3u_recomp::HookList::default() {
+                println!("{} hooks from {}", hooks.at.len() + hooks.inside.len(), hooks_path.display());
             }
             let r = translate::run(
                 &translate::Input {
