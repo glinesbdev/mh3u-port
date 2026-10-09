@@ -265,6 +265,26 @@ move the village on its own.
      pass` should be small. `texture decodes dropped as stale` should be rare, and `texture reads outside what was copied` and
      `decode jobs that panicked` 0. For a comparison, run once with `$env:MH3U_GFX_ASYNC_DECODE = 'off'`.
 
+   **Runs 21 (cold caches) and 22 (warm), PR #8 (198e2ce, merged in 747f372):**
+   - **Warm, no frame over 25 ms.** Run 22's slowest frames per window are 19.0, 22.6, 15.8 and 20.7 ms, with 0 over 33 ms.
+     Before, warm runs had 37–41 ms frames after entering the field (run 20).
+   - **Frame rates:** Moga Woods 80–87 FPS (run 22's `[fps]` 78.2–87.1), the village 115–120.
+   - **No pop-in noticed** while playing.
+   - **Counters:** `texture decodes dropped as stale`, `decode jobs that panicked` and `texture reads outside what was copied` never
+     appear (0). Per window: 17–81 textures and 32–373 vertex streams decoded on workers, and 4–85 `vertex streams from workers never
+     drawn`, which is wasted work but small.
+   - **Warm area changes take 9.6–17.7 ms,** with all shaders found on disk and their modules found made. In the 180 frames after,
+     the slowest frame is 8.7–22.6 ms.
+   - **The loading screens' 206–209 ms frames are gone** in both runs: the big textures are decoded on workers.
+   - **Frame 73/74's geometry pass** is 19.0 ms warm (run 22's slowest frame of its first window) and 13.3 ms cold (run 21 frame
+     74), down from 36 ms. One geometry pipeline is made on a worker.
+   - **Cold (run 21), what is left is shader modules.**
+     - The area-change frames take 35.4–50.3 ms, 17–28 ms of it making 5–8 shader modules.
+     - Frame 1401 took 94.5 ms: `shaders` 77 ms over 380 draws, with 37 modules made in that entry's 180 frames (97 ms).
+     - Stream decoding in those frames is down to 2–3 ms, and 161 streams were copied for workers in frame 1401.
+     - Making shader modules on workers (the way pipelines already are) is what would help next.
+   - **Steady field cost per frame (run 22):** `GX2DirectCallDisplayList` 6.9–7.0 ms, `command encoding (finish)` 2.5–2.6 ms.
+
 ## Fixed (for the record)
 
 - Field slowdown while standing still (runs 11–13): vertex streams made every frame were kept until 1 GiB, and wgpu's per-pass
