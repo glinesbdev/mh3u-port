@@ -226,6 +226,17 @@ is farther than the depth it wrote itself and loses a less-or-equal test, leavin
 the figures. Why the offsets differ is not settled (the units, 2^-24 for a 24-bit buffer, are the hardware's);
 `MH3U_GFX_DEPTH_BIAS=off` tests the explanation.
 
+**3l. Why the colour draws' bias differed from their depth-only twins (run 9).** With `MH3U_GFX_DEPTH_BIAS=off` the village's
+figures appear (and the red tint is gone with ddb7c25's uniform fix), but the shadow pass loses its bias and the player gets
+shadow acne, so the bias itself is wanted, only not where it was. Run 9's dump has the same pattern as run 8 (offsets -192 for
+draws 0-53, then -384, -256, -512, ... changing per mesh, every draw "front true"). The pipeline cache was not it: its key holds
+the bias (constant, slope scale, clamp). The cause is `GX2SetCullOnlyControl`: GX2 does it as `GX2SetPolygonControl(face,
+cullFront, cullBack, no polygon modes, offsets off)`, writing the whole of `PA_SU_SC_MODE_CNTL` (decaf, read for facts), but here it
+only set the face and culling and left the offset enables as they were. Once the shadow pass turned the offset on with
+`GX2SetPolygonControl`, every later draw kept it, with whatever `GX2SetPolygonOffset` the game had set last (it sets one per
+material whether or not the offset is on), and the first mesh of a pass kept the value of the pass before. Now
+`GX2SetCullOnlyControl` turns the offset off; the offset values are kept for the next `GX2SetPolygonControl`.
+
 ## 4. Does the generated code compile in a reasonable time? (done: as C yes, as one Rust crate no)
 
 `mh3u-tools codegen-bench <dump> <out> --lang rust|c --functions N` translates an even sample of the game's functions (found as the

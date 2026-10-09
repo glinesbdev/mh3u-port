@@ -841,9 +841,12 @@ impl Gx2 {
                 self.state().polygon_offset = offset;
             }
             Call::SetCullOnlyControl => {
+                // GX2 writes the whole of PA_SU_SC_MODE_CNTL here, as GX2SetPolygonControl with no polygon modes and no polygon
+                // offset: a draw after it has no depth bias until GX2SetPolygonControl turns it on again
                 let (face, front, back) = (a(0), a(1) != 0, a(2) != 0);
                 let st = self.state();
                 (st.front_face, st.cull_front, st.cull_back) = (face, front, back);
+                (st.offset_front, st.offset_back) = (false, false);
             }
             Call::SetPolygonControl => {
                 let (face, front, back) = (a(0), a(1) != 0, a(2) != 0);
@@ -1307,6 +1310,33 @@ mod tests {
             "playing the list does not make it again"
         );
         assert_eq!(gx2.state().fetch_shader, 0x100);
+    }
+
+    /// The shadow pass turns the polygon offset on with `GX2SetPolygonControl`; the scene's materials set their culling with
+    /// `GX2SetCullOnlyControl`, which turns it off again (it writes the whole register). Kept on, every later draw had the bias of the
+    /// last `GX2SetPolygonOffset`, which differed between a depth-only pass and its colour pass.
+    #[test]
+    fn cull_only_control_turns_the_polygon_offset_off() {
+        let mut gx2 = Gx2::new(crate::Display::noop());
+        let mut m = vec![0u8; 0x1_0000];
+        let g = Guest::new(m.as_mut_ptr());
+        let mut c = blank_ctx();
+        c.r[1] = 0x8000;
+        // front face CCW, cull back, no polygon modes, front offset on, back off
+        c.r[3..12].copy_from_slice(&[0, 0, 1, 0, 0, 0, 1, 0, 0]);
+        gx2.run(Call::SetPolygonControl, &mut c, &g);
+        c.f[1..6].copy_from_slice(&[(-192.0f64).to_bits(), 0, (-192.0f64).to_bits(), 0, 0]);
+        gx2.run(Call::SetPolygonOffset, &mut c, &g);
+        assert!(gx2.state().offset_front && !gx2.state().offset_back);
+        c.r[3..6].copy_from_slice(&[0, 0, 1]);
+        gx2.run(Call::SetCullOnlyControl, &mut c, &g);
+        let st = gx2.state();
+        assert!(!st.offset_front && !st.offset_back, "no bias after GX2SetCullOnlyControl");
+        assert!(st.cull_back && !st.cull_front);
+        assert_eq!(
+            st.polygon_offset[0], -192.0,
+            "the offset itself is kept for the next GX2SetPolygonControl"
+        );
     }
 
     #[test]

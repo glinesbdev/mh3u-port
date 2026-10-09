@@ -294,7 +294,8 @@ with their text and the cloth background, upright, in the right places (the hunt
     set. A program that indexes its registers has them as an array.
   - *State*: the texture's component selectors (`compSel`, applied to what a lookup returns, as Cemu's image views do), the alpha test
     (a discard in the pixel shader), the stencil test (`GX2SetDepthStencilControl`'s 13 arguments and `GX2SetStencilMask`; one read and
-    write mask for both faces), depth bias (`GX2SetPolygonOffset` and the enables of `GX2SetPolygonControl`; one bias for both faces),
+    write mask for both faces), depth bias (`GX2SetPolygonOffset` and the enables of `GX2SetPolygonControl`; one bias for both faces;
+    `GX2SetCullOnlyControl` writes the same register with the offset off, so it turns the bias off),
     the viewport's depth range, and a draw that culls both faces draws nothing.
   - **Diagnostics**: `MH3U_GFX_REPORT=1` prints a `[gfx report]` block every report window: draws and skipped draws by reason, the
     shaders not translated and why (with the draws skipped for each), the texture formats / tile modes / kinds read (binds, images,
@@ -308,8 +309,8 @@ with their text and the cloth background, upright, in the right places (the hunt
     words, both as the GPU reads them: little-endian); `targets.txt` is the frame's render-target chain (each image drawn into, by which draws, and which draws sampled it).
   - **Build stamp**: the log's `[gfx] build <commit>` line and the first line of each `draws.txt` name the commit the binary was
     built from (`+changes` when the working tree differed).
-  - **Depth bias off**: `MH3U_GFX_DEPTH_BIAS=off` drops the bias `GX2SetPolygonOffset` asks for, to check whether a draw loses to
-    the depth its own depth-only pass wrote with a larger bias.
+  - **Depth bias off**: `MH3U_GFX_DEPTH_BIAS=off` drops every depth bias (a debug toggle: without it the shadow pass gets acne), to
+    check whether a draw loses to the depth its own depth-only pass wrote with a different bias.
   - **Pixel shader override**: `MH3U_GFX_DEBUG_PS=<mode>` replaces what pixel shaders put out (after the program, with no alpha test),
     to tell apart where a wrong picture comes from; `MH3U_GFX_DEBUG_PS_ONLY=<hex addresses>` limits it to those shaders. Modes:
     `white` (the geometry: what is covered), `alpha1` (the program's colour made opaque: a picture that appears means the alpha was
