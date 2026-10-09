@@ -5,12 +5,20 @@
 //! yields, and when it ends. A waiting function is run again each time its thread gets the baton back, and gives up the baton again if
 //! what it waits for has not happened. This keeps the order of events the same from one run to the next, and needs no locking in the
 //! guest's memory. It also means a thread that waits by spinning on memory, without calling the system, would hold the baton forever.
+//!
+//! The baton goes to the next ready thread after the current one, in thread order (`Kernel::next_after`); a sleeping thread stays ready
+//! and looks at the clock each time the baton reaches it. Handing it on wakes only the host thread that receives it: each guest thread
+//! has its own condition variable (`Kernel::wakers`), and a host thread waits on its own until `Kernel::current` names it, so threads
+//! that are not next stay asleep however many there are. A thread that has ended never waits for the baton again: a host thread
+//! whose entry function returned ends, and one that called `OSExitThread` (deep in translated code, where it cannot unwind) parks
+//! for good with nothing to unpark it. Host threads that are not guest threads (the dump timer, the profiler) take the lock but never
+//! the baton. When the run stops (`stop_unlocked`) the process exits, so the threads still waiting are not left behind.
 
 use crate::Ctx;
 use crate::cafe::Os;
 use crate::guest::Guest;
 use std::collections::{BTreeMap, HashMap, VecDeque};
-use std::sync::{Condvar, Mutex, MutexGuard};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 /// What a system function that may have to wait says after one try.
@@ -105,6 +113,22 @@ pub struct Kernel {
     /// How many times in a row a thread had to wait without anything getting done.
     spins: u64,
     stuck_since: Option<Instant>,
+    /// One condition variable per guest thread (by index, made when its host thread first waits): handing the baton to thread `t`
+    /// wakes only the host thread waiting on `wakers[t]`.
+    wakers: Vec<Arc<Condvar>>,
+    pub baton: BatonStats,
+}
+
+/// How often the baton went round, for the `MH3U_GFX_TIMES` report.
+#[derive(Default)]
+pub struct BatonStats {
+    passes: u64,
+    /// Passes after which the thread slept 200 us because nothing else could run.
+    idle: u64,
+    /// Guest threads that ended by returning from their entry function (their host thread ended too) and by `OSExitThread` (parked).
+    pub returned: u64,
+    pub exited: u64,
+    since: Option<(Instant, u64)>,
 }
 
 // SAFETY: the raw memory pointer is only used by the thread that holds the baton, and the kernel is behind a mutex
@@ -192,24 +216,35 @@ impl Recent {
 pub const DYNAMIC_BASE: u32 = 0x0330_0000;
 
 pub static KERNEL: Mutex<Option<Kernel>> = Mutex::new(None);
-pub static BATON: Condvar = Condvar::new();
 
 pub fn lock() -> MutexGuard<'static, Option<Kernel>> {
     KERNEL.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-/// Gives the baton to guest thread `next` (the caller holds the lock and the baton).
+/// Gives the baton to guest thread `next` (the caller holds the lock and the baton), waking only the host thread waiting for it. It
+/// is notified with the lock held and checks `current` with the lock held before it waits, so the wakeup cannot be lost.
 fn hand_to(k: &mut Kernel, next: usize) {
     k.current = next;
-    BATON.notify_all();
+    if let Some(w) = k.wakers.get(next) {
+        // only one host thread runs a guest thread at a time; all of them, should a thread be made again while its old host thread
+        // still waits (which would be the game's bug), so none waits forever
+        w.notify_all();
+    }
 }
 
 /// Waits, with the lock held on return, until guest thread `me` holds the baton.
 pub fn wait_for_baton(mut guard: MutexGuard<'static, Option<Kernel>>, me: usize) -> MutexGuard<'static, Option<Kernel>> {
-    while guard.as_ref().expect("kernel").current != me {
-        guard = BATON.wait(guard).unwrap_or_else(std::sync::PoisonError::into_inner);
+    loop {
+        let k = guard.as_mut().expect("kernel");
+        if k.current == me {
+            return guard;
+        }
+        if k.wakers.len() <= me {
+            k.wakers.resize_with(me + 1, Default::default);
+        }
+        let waker = k.wakers[me].clone();
+        guard = waker.wait(guard).unwrap_or_else(std::sync::PoisonError::into_inner);
     }
-    guard
 }
 
 /// Something got done: a system function finished, so the threads that wait are not stuck.
@@ -255,6 +290,8 @@ impl Kernel {
             report,
             spins: 0,
             stuck_since: None,
+            wakers: Vec::new(),
+            baton: BatonStats::default(),
         }
     }
 
@@ -288,6 +325,10 @@ pub fn pass_baton(mut guard: MutexGuard<'static, Option<Kernel>>, waiting: bool)
     }
     let next = k.next_after(me);
     hand_to(k, next);
+    k.baton.passes += 1;
+    if k.gfx_times {
+        k.baton.report(&k.threads);
+    }
     // when nothing else can run and this thread only waits for time to pass, do not spin the core
     let idle = next == me && waiting;
     if idle || (k.spins > 4 * k.threads.len() as u64 + 8 && waiting) {
@@ -296,6 +337,7 @@ pub fn pass_baton(mut guard: MutexGuard<'static, Option<Kernel>>, waiting: bool)
             drop(guard);
             crate::game::stop_unlocked("every thread is waiting and nothing can wake them (a deadlock)".into());
         }
+        k.baton.idle += 1;
         drop(guard);
         std::thread::sleep(Duration::from_micros(200));
         guard = lock();
@@ -372,8 +414,26 @@ pub fn sleep_current(mut guard: MutexGuard<'static, Option<Kernel>>, duration: D
     guard
 }
 
-/// Ends the calling thread for good: it passes the baton and never runs guest code again.
-pub fn retire(mut guard: MutexGuard<'static, Option<Kernel>>) -> ! {
+/// Ends the calling guest thread, whose host thread is in its own frames (its entry function returned): the baton goes to the next
+/// ready thread, and the host thread must return and end, never waiting for the baton again.
+pub fn end_thread(guard: MutexGuard<'static, Option<Kernel>>) {
+    let mut guard = hand_on_for_good(guard);
+    guard.as_mut().expect("kernel").baton.returned += 1;
+}
+
+/// Ends the calling guest thread from inside translated code (`OSExitThread`), where its host thread cannot unwind or return: the
+/// baton goes to the next ready thread and the host thread parks for good; nothing unparks it, so it is never woken again.
+pub fn retire(guard: MutexGuard<'static, Option<Kernel>>) -> ! {
+    let mut guard = hand_on_for_good(guard);
+    guard.as_mut().expect("kernel").baton.exited += 1;
+    drop(guard);
+    loop {
+        std::thread::park();
+    }
+}
+
+/// Passes the baton on from a thread that has ended (stopping the run when no thread is left to take it).
+fn hand_on_for_good(mut guard: MutexGuard<'static, Option<Kernel>>) -> MutexGuard<'static, Option<Kernel>> {
     let k = guard.as_mut().expect("kernel");
     let me = k.current;
     let alive = k.threads.iter().any(|t| t.life == Life::Ready);
@@ -383,8 +443,35 @@ pub fn retire(mut guard: MutexGuard<'static, Option<Kernel>>) -> ! {
     }
     let next = k.next_after(me);
     hand_to(k, next);
-    loop {
-        guard = BATON.wait(guard).unwrap_or_else(std::sync::PoisonError::into_inner);
+    guard
+}
+
+impl BatonStats {
+    /// Every report window (MH3U_TIMES_WINDOW), prints how often the baton was passed per frame and how many threads have ended.
+    fn report(&mut self, threads: &[Thread]) {
+        let (since, frames_at) = *self
+            .since
+            .get_or_insert_with(|| (Instant::now(), crate::FRAMES.load(std::sync::atomic::Ordering::Relaxed)));
+        if since.elapsed() < crate::times_window() {
+            return;
+        }
+        let frames = crate::frames_since(frames_at).max(1);
+        let ready = threads.iter().filter(|t| t.life == Life::Ready).count();
+        let ended = threads.iter().filter(|t| t.life == Life::Done).count();
+        eprintln!(
+            "[baton] {:.1} s: {} passes ({:.0} per frame), {} idle sleeps ({:.1} per frame); guest threads: {ready} ready, {ended} ended \
+             now, {} returned and {} exited in all",
+            since.elapsed().as_secs_f64(),
+            self.passes,
+            self.passes as f64 / frames as f64,
+            self.idle,
+            self.idle as f64 / frames as f64,
+            self.returned,
+            self.exited
+        );
+        self.passes = 0;
+        self.idle = 0;
+        self.since = None;
     }
 }
 
@@ -452,8 +539,8 @@ mod baton_tests {
         std::env::var(name).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
     }
 
-    /// The cost of passing the baton between live guest threads when many others have ended (a thread that returns from its entry
-    /// point, or calls `OSExitThread`, is retired). The only test that sets the kernel: its threads are left blocked when it ends.
+    /// The cost of passing the baton between live guest threads when many others have ended (returned from their entry function, or
+    /// called `OSExitThread`); with one condition variable for all, every pass woke every ended thread. The only test that sets the kernel: its threads are left blocked when it ends.
     /// `MH3U_BATON_RETIRED` (50), `MH3U_BATON_LIVE` (8) and `MH3U_BATON_PASSES` (20000) set its size; run with `--nocapture` to see the
     /// time per pass.
     #[test]
@@ -482,7 +569,12 @@ mod baton_tests {
             std::thread::spawn(move || {
                 let mut guard = wait_for_baton(lock(), t);
                 guard.as_mut().expect("kernel").finish_thread(0);
-                retire(guard)
+                // half end as a thread whose entry function returned, half as one that called OSExitThread
+                if t % 2 == 0 {
+                    end_thread(guard);
+                } else {
+                    retire(guard)
+                }
             });
         }
         let count = Arc::new(AtomicU64::new(0));

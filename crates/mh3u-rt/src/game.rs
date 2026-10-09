@@ -117,9 +117,11 @@ fn stop(c: *mut Ctx, why: String) -> ! {
 extern "C" fn import(c: *mut Ctx, number: u32) {
     // SAFETY: `c` is the context the translated code passed us; it is valid for the call, and nothing else uses it meanwhile
     let c = unsafe { &mut *c };
-    // The kernel lock is taken on every call even though only the thread holding the baton runs guest code: the host's own threads (the
-    // alarm and audio service threads, the dump timer, the window's input) take it too, and without contention it costs a few atomic
-    // operations, so skipping it would buy little for a soundness argument this code does not want to depend on.
+    // The kernel lock is taken on every call even though only the thread holding the baton runs guest code: other threads take it too
+    // (a host thread woken with the baton, one coming back from guest callbacks run unlocked, the dump timer), and without contention
+    // it costs a few atomic operations, so skipping it would buy little for a soundness argument this code does not want to depend on.
+    // The window's input has a lock of its own (`input::INPUT`), and the audio and alarm threads are guest threads, which only take it
+    // with the baton or to wait for it.
     let mut guard = lock();
     {
         let k = guard.as_mut().expect("the kernel is set while the game runs");
@@ -294,7 +296,8 @@ pub fn spawn(k: &Kernel, t: usize) {
         unsafe { call(&mut c, entry) };
         let mut guard = lock();
         guard.as_mut().expect("kernel").finish_thread(c.r[3]);
-        kernel::retire(guard)
+        // nothing of the translated code is on this thread's stack any more, so it ends here rather than waiting forever
+        kernel::end_thread(guard);
     });
 }
 
