@@ -700,6 +700,8 @@ pub fn run(library: &Path, pieces: &[Piece], options: Options) -> Result<Report>
                         };
                         let mut last = read();
                         let mut prev: Option<std::collections::HashMap<u32, u32>> = None;
+                        // the functions only called in each window (to intersect two menu-open windows)
+                        let mut only_sets: Vec<std::collections::BTreeSet<u32>> = Vec::new();
                         let mut seen = crate::mods::KEY_F9.load(Relaxed);
                         let mut window = 0;
                         loop {
@@ -719,10 +721,27 @@ pub fn run(library: &Path, pieces: &[Piece], options: Options) -> Result<Report>
                                 .map(|(i, (a, b))| (base + 4 * i as u32, a.wrapping_sub(*b)))
                                 .collect();
                             last = now;
+                            if prev.is_none() {
+                                only_sets.push(Default::default());
+                            }
                             eprintln!("[calldiff] window {window} closed ({} functions called)", done.len());
                             if let Some(pw) = &prev {
                                 let d = crate::mods::call_diff_min(pw, &done, 1);
                                 let only: Vec<_> = d.iter().filter(|x| x.1 == 0).collect();
+                                let set: std::collections::BTreeSet<u32> = only.iter().map(|x| x.0).collect();
+                                if only_sets.len() >= 2 {
+                                    let earlier = &only_sets[only_sets.len() - 2];
+                                    let both: Vec<_> = set.intersection(earlier).collect();
+                                    eprintln!(
+                                        "[calldiff] only-now in both window {window} and window {}: {} functions",
+                                        window - 2,
+                                        both.len()
+                                    );
+                                    for f in both.iter().take(40) {
+                                        eprintln!("[calldiff]   both f_{f:08x}");
+                                    }
+                                }
+                                only_sets.push(set);
                                 eprintln!(
                                     "[calldiff] window {window} vs {}: {} far more often, {} only now",
                                     window - 1,

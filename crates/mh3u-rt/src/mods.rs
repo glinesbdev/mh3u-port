@@ -353,6 +353,10 @@ pub(crate) fn report_write(address: u32, value: u64, size: u32, lr: u32) -> bool
     // SAFETY: a plain read of a global of the watch build
     let function = unsafe { last() };
     let label = (w.label)(address);
+    if label.is_empty() {
+        // outside what is watched in a wide range (all the pouch copies at once): not reported
+        return true;
+    }
     let kind = label.split(' ').filter(|p| p.parse::<u32>().is_err()).collect::<Vec<_>>().join(" ");
     let count = {
         let mut seen = w.seen.lock().unwrap_or_else(|e| e.into_inner());
@@ -375,14 +379,33 @@ pub(crate) fn report_write(address: u32, value: u64, size: u32, lr: u32) -> bool
 
 /// Where `pattern` occurs (word-aligned) in `piece`, which starts at guest address `base`.
 pub fn copies_in(piece: &[u8], base: u32, pattern: &[u8], out: &mut Vec<u32>) {
+    copies_in_masked(piece, base, pattern, &vec![true; pattern.len()], out);
+}
+
+/// As `copies_in`, comparing only the bytes `mask` marks (a pouch's filled slots: on a quest, the empty ones may hold supplies).
+pub fn copies_in_masked(piece: &[u8], base: u32, pattern: &[u8], mask: &[bool], out: &mut Vec<u32>) {
     if pattern.is_empty() || piece.len() < pattern.len() {
         return;
     }
+    let first = mask.iter().position(|&m| m).unwrap_or(0);
     for i in (0..=piece.len() - pattern.len()).step_by(4) {
-        if piece[i..i + pattern.len()] == *pattern {
+        if piece[i + first] == pattern[first] && (0..pattern.len()).all(|k| !mask[k] || piece[i + k] == pattern[k]) {
             out.push(base + i as u32);
         }
     }
+}
+
+/// The copies to watch at once: the largest group within `span` bytes (sorted input), as (first, last).
+pub fn cluster(copies: &[u32], span: u32) -> Option<(u32, u32)> {
+    let mut best: Option<(usize, u32, u32)> = None;
+    for (i, &a) in copies.iter().enumerate() {
+        let n = copies[i..].iter().take_while(|&&c| c - a <= span).count();
+        let last = copies[i + n - 1];
+        if best.is_none_or(|b| n > b.0) {
+            best = Some((n, a, last));
+        }
+    }
+    best.map(|b| (b.1, b.2))
 }
 
 /// `MH3U_WATCH=live`: the save the overlay found may be only the save image (written when saving), so this looks for other copies
@@ -401,6 +424,8 @@ pub fn watch_copies(at: u32, len: u32, ranges: Vec<(u32, u32)>, around: (i64, i6
         };
         let mut pattern = vec![0u8; len as usize];
         read_tolerant(base, at, &mut pattern);
+        // only the filled slots are compared (on a quest the empty ones may have been given supplies)
+        let mask: Vec<bool> = pattern.as_chunks::<4>().0.iter().flat_map(|s| [s[..2] != [0, 0]; 4]).collect();
         let filled = pattern.as_chunks::<4>().0.iter().filter(|s| s[..2] != [0, 0]).count();
         if filled < 3 {
             eprintln!("[watch-live] the pouch has {filled} items; put at least 3 in it and run again so its copies can be found");
@@ -416,7 +441,7 @@ pub fn watch_copies(at: u32, len: u32, ranges: Vec<(u32, u32)>, around: (i64, i6
                 let m = piece.min(to - p);
                 let slice = &mut buf[..(m + len).min(to - p) as usize];
                 read_tolerant(base, p, slice);
-                copies_in(slice, p, &pattern, &mut found);
+                copies_in_masked(slice, p, &pattern, &mask, &mut found);
                 p = p.saturating_add(m);
                 std::thread::sleep(std::time::Duration::from_micros(200));
             }
@@ -477,6 +502,15 @@ mod write_watch_tests {
         let mut out = Vec::new();
         super::copies_in(&piece, 0x1000, &pat, &mut out);
         assert_eq!(out, vec![0x1008]);
+        // masked: a changed byte outside the mask still matches
+        let mut piece2 = piece.clone();
+        piece2[12] = 99;
+        let mut mask = vec![true; 8];
+        mask[4] = false;
+        let mut out = Vec::new();
+        super::copies_in_masked(&piece2, 0x1000, &pat, &mask, &mut out);
+        assert_eq!(out, vec![0x1008]);
+        assert_eq!(super::cluster(&[0x100, 0x200, 0x5000_0000, 0x300], 0x1000), Some((0x100, 0x300)));
     }
 
     #[test]

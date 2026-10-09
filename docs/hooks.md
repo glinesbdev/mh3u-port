@@ -257,6 +257,23 @@ Send back `Desktop\session.log` with your notes (the order of the steps, and whi
 - **Next lead:** `0x30297908`, the other copy the in-quest F10 found in run 35. It is next to the quest data `quest_accept`
   passes (`0x30297390`). Press F10 on the quest with `MH3U_WATCH_COPY=1`.
 
+#### Run 37 (user)
+
+- **Build and counting:** build `67e121d`, with exact counting on. The item-menu window gave 190 functions called only while
+  it was open (for example the groups `f_02142f84`–`f_021451a8` and `f_02152830`–`f_02153480`). Too many to pick a hook from
+  one window. The call diff now intersects each window's "only now" functions with those of the window two before
+  (`[calldiff]   both f_…`), so two open-the-menu windows narrow it down.
+- **F10 in the field found only the village-era copies** (`0x2e66bdec`, `0x2e67387c`, `0x2e6eda44`). No write reached the
+  pouch of the copy it watched. The quest's pouch had already changed (supplies added), so an exact match of all 96 bytes
+  could not find it.
+- **F10 now:**
+  - compares only the slots that are filled in the save;
+  - logs every copy (`pouch copy N: 0x…`);
+  - by default watches **all** copies in the largest group within 32 MiB at once, reporting only writes into one of the
+    pouches (`copy N 0x…: pouch 3 count <- …`). `MH3U_WATCH_COPY=n` still watches just one.
+- **Leftover settings:** `MH3U_WATCH_AT` and `MH3U_WATCH_COPY` from earlier sessions were still set (and the startup copy
+  `0x3001cc1c` was reused heap). Clear them before a run.
+
 ## Plan
 
 1. Write this doc. **(done)**
@@ -271,7 +288,6 @@ Send back `Desktop\session.log` with your notes (the order of the steps, and whi
 
 See the bottom of this file. It is updated with each commit of PR #13.
 
-- Status: run 36 ran an old build. The quest's working save is ruled out for item use. The lead is `0x30297908`. No item-use
-  or menu hook yet (PR #17).
-- Next: a run on `01bf289` or later, translated again: exact-count F9 around opening a menu, and on a quest, F10 with
-  `MH3U_WATCH_COPY=1`, then use items.
+- Status: run 37 confirmed exact counting works. F10 now matches slots partially and watches all copies; the call diff
+  intersects windows. No item-use or menu hook yet (PR #17).
+- Next: one run with two open-the-menu windows and an in-quest F10 (steps in the PR #17 report).
