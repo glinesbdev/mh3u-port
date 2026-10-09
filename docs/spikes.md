@@ -162,6 +162,17 @@ paths only 3D uses were checked against references, each with tests in the repos
   approximately. `MH3U_GFX_REPORT` and `MH3U_GFX_DUMP_FRAME` (see `docs/translator.md`) are there to tell those apart on the owner's
   machine.
 
+**3f. The village's scenery (owner's run 4, frame 4800 dumped).** Character select was right after 3e and the village was not: no
+scenery, streaks on some models. `draws.txt` showed why: the fetch shaders of the scenery (`0x1dbd60f0`..`0x1dbd7ef0`, used by about
+250 of the frame's 451 draws, vertex shaders `0x169eb340`, `0x169eee80`, `0x16978000`, `0x169ad300`, and 4 draws of the skinned
+`0x1699c580`) had one `sint 16_16_16_16` stream at location 0 and every other stream all zero (location 0, offset 0, format 0), while
+the vertex shaders read a float position in R1 and an integer colour in R3 (`INT_TO_FLT`). The character's fetch shaders were right.
+The cause: the game makes these fetch shaders while it is recording the frame's display list, and `GX2InitFetchShaderEx` was recorded
+like a GPU command, so it ran only when the list was played, reading the attribute array (the caller's, gone by then) from reused
+memory; `GX2CalcFetchShaderSizeEx` returned nothing to its caller the same way. The `GX2Calc*`/`GX2Init*` calls (CPU-only: they fill
+in an object) now run when they are made, recording or not, and `GX2InitFetchShaderEx` writes only the 0x20 bytes of the
+`GX2FetchShader` (it wrote 0x28).
+
 ## 4. Does the generated code compile in a reasonable time? (done: as C yes, as one Rust crate no)
 
 `mh3u-tools codegen-bench <dump> <out> --lang rust|c --functions N` translates an even sample of the game's functions (found as the

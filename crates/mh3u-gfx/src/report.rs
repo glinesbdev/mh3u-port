@@ -308,7 +308,7 @@ impl Diagnostics {
             t,
             "  primitive {primitive:#x}, count {count}, {}, first {offset}, instances {instances}",
             match indexed {
-                Some((at, kind)) => format!("indexed (indices at {at:#x}, type {kind})"),
+                Some((kind, at)) => format!("indexed (indices at {at:#x}, type {kind})"),
                 None => "not indexed".into(),
             }
         );

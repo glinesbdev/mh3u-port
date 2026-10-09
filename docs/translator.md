@@ -173,7 +173,9 @@ for the next frame) blocks there, with the other guest threads waiting.
 with their text and the cloth background, upright, in the right places (the hunter's clothing still shows white speckles: not understood yet). The pieces:
 
 - **State**: every `GX2Set*` call is recorded into the state of the current context (`GX2SetContextState`/`GX2SetupContextStateEx`
-  switch between them); display lists (`GX2BeginDisplayListEx`...) are recorded and replayed with their arguments. A recorded call is
+  switch between them); display lists (`GX2BeginDisplayListEx`...) are recorded and replayed with their arguments; the calls that only fill in an object in
+  memory (`GX2Calc*`, `GX2Init*`, such as `GX2InitFetchShaderEx` and `GX2InitSampler*`) are never recorded but run at once, as on the
+  console (their inputs may be gone when the list is played). A recorded call is
   a fixed-size record (which call, as a number, and the argument registers and stack words it reads), a list is a shared slice played
   back without copying, and a `GX2SetPixelTexture`/`GX2SetPixelSampler` that sets a unit to what the list already set it to since its
   last change of context is left out (the size `GX2EndDisplayList` returns still counts it). Graphics imports are given a number

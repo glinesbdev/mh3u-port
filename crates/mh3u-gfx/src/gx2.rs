@@ -651,7 +651,10 @@ impl Seen {
     }
 }
 
-/// The calls that are never part of a display list (they are about the display, not the GPU's command stream).
+/// The calls that are never part of a display list: the ones about the display, not the GPU's command stream, and the ones that only fill
+/// in an object in the CPU's memory (`GX2Calc*`, `GX2Init*`). The console runs those at once even while a list is being made; recorded,
+/// they would run only when the list is played, reading their inputs (a fetch shader's attribute array, often on the caller's stack) long
+/// after the game has reused that memory, and giving no result (a size) to the caller now.
 fn is_immediate(call: Call) -> bool {
     matches!(
         call,
@@ -663,7 +666,34 @@ fn is_immediate(call: Call) -> bool {
             | Call::GetSwapStatus
             | Call::SetSwapInterval
             | Call::GetSwapInterval
+            | Call::CalcFetchShaderSizeEx
+            | Call::InitFetchShaderEx
+            | Call::InitSampler
+            | Call::InitSamplerClamping
+            | Call::InitSamplerXYFilter
+            | Call::InitSamplerZMFilter
+            | Call::InitSamplerLOD
+            | Call::InitSamplerDepthCompare
     )
+}
+
+/// `GX2InitFetchShaderEx(fetchShader, buffer, count, attribs, ...)`: no machine code is made; the attribute streams are read now (the array
+/// is the caller's and may be gone after the call) and kept for the draws. Only the `GX2FetchShader` itself (0x20 bytes) is written.
+pub(crate) fn init_fetch_shader(
+    g: &Guest,
+    fs: u32,
+    buffer: u32,
+    count: u32,
+    attribs: u32,
+) -> (u32, std::sync::Arc<[crate::draw::AttribStream]>) {
+    let streams: Vec<_> = (0..count.min(32))
+        .map(|i| crate::draw::AttribStream::read(g, attribs + 32 * i))
+        .collect();
+    g.fill(fs, 0, 0x20);
+    g.put_u32(fs + 8, (32 + 16 * count).div_ceil(16) * 16);
+    g.put_u32(fs + 0xc, buffer);
+    g.put_u32(fs + 0x10, count);
+    (fs, streams.into())
 }
 
 impl Gx2 {
@@ -835,15 +865,8 @@ impl Gx2 {
             // (fetch shader, buffer, attribute count, attributes, type, tessellation): nothing of machine code is made, the attributes
             // are kept and the draw reads them
             Call::InitFetchShaderEx => {
-                let (fs, buffer, count, attribs) = (c.r[3], c.r[4], c.r[5], c.r[6]);
-                let streams: Vec<_> = (0..count.min(32))
-                    .map(|i| crate::draw::AttribStream::read(g, attribs + 32 * i))
-                    .collect();
-                g.fill(fs, 0, 0x28);
-                g.put_u32(fs + 8, (32 + 16 * count).div_ceil(16) * 16);
-                g.put_u32(fs + 0xc, buffer);
-                g.put_u32(fs + 0x10, count);
-                self.fetch_shaders.insert(fs, streams.into());
+                let (fs, streams) = init_fetch_shader(g, c.r[3], c.r[4], c.r[5], c.r[6]);
+                self.fetch_shaders.insert(fs, streams);
             }
             Call::CopySurface => self.copy_surface(g, c.r[3], c.r[6]),
             // (mode, address, size): the CPU wrote memory the GPU may have cached; a texture or a shader program there is read again
@@ -1226,8 +1249,56 @@ mod tests {
         }
     }
 
+    /// The village's broken scenery (run 4, frame 4800): its fetch shaders were made while the frame's display list was being recorded, so
+    /// `GX2InitFetchShaderEx` was recorded too and read the attribute array a frame later, from reused memory (draws.txt showed one
+    /// `sint 16_16_16_16` stream and then all-zero streams, all at location 0). CPU-only calls must run when they are made.
     #[test]
-    fn immediate_calls_are_the_display_ones() {
+    fn object_setup_calls_are_never_recorded() {
+        for &call in Call::ALL {
+            let name = call.name();
+            if name.starts_with("gx2:GX2Init") || name.starts_with("gx2:GX2Calc") {
+                assert!(is_immediate(call), "{name} would be recorded into a display list");
+            }
+        }
+        // the GPU's commands are still recorded
+        for call in [
+            Call::SetFetchShader,
+            Call::SetAttribBuffer,
+            Call::DrawIndexedEx,
+            Call::SetPixelSampler,
+            Call::Invalidate,
+        ] {
+            assert!(!is_immediate(call), "{}", call.name());
+        }
+    }
+
+    #[test]
+    fn fetch_shader_streams_are_read_when_made() {
+        let mut m = vec![0u8; 0x1000];
+        let g = Guest::new(m.as_mut_ptr());
+        // two streams at 0x200: float3 position at location 0, uint8x4 at location 2, offset 12
+        let words = [[0, 0, 0, 0x811, 0, 0, 0x0001_0203, 3], [2, 0, 12, 0x10a, 0, 0, 0x0001_0203, 3]];
+        for (i, w) in words.iter().enumerate() {
+            for (k, v) in w.iter().enumerate() {
+                g.put_u32(0x200 + 32 * i as u32 + 4 * k as u32, *v);
+            }
+        }
+        // the word after the 0x20-byte GX2FetchShader is someone else's
+        g.put_u32(0x120, 0xdead_beef);
+        let (fs, streams) = init_fetch_shader(&g, 0x100, 0x400, 2, 0x200);
+        // the caller's array goes away (as a stack frame does)
+        g.fill(0x200, 0, 64);
+        assert_eq!(fs, 0x100);
+        assert_eq!(streams.len(), 2);
+        assert_eq!((streams[0].location, streams[0].offset, streams[0].format), (0, 0, 0x811));
+        assert_eq!((streams[1].location, streams[1].offset, streams[1].format), (2, 12, 0x10a));
+        assert_eq!(streams[1].select, [0, 1, 2, 3]);
+        assert_eq!((g.u32(0x10c), g.u32(0x110)), (0x400, 2));
+        assert_eq!(g.u32(0x120), 0xdead_beef);
+    }
+
+    #[test]
+    fn immediate_calls_are_the_display_and_setup_ones() {
         let immediate: Vec<&str> = Call::ALL.iter().filter(|c| is_immediate(**c)).map(|c| c.name()).collect();
         assert_eq!(
             immediate,
@@ -1235,6 +1306,14 @@ mod tests {
                 "gx2:GX2BeginDisplayListEx",
                 "gx2:GX2EndDisplayList",
                 "gx2:GX2DirectCallDisplayList",
+                "gx2:GX2CalcFetchShaderSizeEx",
+                "gx2:GX2InitFetchShaderEx",
+                "gx2:GX2InitSampler",
+                "gx2:GX2InitSamplerClamping",
+                "gx2:GX2InitSamplerXYFilter",
+                "gx2:GX2InitSamplerZMFilter",
+                "gx2:GX2InitSamplerLOD",
+                "gx2:GX2InitSamplerDepthCompare",
                 "gx2:GX2SwapScanBuffers",
                 "gx2:GX2WaitForVsync",
                 "gx2:GX2GetSwapStatus",
@@ -1246,7 +1325,7 @@ mod tests {
             .filter(|n| immediate.contains(n))
             .collect::<Vec<_>>()
         );
-        assert_eq!(immediate.len(), 8);
+        assert_eq!(immediate.len(), 16);
     }
 
     #[test]
