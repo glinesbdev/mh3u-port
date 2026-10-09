@@ -4,3 +4,11 @@
 # No real addresses yet (step 5 of the plan finds them). To try the mechanism, list any function the translator found, e.g. one
 # from an [enter] or [watch] log line, or an f_XXXXXXXX name in game.h:
 # 0x02000000 example
+
+# Confirmed in run 31 (docs/hooks.md, "Run 31"). r3 is the hunter's data (0x10 before the save block) in all of these.
+0x0219c720 money_add          # r4 = signed change in zenny (-200 craft fee, -50 meal, -310 quest fee, +310 refund), r5 = &money
+0x02199438 item_gain          # rare (20 calls): pickup, box->pouch; r5 = item id (0xb4 on a pickup), r4 = &save
+0x0219ae84 pouch_remove_slot  # 1 call, putting a pouch item back in the box; r4 = r5 = the pouch
+0x02198d40 equip_records      # writes the records at +0x50..+0xbf after crafting armour; r5 = record kind (0x10..0x19)
+# Rejected (thousands of calls a minute, queries, not actions): 0x0219acec (pouch item lookup, r4 = item id),
+# 0x02199408 (box item lookup, r4 = item id), 0x02198770 (field getter, r5 = 7/8), 0x0216afd4 (per-frame, another object).
