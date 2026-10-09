@@ -215,6 +215,7 @@ impl Gx2 {
         if let Some(e) = self.caches.geometry.get(&key) {
             return e.clone();
         }
+        self.caches.work.translated += 1;
         let result = (|| {
             let es_d = decode(&es_code).map_err(|e| format!("vertex shader: {e}"))?;
             let gs_d = decode(&gs_code).map_err(|e| format!("geometry shader: {e}"))?;
@@ -250,23 +251,18 @@ impl Gx2 {
                         source: wgpu::ShaderSource::Wgsl(wgsl.into()),
                     })
                 };
-                let (es_module, gs_module, copy_module) = (module("es", es.wgsl), module("gs", gst.wgsl), module("copy", copy.wgsl));
+                let (es_module, gs_module, copy_module) = (
+                    module("es", es.wgsl.clone()),
+                    module("gs", gst.wgsl.clone()),
+                    module("copy", copy.wgsl.clone()),
+                );
                 let (es_pipeline, gs_pipeline) = (self.compute(&es_module), self.compute(&gs_module));
                 let es_layouts = [es_pipeline.get_bind_group_layout(0), es_pipeline.get_bind_group_layout(1)];
                 let gs_layouts = [gs_pipeline.get_bind_group_layout(0), gs_pipeline.get_bind_group_layout(1)];
                 Some(Arc::new(GeometryEntry {
-                    es: Arc::new(Compiled {
-                        module: es_module,
-                        interface: es.interface,
-                    }),
-                    gs: Arc::new(Compiled {
-                        module: gs_module,
-                        interface: gst.interface,
-                    }),
-                    copy: Arc::new(Compiled {
-                        module: copy_module,
-                        interface: copy.interface,
-                    }),
+                    es: Arc::new(Compiled::new(es_module, es.interface, es.wgsl)),
+                    gs: Arc::new(Compiled::new(gs_module, gst.interface, gst.wgsl)),
+                    copy: Arc::new(Compiled::new(copy_module, copy.interface, copy.wgsl)),
                     max_vertices,
                     es_pipeline,
                     gs_pipeline,

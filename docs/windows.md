@@ -113,6 +113,13 @@ $env:MH3U_TIMES_WINDOW = '10'
 & $tools run $games $out --window --max-imports 1000000000000
 ```
 
+The same report has `[gfx frames]` (the slowest frame of the window), `[gfx caches]` (each cache's size: steady while standing
+still, or something grows), `[gfx pipelines]`, `[gfx invalidates]`, and an `[gfx] area change` line when entering an area, with how
+the 180 frames after it went (`translator.md`). Pipelines are made on worker threads and kept in `$out\cache\pipelines`, so a second
+visit to an area, or a second run, does not hitch; `$env:MH3U_GFX_ASYNC_PIPELINES = 'off'` makes each draw wait for its pipeline
+instead (the old behaviour, for comparing), `$env:MH3U_GFX_PIPELINE_CACHE = 'off'` leaves the disk out, and deleting
+`$out\cache` is always safe.
+
 **Sampling profilers and the Rust side.** A `-gnullvm` build's PDB (`-C link-arg=-Wl,--pdb=`) holds only the public symbols
 (about 12 thousand): the Rust code's own functions are local symbols, which lld does not put in it, so Visual Studio's profiler
 gives each sample to the public symbol before it in memory, whatever function it really is in (`--icf=none` does not change that).

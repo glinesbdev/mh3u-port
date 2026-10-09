@@ -10,6 +10,9 @@ With the work in PRs #1–#3 (`perf/regs-flags-dispatch` → `windows-build` →
 - `MH3U_FPS=1`: an `[fps]` line every 5 s.
 - `MH3U_GFX_TIMES=1`: per report window (`MH3U_TIMES_WINDOW`, default 10 s), time per graphics call and per draw step, with
   per-frame columns; `[draw counts]` for cache hits and misses; `[baton]` for guest thread handoffs.
+- With either of the two above, every window also has `[gfx frames]` (slowest frame, frames over 33 and 50 ms), `[gfx caches]`
+  (cache sizes), `[gfx pipelines]` and `[gfx invalidates]`, and entering an area prints `[gfx] area change at frame N` and,
+  180 frames later, how those frames went (PR #5; `translator.md` has the details).
 - A CPU profiler (Visual Studio on Windows). On `x86_64-pc-windows-gnullvm` the PDB only has public symbols, so a profiler
   gives each sample to the nearest public name before it: read names from `llvm-nm -n --demangle mh3u-tools.exe` instead
   (see `translator.md`).
@@ -36,8 +39,11 @@ move the village on its own.
    otherwise). Run 11 (500c143): about 3.5 s of window 1 and 2.4 s of window 2 (village load, leaving for the field) went to
    it, against 0.1 ms a frame once the field was set up: the hitching the user feels on an area change. Texture decoding (at
    most 0.2 ms a frame) and shader translation (under 0.3 ms a frame) are small. *Guess:* the driver compiling each new
-   pipeline on the render thread. Options: build pipelines on a worker thread, a pipeline description cache on disk built at
-   start-up, `wgpu::PipelineCache` on Vulkan.
+   pipeline on the render thread. **PR #5 (not yet measured in the game):** pipelines are made on worker threads (a new one's
+   draws wait a frame or two instead of the frame waiting), and kept on disk (`<out>/cache/pipelines`) and made again at the
+   next start, so a second visit or a second run should not compile at all while playing. `wgpu::PipelineCache` is not used
+   (an `unsafe` call outside `mh3u-rt`; a decision for later). To verify: `[gfx] area change` lines should show "0 made with
+   the draw waiting" and a slowest frame near the others.
 3. **Shader cache misses that never stop, and a replay that slows down.** About 30 pixel and 22–30 vertex shader misses per frame
    even while standing still (run 11 in the field: ~48 pixel, ~28 vertex and 4 geometry pipeline misses a frame). In run 11 the
    field's draws (~426 a frame) and replayed display-list calls (~6190) stayed the same from window 3 to 9, but
@@ -57,7 +63,12 @@ move the village on its own.
    fetch shader the game makes again misses and adds an entry, and every `GX2Invalidate` with the shader or CPU bit (about 1100
    a frame) walks all entries of all three front caches (`FrontCache::invalidate`, a `retain`). Plan: measure cache sizes,
    pipelines made, shader invalidates and the slowest frame per window; key the front caches by the fetch shader's contents;
-   index entries by address so an invalidate touches only what overlaps; cap or age entries.
+   index entries by address so an invalidate touches only what overlaps; cap or age entries. **PR #5 (not yet measured in the
+   game):** all three. Fetch shaders with the same attributes now share one slice; the front caches are indexed by program start
+   (a test with 1000 and 100000 entries: 29 and 36 ns per invalidate in a release build, no entry looked at for memory with no
+   program near, where the `retain` walked every entry); entries unused for 600 frames go, and past 16384 the least recently
+   used. `[gfx caches]` now shows each cache's size, so if something else grows it will show. To verify: in the field the
+   replay's ms per frame and `[gfx caches]` should stay flat from window to window.
 4. **Vertex bytes hashed.** 1.5–3.5 MB per frame are hashed to check vertex streams. XXH3 keeps it cheap (~0.2 ms), but
    tracking writes through `GX2Invalidate` could skip most of it.
 5. **Single core for guest threads.** All guest threads share one host core through the baton (`kernel.rs`). About 15 handoffs

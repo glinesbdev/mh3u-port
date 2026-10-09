@@ -213,12 +213,24 @@ with their text and the cloth background, upright, in the right places (the hunt
 - **What a draw costs on the CPU** (about 50 microseconds by `MH3U_GFX_TIMES` before these changes, ~125 draws a frame in the village): nothing per draw is found by a
   formatted string or a hash of the whole program any more.
   - *Shaders*: a translation is found by a front cache (`shader_cache.rs`) keyed by what is cheap to read: the shader's address, its
-    program's address and size, the fetch shader's version (a new shared slice per `GX2InitFetchShaderEx`), half z, and for pixel
-    shaders a hash of the input words and the texture kinds. The program bytes still decide: each entry keeps their hash, the first
-    draw of every frame that uses it hashes them again, and `GX2Invalidate` with the shader (8) or CPU (0x40) bit drops the entries
-    whose programs it overlaps. The assumption: a program rewritten in place without `GX2Invalidate` may be drawn as it was for the
-    rest of that frame (the console's GPU reads programs through its own cache too). Geometry pipelines are found the same way (their
-    key also has half z and the ring sizes, which the translation uses).
+    program's address and size, the fetch shader's contents (`GX2InitFetchShaderEx` makes one shared slice per distinct attribute
+    description, so its address names the contents: the game makes some fetch shaders again every frame, and with a new slice each
+    time every draw with them missed and left an entry behind), half z, and for pixel shaders a hash of the input words and the
+    texture kinds. The program bytes still decide: each entry keeps their hash, the first draw of every frame that uses it hashes
+    them again, and `GX2Invalidate` with the shader (8) or CPU (0x40) bit drops the entries whose programs it overlaps. The entries
+    are indexed by where their programs start, so an invalidate looks only at the programs near the memory it names (the game
+    invalidates about a thousand times a frame); entries not drawn with for 600 frames go, and past 16384 the least recently used. The
+    assumption: a program rewritten in place without `GX2Invalidate` may be drawn as it was for the rest of that frame (the console's
+    GPU reads programs through its own cache too). Geometry pipelines are found the same way (their key also has half z and the ring
+    sizes, which the translation uses).
+  - *Render pipelines* (`pipelines.rs`): found by the shaders' translations and the state the pipeline holds; a new one is made on a
+    worker thread and its draw is not drawn until it is there (usually a frame or two; `MH3U_GFX_ASYNC_PIPELINES=off` makes the draw
+    wait instead, as before). Each one made is written down under `<out>/cache/pipelines/<key>/` (its shaders' WGSL in `shaders/`,
+    its state as a line of `pipelines.txt`; the key is a hash of the build and the adapter and driver, written in `about.txt`), and all
+    of them are made again on the workers at the next start, found then by a hash of the WGSL whatever addresses the shaders have.
+    `MH3U_GFX_PIPELINE_CACHE=off` turns the disk cache off, `MH3U_GFX_CACHE_DIR` puts it elsewhere; deleting the folder is always
+    safe. `wgpu::PipelineCache` (Vulkan's own cache of compiled pipelines) is not used: making one is an `unsafe` call, and only
+    `mh3u-rt` may have `unsafe` code.
   - *Uploads*: what a batch's draws read (uniform blocks, indices, geometry parameters) is written into a copy of the arena in memory
     and uploaded with one write per arena when the batch is flushed. The vertex streams' start table lives with the cached streams,
     and the geometry draws use the stream cache too.
@@ -243,6 +255,13 @@ with their text and the cloth background, upright, in the right places (the hunt
     of the target is not kept.
   - *System calls*: the report's counters are arrays indexed by import number, `MH3U_TRACE_FROM` is read once, and the timing report
     allocates nothing per call.
+
+  With `MH3U_GFX_TIMES=1` (or `MH3U_FPS=1`), every window also has `[gfx frames]` (the slowest frame and how many took over 33 and
+  50 ms), `[gfx caches]` (the size of every cache: one that only grows shows here), `[gfx pipelines]` (made with the draw waiting,
+  handed to workers, made by them and their time, draws not drawn while theirs was made, found made) and `[gfx invalidates]` (how many
+  `GX2Invalidate`, how many reached the shader caches and how many index entries each looked at, and their time a frame); and a frame
+  that makes eight or more new pipelines or shader translations prints `[gfx] area change at frame N: ...`, then, 180 frames later,
+  how those frames went (the slowest, the mean, how many took over 50 ms, the pipelines made).
 
   The reports: `MH3U_GFX_TIMES=1` gives each line as a total, a count, and both per frame (`[gfx times]` per graphics call, `[draw
   times]` per part of a draw, where "geometry pass" counts only the draws with a geometry shader), and `[draw counts]`: hits, checks
