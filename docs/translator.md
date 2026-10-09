@@ -173,23 +173,32 @@ for the next frame) blocks there, with the other guest threads waiting.
 with their text and the cloth background, upright, in the right places (the hunter's clothing still shows white speckles: not understood yet). The pieces:
 
 - **State**: every `GX2Set*` call is recorded into the state of the current context (`GX2SetContextState`/`GX2SetupContextStateEx`
-  switch between them); display lists (`GX2BeginDisplayListEx`...) are recorded and replayed with their arguments. A recorded call is
+  switch between them); display lists (`GX2BeginDisplayListEx`...) are recorded and replayed with their arguments; the calls that only fill in an object in
+  memory (`GX2Calc*`, `GX2Init*`, such as `GX2InitFetchShaderEx` and `GX2InitSampler*`) are never recorded but run at once, as on the
+  console (their inputs may be gone when the list is played). A recorded call is
   a fixed-size record (which call, as a number, and the argument registers and stack words it reads), a list is a shared slice played
   back without copying, and a `GX2SetPixelTexture`/`GX2SetPixelSampler` that sets a unit to what the list already set it to since its
   last change of context is left out (the size `GX2EndDisplayList` returns still counts it). Graphics imports are given a number
   when the game is loaded (`Gx2Backend::resolve`) and dispatched by it.
 - **A draw** (`draw.rs`): the vertex and pixel shaders are read from the guest, translated (cached by address and a hash of the
   program), the vertex attributes are decoded on the CPU into one stream of `vec4` per fetch-shader element (the fetch shader is not
-  run: `GX2InitFetchShaderEx` keeps the attribute descriptions), the uniform blocks are copied with their words swapped, a pipeline is
+  run: `GX2InitFetchShaderEx` keeps the attribute descriptions), the uniform blocks are copied as they are (little-endian words), a pipeline is
   made from the state (blend, depth, cull, formats) and cached, and the draw is issued with generated indices (fans, quads and strips
   that `wgpu` lacks are expanded). A vertex shader's outputs reach the pixel shader through the semantic numbers in the shaders'
   headers (a pixel input takes the vertex output with the same semantic). A pass that samples the target it draws into gets a copy.
+  The position is `@invariant`, so a mesh's depth-only and colour draws (same vertex shader, different pixel shaders) give the same
+  depth. Colour buffers of the 32-bit float formats (`0x80e`, `0x80d`, `0x823`) are made as `R32Float`, `Rg32Float` and
+  `Rgba32Float` and are never blended, as on the hardware; other unlisted formats are still `Rgba8Unorm`.
 - **Geometry pipelines** (`geometry.rs`): nearly every draw of the 2D interface and the effects goes through the same geometry
   shader (it turns a point with a size and a rectangle into a quad). The hardware's vertex shader (writing a ring of 12 `vec4`
   per vertex) and geometry shader (reading it, writing a ring of 11 `vec4` per emitted vertex, and `EMIT_VERTEX`) are translated into
   compute shaders; the geometry shader also writes the triangles its strips make; the copy shader (a vertex shader that reads the
   second ring) draws them with the pixel shader. Only point inputs are done.
-- **The DMA engine** (`DMAECopyMem`) is how the game fills the GPU's constant buffers: without it every uniform block was zero.
+- **The DMA engine** (`DMAECopyMem`) is how the game fills the GPU's constant buffers: without it every uniform block was zero. Its
+  last argument turns the bytes around (0 none, 1 in every 16 bits, 2 in every 32 bits); the game's float blocks must come with 2 (copied
+  without the swap they were big-endian in memory, which the GPU could not read), and the GPU reads uniform blocks as little-endian words with no swap of its own (packed colours the game writes as bytes, red first,
+  are read with red in the low byte). The first copy of each mode is logged (`[dmae] first copy with endian mode N`). An indexed
+  uniform fetch (`VFETCH` on resource 128 + n) honours its own `ENDIAN_SWAP`.
 - `GX2CopySurface` copies between render targets (same size and format only); `GX2ClearColor`, `GX2ClearDepthStencilEx`.
 
 - **Speed** (the village scene went from 3.7 to about 13 frames a second): the draws of a frame are recorded into one command buffer and
@@ -270,10 +279,64 @@ with their text and the cloth background, upright, in the right places (the hunt
   Remote and Pro Controller functions (`KPAD*`, `WPAD*`) are not answered: no controller of those kinds exists for the game.
   `MH3U_PRESS` still works and is added to the real input.
 
-**Not done yet:** 3D textures, the component selectors of a texture (`compMap`), the rest of the sampler state (borders, the mip bias), alpha
-test and stencil, depth bias, other geometry inputs (lines, triangles, instances), loops and relative
-addressing in vertex shaders, rects and other primitive types, stream out, and the second render target (the GamePad's picture is
-drawn but not shown). (Speed is in "Speed" above: draws are batched and their buffers come from arenas.)
+- **Rendering correctness** (the 3D models and the areas were wrong while the 2D pictures were right; checked offline, not yet against
+  the game's picture):
+  - *Tiling* now matches AMD's address library for this chip (R7xx: no dual pitch, no doubled macro-tile bytes, thick tiles in the
+    displayable order with the slice bits 6 and 7): `mh3u-formats/src/tiling_vectors.txt` holds every 15th of 9,828 cases made by the
+    library itself (`tools/addrlib_vectors.cpp`); all 9,828 match (pitch, height, size, base alignment and a hash of every address).
+    The 2D-tiled textures with a pitch that is not a power of two, and all thick ones, were laid out wrong before.
+  - *Vertex attributes* are read by their type and the GX2 flags: the scaled formats (integer to float) were raw integers or halves,
+    signed 10_10_10_2 was read unsigned, and the default swap was applied to every size; now bits are swapped per unit (none for 8-bit
+    types, 16-bit units for 16-bit ones, 32-bit for the rest) and sign-extended, a missing component reads 0 and the fourth 1.
+  - *Texels* are little-endian (GX2's format table asks for no swap; Cemu reads them that way): the 16-bit packed formats had their
+    bytes swapped. Volumes are 3D textures; depth formats include 0x1c.
+  - *Shaders*: loops (`LOOP_START`, `_DX10`, `_NO_AL`, `LOOP_END`, `LOOP_BREAK`, `LOOP_CONTINUE`, and the ALU clauses that break,
+    continue or end with `ELSE`), the address register (`MOVA`, `MOVA_FLOOR`, `MOVA_INT`) and the loop index for relatively addressed
+    registers, uniform blocks and constants; counted loops read the shader's `GX2LoopVar`s; a loop with no count stops after 4,096
+    trips. The one vertex shader the village could not translate (`0x169ac000`: `LOOP_START_DX10`, `ALU_BREAK`, `LOOP_END`) is in this
+    set. A program that indexes its registers has them as an array.
+  - *State*: the texture's component selectors (`compSel`, applied to what a lookup returns, as Cemu's image views do), the alpha test
+    (a discard in the pixel shader), the stencil test (`GX2SetDepthStencilControl`'s 13 arguments and `GX2SetStencilMask`; one read and
+    write mask for both faces), depth bias (`GX2SetPolygonOffset` and the enables of `GX2SetPolygonControl`; one bias for both faces;
+    `GX2SetCullOnlyControl` writes the same register with the offset off, so it turns the bias off),
+    the viewport's depth range, and a draw that culls both faces draws nothing.
+  - **Diagnostics**: `MH3U_GFX_REPORT=1` prints a `[gfx report]` block every report window: draws and skipped draws by reason, the
+    shaders not translated and why (with the draws skipped for each), the texture formats / tile modes / kinds read (binds, images,
+    largest size, levels, selectors, and `APPROXIMATE` or `NOT DECODED`), textures that failed to decode and header pitches that differ
+    from the computed one, the vertex attribute formats with their swap mode, and once the `gx2` imports that do nothing here.
+    `MH3U_GFX_DUMP_FRAME=<n>[,<n>...]` writes frame `n` (counting swaps) to `MH3U_GFX_DUMP_DIR` (`mh3u-frames` by default) as
+    `frame-<n>/`: `draws.txt` (every draw's shaders, state, attributes, textures and whether it was drawn or why not),
+    `shaders/vs-*.txt` and `ps-*.txt` (listing and WGSL, or why not translated), `textures/*.png` and `tv.png`. Each draw also lists
+    its sampler's settings, marks a texture that is a buffer drawn earlier in the frame (`[the colour buffer of draws a-b of this
+    frame]`), and shows its uniform blocks (the pixel shader's first 32 vec4s, the vertex shader's first 16, as floats and as hex
+    words, both as the GPU reads them: little-endian); `targets.txt` is the frame's render-target chain (each image drawn into, by which draws, and which draws sampled it).
+  - **Build stamp**: the log's `[gfx] build <commit>` line and the first line of each `draws.txt` name the commit the binary was
+    built from (`+changes` when the working tree differed).
+  - **Depth bias off**: `MH3U_GFX_DEPTH_BIAS=off` drops every depth bias (a debug toggle: without it the shadow pass gets acne), to
+    check whether a draw loses to the depth its own depth-only pass wrote with a different bias.
+  - **Pixel shader override**: `MH3U_GFX_DEBUG_PS=<mode>` replaces what pixel shaders put out (after the program, with no alpha test),
+    to tell apart where a wrong picture comes from; `MH3U_GFX_DEBUG_PS_ONLY=<hex addresses>` limits it to those shaders. Modes:
+    `white` (the geometry: what is covered), `alpha1` (the program's colour made opaque: a picture that appears means the alpha was
+    0 and blending hid it), `tex` (the first ordinary texture lookup's texels: black means the texture or its binding), `uv` (that
+    lookup's coordinates as red/green, `fract`ed: flat colour means the coordinates are wrong), `inputN` (input register N as it
+    arrives from the vertex shader, e.g. `input1` the vertex colour of many shaders: black means the vertex stream or the vertex
+    shader) and `normalN`/`normals` (the same mapped from -1..1). Magenta: the shader has no such lookup or input.
+  - **Uniform blocks** are read to the next 256 bytes past the size the game gives (`SQ_ALU_CONST_BUFFER_SIZE` is in 256-byte units),
+    as the hardware does.
+  - **Vertex attributes** go to the registers the vertex shader's semantic table (`SQ_VTX_SEMANTIC`, `GX2VertexShader` +0x40/+0x44)
+    names for their location (the fetch shader's semantic id), not `location + 1`; an attribute the table does not name is not
+    loaded.
+  - **Shadow maps drawn as colour**: a buffer drawn into as colour (the village's 1024x1024 `r32f`) and read with a comparison
+    (`SAMPLE_C`) is copied into a depth texture (first component, clamped to 0..1) when it has changed since the last copy, and the
+    comparison is the sampler's own (`GX2InitSamplerDepthCompare`; less or equal when none was set). Before, such a lookup read a
+    1x1 depth stand-in. The game's shadow bias is in the receiving shader (reference `z - c`, `c` from pixel block 4), not a depth
+    bias, so the map must keep 32-bit precision (up to fb2f3db it was made 8-bit, and it was blended).
+
+**Not done yet:** the rest of the sampler state (borders, the mip bias), separate stencil masks and depth bias for back faces, other
+geometry inputs (lines, triangles, instances), rects and other primitive types, stream out, a viewport larger than its target (it is
+clamped, which squeezes the picture), the `*Reg` forms of the state calls (`GX2SetDepthStencilControlReg`...; the report lists which
+the game imports), and the second render target (the GamePad's picture is drawn but not shown). (Speed is in "Speed" above: draws are
+batched and their buffers come from arenas.)
 
 Looking at what it draws: `MH3U_GFX_SAVE=<folder>` writes the TV picture as a PPM every `MH3U_GFX_SAVE_EVERY` swaps (120 by default),
 `MH3U_GFX_SAVE_IMAGE=<hex image address>` saves a given colour buffer instead; `MH3U_GFX_SOLID=1` makes every pixel red (to see
@@ -298,8 +361,11 @@ derivative_uniformity)`). **All 579 different pixel programs become WGSL that na
 OpenGL face convention (its exact output is not checked against a cube-map picture yet). Whether a translated
 shader computes what the hardware does is not checked by anything but looking at the picture: the semantics are from the documents,
 so an operation the translator does not know is an error, never a guess.
-Vertex shaders are translated with the fetch shader replaced by decoded attribute streams (vertex pulling); loops and relative
-addressing in them are not done. The geometry pipeline's three programs are translated by `translate_es`, `translate_gs` and
+Vertex shaders are translated with the fetch shader replaced by decoded attribute streams (vertex pulling). Loops become WGSL `loop`s
+with the exec-mask stack pushed at the start and popped at the end: a lane that is off at the top of the loop leaves it, a breaking
+clause sends the lanes it turned off out of the loop, a continuing one sends them to the next trip (live again), and `LOOP_BREAK` /
+`LOOP_CONTINUE` do that to the lanes that are on. Relatively addressed operands add `ar.<c>` (set by `MOVA*` after its group) or
+`al` (the loop index of `LOOP_START`), clamped to the register file, the 4,096-entry bank or the 256 constants. The geometry pipeline's three programs are translated by `translate_es`, `translate_gs` and
 `translate_vertex` with a ring configuration (the hardware's ring writes are dwords at an absolute offset; the item sizes come from
 the vertex shader's `ringItemsize` and the geometry shader's `sq_gs_vert_itemsize`).
 

@@ -1004,6 +1004,9 @@ dependencies = [
 [[package]]
 name = "mh3u-latte"
 version = "0.1.0"
+dependencies = [
+ "naga",
+]
 
 [[package]]
 name = "mh3u-ppc"

@@ -299,9 +299,7 @@ fn main() -> Result<()> {
         } => {
             use mh3u_latte::translate::{Context, PixelInputs, TexKind, VertexAttribute, VertexInputs, translate_pixel, translate_vertex};
             let d = mh3u_latte::decode::decode(&read(&file)?).map_err(|e| anyhow::anyhow!("{e}"))?;
-            let ctx = Context {
-                texture_kind: &|_| TexKind::D2,
-            };
+            let ctx = Context::new(&|_| TexKind::D2);
             let ring = mh3u_latte::translate::RingConfig {
                 es_vec4: 12,
                 gs_vec4: 11,

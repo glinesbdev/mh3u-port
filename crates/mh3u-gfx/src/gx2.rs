@@ -63,6 +63,8 @@ calls! {
     SetCullOnlyControl = "gx2:GX2SetCullOnlyControl",
     SetPolygonControl = "gx2:GX2SetPolygonControl",
     SetAlphaTest = "gx2:GX2SetAlphaTest",
+    SetStencilMask = "gx2:GX2SetStencilMask",
+    SetPolygonOffset = "gx2:GX2SetPolygonOffset",
     SetRasterizerClipControlEx = "gx2:GX2SetRasterizerClipControlEx",
     SetShaderModeEx = "gx2:GX2SetShaderModeEx",
     CalcFetchShaderSizeEx = "gx2:GX2CalcFetchShaderSizeEx",
@@ -132,16 +134,23 @@ pub struct Gx2 {
     pub(crate) fetch_shaders: HashMap<u32, std::sync::Arc<[crate::draw::AttribStream]>>,
     /// With MH3U_FPS set: when the frame rate was last printed, and the swap count then.
     fps: Option<(Instant, u32)>,
+    /// MH3U_GFX_REPORT and MH3U_GFX_DUMP_FRAME.
+    pub(crate) diag: crate::report::Diagnostics,
 }
 
 /// The texture format of a `GX2SurfaceFormat` of a colour buffer.
-fn texture_format(gx2: u32) -> wgpu::TextureFormat {
+pub(crate) fn texture_format(gx2: u32) -> wgpu::TextureFormat {
     match gx2 {
         0x41a => wgpu::TextureFormat::Rgba8UnormSrgb,
         0x19 => wgpu::TextureFormat::Rgb10a2Unorm,
         0x816 | 0x810 => wgpu::TextureFormat::Rgba16Float,
         0x1 => wgpu::TextureFormat::R8Unorm,
         0x7 => wgpu::TextureFormat::Rg8Unorm,
+        // the 32-bit float formats keep their precision: the village's shadow map is z/w in an r32f colour buffer, and in 8 bits
+        // its steps (1/255) outgrow the game's shadow bias (about 0.0115) and the lit side of a figure shadows itself in bands
+        0x80e => wgpu::TextureFormat::R32Float,
+        0x80d => wgpu::TextureFormat::Rg32Float,
+        0x823 => wgpu::TextureFormat::Rgba32Float,
         _ => wgpu::TextureFormat::Rgba8Unorm,
     }
 }
@@ -162,6 +171,7 @@ struct Out { @builtin(position) position: vec4<f32>, @location(0) uv: vec2<f32> 
 
 impl Gx2 {
     pub fn new(d: Display) -> Gx2 {
+        eprintln!("[gfx] build {}", crate::BUILD);
         let size = d
             .window
             .as_ref()
@@ -270,6 +280,7 @@ impl Gx2 {
                 .unwrap_or(120),
             fetch_shaders: HashMap::new(),
             fps: std::env::var_os("MH3U_FPS").map(|_| (Instant::now(), 0)),
+            diag: crate::report::Diagnostics::from_env(),
         }
     }
 
@@ -343,6 +354,8 @@ impl Gx2 {
             ));
             return;
         }
+        *self.caches.target_version.entry(to).or_default() += 1;
+        let (a, b) = (&self.targets[&from].texture, &self.targets[&to].texture);
         let mut enc = self.d.device.create_command_encoder(&Default::default());
         enc.copy_texture_to_texture(
             a.as_image_copy(),
@@ -359,6 +372,7 @@ impl Gx2 {
     fn clear(&mut self, g: &Guest, c: &Ctx) {
         self.flush_draws();
         let Some(image) = self.target(g, c.r[3]) else { return };
+        *self.caches.target_version.entry(image).or_default() += 1;
         let f = |n: usize| f64::from(f64::from_bits(c.f[n]) as f32);
         let view = self.targets[&image].view.clone();
         let mut enc = self.d.device.create_command_encoder(&Default::default());
@@ -434,6 +448,17 @@ impl Gx2 {
     /// Writes the TV picture as a PPM file (for looking at what the game drew without the window): MH3U_GFX_SAVE=<folder> saves one
     /// every 120 swaps.
     fn save_tv(&self, folder: &std::path::Path) {
+        let Some((w, h, rgba)) = self.read_tv() else { return };
+        let mut ppm = format!("P6\n{w} {h}\n255\n").into_bytes();
+        for px in rgba.as_chunks::<4>().0 {
+            ppm.extend_from_slice(&px[..3]);
+        }
+        let _ = std::fs::create_dir_all(folder);
+        let _ = std::fs::write(folder.join(format!("tv-{:06}.ppm", self.swaps)), ppm);
+    }
+
+    /// The TV picture (or the colour buffer MH3U_GFX_SAVE_IMAGE names) as 8-bit RGBA, read back from the GPU.
+    fn read_tv(&self) -> Option<(u32, u32, Vec<u8>)> {
         // MH3U_GFX_SAVE_IMAGE=<hex address of a colour buffer's image> saves that buffer instead of the TV picture
         let wanted = std::env::var("MH3U_GFX_SAVE_IMAGE")
             .ok()
@@ -442,9 +467,9 @@ impl Gx2 {
             Some(image) => self.targets.get(&image).map(|t| &t.texture),
             None => self.tv.as_ref(),
         };
-        let Some(tv) = tv else { return };
+        let tv = tv?;
         if tv.format() != wgpu::TextureFormat::Rgba8Unorm {
-            return;
+            return None;
         }
         let (w, h) = (tv.width(), tv.height());
         let row = (w * 4).div_ceil(256) * 256;
@@ -475,16 +500,13 @@ impl Gx2 {
         let slice = buffer.slice(..);
         slice.map_async(wgpu::MapMode::Read, |_| {});
         let _ = self.d.device.poll(wgpu::PollType::wait_indefinitely());
-        let Ok(data) = slice.get_mapped_range() else { return };
-        let mut ppm = format!("P6\n{w} {h}\n255\n").into_bytes();
+        let data = slice.get_mapped_range().ok()?;
+        let mut rgba = Vec::with_capacity((w * h * 4) as usize);
         for y in 0..h {
-            for x in 0..w {
-                let at = (y * row + x * 4) as usize;
-                ppm.extend_from_slice(&data[at..at + 3]);
-            }
+            let at = (y * row) as usize;
+            rgba.extend_from_slice(&data[at..at + (w * 4) as usize]);
         }
-        let _ = std::fs::create_dir_all(folder);
-        let _ = std::fs::write(folder.join(format!("tv-{:06}.ppm", self.swaps)), ppm);
+        Some((w, h, rgba))
     }
 
     /// Shows the TV picture, scaled to the window with the picture's proportions kept.
@@ -638,7 +660,10 @@ impl Seen {
     }
 }
 
-/// The calls that are never part of a display list (they are about the display, not the GPU's command stream).
+/// The calls that are never part of a display list: the ones about the display, not the GPU's command stream, and the ones that only fill
+/// in an object in the CPU's memory (`GX2Calc*`, `GX2Init*`). The console runs those at once even while a list is being made; recorded,
+/// they would run only when the list is played, reading their inputs (a fetch shader's attribute array, often on the caller's stack) long
+/// after the game has reused that memory, and giving no result (a size) to the caller now.
 fn is_immediate(call: Call) -> bool {
     matches!(
         call,
@@ -650,7 +675,34 @@ fn is_immediate(call: Call) -> bool {
             | Call::GetSwapStatus
             | Call::SetSwapInterval
             | Call::GetSwapInterval
+            | Call::CalcFetchShaderSizeEx
+            | Call::InitFetchShaderEx
+            | Call::InitSampler
+            | Call::InitSamplerClamping
+            | Call::InitSamplerXYFilter
+            | Call::InitSamplerZMFilter
+            | Call::InitSamplerLOD
+            | Call::InitSamplerDepthCompare
     )
+}
+
+/// `GX2InitFetchShaderEx(fetchShader, buffer, count, attribs, ...)`: no machine code is made; the attribute streams are read now (the array
+/// is the caller's and may be gone after the call) and kept for the draws. Only the `GX2FetchShader` itself (0x20 bytes) is written.
+pub(crate) fn init_fetch_shader(
+    g: &Guest,
+    fs: u32,
+    buffer: u32,
+    count: u32,
+    attribs: u32,
+) -> (u32, std::sync::Arc<[crate::draw::AttribStream]>) {
+    let streams: Vec<_> = (0..count.min(32))
+        .map(|i| crate::draw::AttribStream::read(g, attribs + 32 * i))
+        .collect();
+    g.fill(fs, 0, 0x20);
+    g.put_u32(fs + 8, (32 + 16 * count).div_ceil(16) * 16);
+    g.put_u32(fs + 0xc, buffer);
+    g.put_u32(fs + 0x10, count);
+    (fs, streams.into())
 }
 
 impl Gx2 {
@@ -779,18 +831,34 @@ impl Gx2 {
             }
             Call::SetDepthStencilControl => {
                 let (t, w, f, s) = (a(0) != 0, a(1) != 0, a(2), a(3) != 0);
+                // front: comparison, pass, depth fail, fail; then the same for back faces (the arguments' order)
+                let (back_enabled, front, back) = (a(4) != 0, [a(5), a(8), a(7), a(6)], [a(9), a(12), a(11), a(10)]);
                 let st = self.state();
                 (st.depth_test, st.depth_write, st.depth_func, st.stencil_test) = (t, w, f, s);
+                (st.stencil.back_enabled, st.stencil.front, st.stencil.back) = (back_enabled, front, back);
+            }
+            Call::SetStencilMask => {
+                let masks = std::array::from_fn(|k| a(k) & 0xff);
+                self.state().stencil.masks = Some(masks);
+            }
+            Call::SetPolygonOffset => {
+                let offset = std::array::from_fn(|k| farg(c, k));
+                self.state().polygon_offset = offset;
             }
             Call::SetCullOnlyControl => {
+                // GX2 writes the whole of PA_SU_SC_MODE_CNTL here, as GX2SetPolygonControl with no polygon modes and no polygon
+                // offset: a draw after it has no depth bias until GX2SetPolygonControl turns it on again
                 let (face, front, back) = (a(0), a(1) != 0, a(2) != 0);
                 let st = self.state();
                 (st.front_face, st.cull_front, st.cull_back) = (face, front, back);
+                (st.offset_front, st.offset_back) = (false, false);
             }
             Call::SetPolygonControl => {
                 let (face, front, back) = (a(0), a(1) != 0, a(2) != 0);
+                let (offset_front, offset_back) = (a(6) != 0, a(7) != 0);
                 let st = self.state();
                 (st.front_face, st.cull_front, st.cull_back) = (face, front, back);
+                (st.offset_front, st.offset_back) = (offset_front, offset_back);
             }
             Call::SetAlphaTest => {
                 let (e, f, r) = (a(0) != 0, a(1), farg(c, 0));
@@ -809,15 +877,8 @@ impl Gx2 {
             // (fetch shader, buffer, attribute count, attributes, type, tessellation): nothing of machine code is made, the attributes
             // are kept and the draw reads them
             Call::InitFetchShaderEx => {
-                let (fs, buffer, count, attribs) = (c.r[3], c.r[4], c.r[5], c.r[6]);
-                let streams: Vec<_> = (0..count.min(32))
-                    .map(|i| crate::draw::AttribStream::read(g, attribs + 32 * i))
-                    .collect();
-                g.fill(fs, 0, 0x28);
-                g.put_u32(fs + 8, (32 + 16 * count).div_ceil(16) * 16);
-                g.put_u32(fs + 0xc, buffer);
-                g.put_u32(fs + 0x10, count);
-                self.fetch_shaders.insert(fs, streams.into());
+                let (fs, streams) = init_fetch_shader(g, c.r[3], c.r[4], c.r[5], c.r[6]);
+                self.fetch_shaders.insert(fs, streams);
             }
             Call::CopySurface => self.copy_surface(g, c.r[3], c.r[6]),
             // (mode, address, size): the CPU wrote memory the GPU may have cached; a texture or a shader program there is read again
@@ -874,6 +935,13 @@ impl Gx2 {
                 self.swaps += 1;
                 mh3u_rt::FRAMES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 self.prune();
+                self.diag.maybe_print(&self.caches.skipped);
+                if self.diag.swapped(self.swaps) {
+                    // the frame written out is on the TV now
+                    if let (Some((w, h, rgba)), Some(dir)) = (self.read_tv(), self.diag.finished_dir.take()) {
+                        let _ = std::fs::write(dir.join("tv.png"), crate::report::png(w, h, &rgba));
+                    }
+                }
                 if let Some((since, at)) = self.fps {
                     // the frame rate, swaps per second, every five seconds (for comparing builds)
                     let secs = since.elapsed().as_secs_f64();
@@ -964,7 +1032,47 @@ impl Gx2 {
 
     fn draw(&mut self, g: &Guest, primitive: u32, count: u32, indexed: Option<(u32, u32)>, offset: u32, instances: u32) {
         self.draws += 1;
-        self.draw_call(g, primitive, count, indexed, offset, instances);
+        if !self.diag.per_draw() {
+            self.draw_call(g, primitive, count, indexed, offset, instances);
+        } else {
+            self.diag.draw();
+            let before: u64 = self.caches.skipped.values().sum();
+            let skipped_before = self.diag.dumping.then(|| self.caches.skipped.clone());
+            self.draw_call(g, primitive, count, indexed, offset, instances);
+            if let Some(then) = skipped_before {
+                let outcome = if self.caches.skipped.values().sum::<u64>() == before {
+                    "drawn".to_string()
+                } else {
+                    let why = self
+                        .caches
+                        .skipped
+                        .iter()
+                        .find(|(k, v)| then.get(*k).copied().unwrap_or(0) != **v)
+                        .map_or("skipped", |(k, _)| *k);
+                    format!("SKIPPED ({why})")
+                };
+                let st = self.contexts.entry(self.current).or_default().clone();
+                let shaders = [
+                    (
+                        format!("vs-{:08x}", st.vertex_shader),
+                        self.diag.shader_texts.get(&format!("vs-{:08x}", st.vertex_shader)).cloned(),
+                    ),
+                    (
+                        format!("ps-{:08x}", st.pixel_shader),
+                        self.diag.shader_texts.get(&format!("ps-{:08x}", st.pixel_shader)).cloned(),
+                    ),
+                ];
+                let fetch = self.fetch_shaders.get(&st.fetch_shader).cloned();
+                self.diag.dump_draw(
+                    g,
+                    &st,
+                    (primitive, count, indexed, offset, instances),
+                    &outcome,
+                    shaders,
+                    fetch.as_deref().unwrap_or(&[]),
+                );
+            }
+        }
         {
             let (vs, ps) = {
                 let st = self.contexts.entry(self.current).or_default();
@@ -1037,7 +1145,11 @@ impl Gx2 {
 
 impl Gx2Backend for Gx2 {
     fn implements(&self, name: &str) -> bool {
-        Call::from_name(name).is_some()
+        let known = Call::from_name(name).is_some();
+        if !known && name.starts_with("gx2:") {
+            self.diag.stub(name.trim_start_matches("gx2:"));
+        }
+        known
     }
 
     fn resolve(&self, name: &str) -> Option<u32> {
@@ -1134,7 +1246,7 @@ mod tests {
             assert!(seen.insert(call.name()), "duplicate name {}", call.name());
             assert_eq!(Call::from_name(call.name()), Some(call));
         }
-        assert_eq!(Call::ALL.len(), 50);
+        assert_eq!(Call::ALL.len(), 52);
         assert_eq!(Call::from_name("gx2:GX2Nothing"), None);
         assert_eq!(Call::from_name("coreinit:GX2DrawEx"), None);
     }
@@ -1149,8 +1261,116 @@ mod tests {
         }
     }
 
+    /// The village's broken scenery (run 4, frame 4800): its fetch shaders were made while the frame's display list was being recorded, so
+    /// `GX2InitFetchShaderEx` was recorded too and read the attribute array a frame later, from reused memory (draws.txt showed one
+    /// `sint 16_16_16_16` stream and then all-zero streams, all at location 0). CPU-only calls must run when they are made.
     #[test]
-    fn immediate_calls_are_the_display_ones() {
+    fn object_setup_calls_are_never_recorded() {
+        for &call in Call::ALL {
+            let name = call.name();
+            if name.starts_with("gx2:GX2Init") || name.starts_with("gx2:GX2Calc") {
+                assert!(is_immediate(call), "{name} would be recorded into a display list");
+            }
+        }
+        // the GPU's commands are still recorded
+        for call in [
+            Call::SetFetchShader,
+            Call::SetAttribBuffer,
+            Call::DrawIndexedEx,
+            Call::SetPixelSampler,
+            Call::Invalidate,
+        ] {
+            assert!(!is_immediate(call), "{}", call.name());
+        }
+    }
+
+    #[test]
+    fn a_fetch_shader_made_while_a_list_is_recorded_is_made_at_once() {
+        let mut gx2 = Gx2::new(crate::Display::noop());
+        let mut m = vec![0u8; 0x1_0000];
+        let g = Guest::new(m.as_mut_ptr());
+        let mut c = blank_ctx();
+        c.r[1] = 0x8000;
+        c.r[3] = 0x4000;
+        gx2.run(Call::BeginDisplayListEx, &mut c, &g);
+        c.r[3] = 1;
+        gx2.run(Call::CalcFetchShaderSizeEx, &mut c, &g);
+        assert_eq!(c.r[3], 48, "the size is the caller's now");
+        for (k, v) in [0u32, 0, 0, 0x811, 0, 0, 0x0001_0203, 3].iter().enumerate() {
+            g.put_u32(0x200 + 4 * k as u32, *v);
+        }
+        (c.r[3], c.r[4], c.r[5], c.r[6]) = (0x100, 0x400, 1, 0x200);
+        gx2.run(Call::InitFetchShaderEx, &mut c, &g);
+        // the caller's array is gone before the list is played
+        g.fill(0x200, 0, 32);
+        c.r[3] = 0x100;
+        gx2.run(Call::SetFetchShader, &mut c, &g);
+        gx2.run(Call::EndDisplayList, &mut c, &g);
+        let streams = gx2.fetch_shaders.get(&0x100).expect("made while recording");
+        assert_eq!(streams[0].format, 0x811);
+        c.r[3] = 0x4000;
+        gx2.run(Call::DirectCallDisplayList, &mut c, &g);
+        assert_eq!(
+            gx2.fetch_shaders[&0x100][0].format, 0x811,
+            "playing the list does not make it again"
+        );
+        assert_eq!(gx2.state().fetch_shader, 0x100);
+    }
+
+    /// The shadow pass turns the polygon offset on with `GX2SetPolygonControl`; the scene's materials set their culling with
+    /// `GX2SetCullOnlyControl`, which turns it off again (it writes the whole register). Kept on, every later draw had the bias of the
+    /// last `GX2SetPolygonOffset`, which differed between a depth-only pass and its colour pass.
+    #[test]
+    fn cull_only_control_turns_the_polygon_offset_off() {
+        let mut gx2 = Gx2::new(crate::Display::noop());
+        let mut m = vec![0u8; 0x1_0000];
+        let g = Guest::new(m.as_mut_ptr());
+        let mut c = blank_ctx();
+        c.r[1] = 0x8000;
+        // front face CCW, cull back, no polygon modes, front offset on, back off
+        c.r[3..12].copy_from_slice(&[0, 0, 1, 0, 0, 0, 1, 0, 0]);
+        gx2.run(Call::SetPolygonControl, &mut c, &g);
+        c.f[1..6].copy_from_slice(&[(-192.0f64).to_bits(), 0, (-192.0f64).to_bits(), 0, 0]);
+        gx2.run(Call::SetPolygonOffset, &mut c, &g);
+        assert!(gx2.state().offset_front && !gx2.state().offset_back);
+        c.r[3..6].copy_from_slice(&[0, 0, 1]);
+        gx2.run(Call::SetCullOnlyControl, &mut c, &g);
+        let st = gx2.state();
+        assert!(!st.offset_front && !st.offset_back, "no bias after GX2SetCullOnlyControl");
+        assert!(st.cull_back && !st.cull_front);
+        assert_eq!(
+            st.polygon_offset[0], -192.0,
+            "the offset itself is kept for the next GX2SetPolygonControl"
+        );
+    }
+
+    #[test]
+    fn fetch_shader_streams_are_read_when_made() {
+        let mut m = vec![0u8; 0x1000];
+        let g = Guest::new(m.as_mut_ptr());
+        // two streams at 0x200: float3 position at location 0, uint8x4 at location 2, offset 12
+        let words = [[0, 0, 0, 0x811, 0, 0, 0x0001_0203, 3], [2, 0, 12, 0x10a, 0, 0, 0x0001_0203, 3]];
+        for (i, w) in words.iter().enumerate() {
+            for (k, v) in w.iter().enumerate() {
+                g.put_u32(0x200 + 32 * i as u32 + 4 * k as u32, *v);
+            }
+        }
+        // the word after the 0x20-byte GX2FetchShader is someone else's
+        g.put_u32(0x120, 0xdead_beef);
+        let (fs, streams) = init_fetch_shader(&g, 0x100, 0x400, 2, 0x200);
+        // the caller's array goes away (as a stack frame does)
+        g.fill(0x200, 0, 64);
+        assert_eq!(fs, 0x100);
+        assert_eq!(streams.len(), 2);
+        assert_eq!((streams[0].location, streams[0].offset, streams[0].format), (0, 0, 0x811));
+        assert_eq!((streams[1].location, streams[1].offset, streams[1].format), (2, 12, 0x10a));
+        assert_eq!(streams[1].select, [0, 1, 2, 3]);
+        assert_eq!((g.u32(0x10c), g.u32(0x110)), (0x400, 2));
+        assert_eq!(g.u32(0x120), 0xdead_beef);
+    }
+
+    #[test]
+    fn immediate_calls_are_the_display_and_setup_ones() {
         let immediate: Vec<&str> = Call::ALL.iter().filter(|c| is_immediate(**c)).map(|c| c.name()).collect();
         assert_eq!(
             immediate,
@@ -1158,6 +1378,14 @@ mod tests {
                 "gx2:GX2BeginDisplayListEx",
                 "gx2:GX2EndDisplayList",
                 "gx2:GX2DirectCallDisplayList",
+                "gx2:GX2CalcFetchShaderSizeEx",
+                "gx2:GX2InitFetchShaderEx",
+                "gx2:GX2InitSampler",
+                "gx2:GX2InitSamplerClamping",
+                "gx2:GX2InitSamplerXYFilter",
+                "gx2:GX2InitSamplerZMFilter",
+                "gx2:GX2InitSamplerLOD",
+                "gx2:GX2InitSamplerDepthCompare",
                 "gx2:GX2SwapScanBuffers",
                 "gx2:GX2WaitForVsync",
                 "gx2:GX2GetSwapStatus",
@@ -1169,7 +1397,7 @@ mod tests {
             .filter(|n| immediate.contains(n))
             .collect::<Vec<_>>()
         );
-        assert_eq!(immediate.len(), 8);
+        assert_eq!(immediate.len(), 16);
     }
 
     #[test]

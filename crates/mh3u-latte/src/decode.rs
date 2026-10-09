@@ -102,6 +102,9 @@ pub struct AluInst {
     pub update_pred: bool,
     pub pred_sel: u32,
     pub bank_swizzle: u32,
+    /// What a relatively addressed operand or destination adds to its index: 0 to 3 a component of the address register (`AR`),
+    /// 4 the loop index (`aL`).
+    pub index_mode: u32,
     pub last: bool,
 }
 
@@ -178,6 +181,8 @@ pub enum Cf {
         addr: u32,
         pop_count: u32,
         cond: u32,
+        /// The constant the instruction uses: for a counted loop, which loop constant holds its count, start and step.
+        cf_const: u32,
     },
     /// A write to a ring (`MEM_RING`, 0x26): `burst` consecutive registers from `gpr` go to the dword offset `array_base` of the
     /// ring, only the components in `mask`. The vertex shader that feeds a geometry shader writes its outputs this way, and so does the
@@ -274,6 +279,7 @@ fn decode_alu_clause(program: &[u8], address: usize, count: usize) -> Result<Vec
                 update_pred: !three && (a1 >> 3) & 1 != 0,
                 pred_sel: (a0 >> 29) & 3,
                 bank_swizzle: (a1 >> 18) & 7,
+                index_mode: (a0 >> 26) & 7,
                 last,
             });
             if last {
@@ -398,6 +404,7 @@ pub fn decode(program: &[u8]) -> Result<Decoded, Error> {
                     addr: w0,
                     pop_count,
                     cond,
+                    cf_const: (w1 >> 3) & 0x1f,
                 },
                 0x13 => Cf::CallFetchShader,
                 0x15..=0x17 => Cf::Emit { inst },
@@ -476,7 +483,12 @@ pub fn listing(d: &Decoded) -> String {
                     for i in &g.insts {
                         let name = if i.three { crate::ops::op3(i.op) } else { crate::ops::op2(i.op) }.map_or("?", |t| t.1);
                         let used = if i.three { 3 } else { 2 };
-                        let srcs: Vec<String> = i.src[..used].iter().map(|s| source_text(s, &g.literals)).collect();
+                        let index = ["[AR.x]", "[AR.y]", "[AR.z]", "[AR.w]", "[aL]", "[global]", "[global+AR.x]", "[?]"]
+                            [(i.index_mode & 7) as usize];
+                        let srcs: Vec<String> = i.src[..used]
+                            .iter()
+                            .map(|s| source_text(s, &g.literals).replace("[AR]", index))
+                            .collect();
                         let _ = writeln!(
                             out,
                             "      {}{} {}R{}{}.{} <- {}{}{}",
@@ -484,7 +496,7 @@ pub fn listing(d: &Decoded) -> String {
                             name,
                             if i.write { "" } else { "(nowrite) " },
                             i.dst_gpr,
-                            if i.dst_relative { "[AR]" } else { "" },
+                            if i.dst_relative { index } else { "" },
                             ['x', 'y', 'z', 'w'][(i.dst_channel & 3) as usize],
                             srcs.join(", "),
                             if i.omod != 0 { format!(" omod{}", i.omod) } else { String::new() },

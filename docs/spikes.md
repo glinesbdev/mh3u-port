@@ -145,6 +145,126 @@ small, plain and finite, and the programs can all be translated once, before the
 blend state), to show the rest of the graphics layer is reachable. A capture from Cemu through RenderDoc shows Vulkan calls, not GX2, and
 it contains the game's textures, so it stays on the owner's machine and out of the repository. It is needed after 3a and 3b, not before.
 
+**3e. Why the 3D was wrong (checked offline, October 2026).** The 2D pictures were right and the models and areas were not, so the
+paths only 3D uses were checked against references, each with tests in the repository:
+
+- *Tiling* against AMD's address library itself (built from its MIT sources on this machine, configured as the console's R7xx: family
+  0x51, `gbAddrConfig` 0x44902): 1,256 of 9,828 cases differed before (macro-tiled pitches that are not a power of two, every thick
+  mode, base alignments); none now. Bad untiling of exactly the 2D-tiled textures fits "UI right, models noisy".
+- *Vertex attributes* against GX2's attribute format list and Cemu's fetch code: the scaled formats were read as raw integers (a
+  position or weight of 3 read as a denormal), signed 10_10_10_2 unsigned, and 8-bit types were swapped as if 32-bit. That fits the
+  long streaks.
+- *Texel byte order* against GX2's format table (no swap for any texture format) and Cemu's decoders: 16-bit packed texels were
+  read byte-swapped.
+- *What is not known yet:* whether the remaining wrong pictures come from these, from a shader whose semantics are guessed (the
+  translator errs rather than guesses, but the order of a group's writes, `CUBE`'s output and the rounding of `MOVA` are from the
+  documents only), from state the game sets through `*Reg` calls this backend does not take, or from a texture format read
+  approximately. `MH3U_GFX_REPORT` and `MH3U_GFX_DUMP_FRAME` (see `docs/translator.md`) are there to tell those apart on the owner's
+  machine.
+
+**3f. The village's scenery (owner's run 4, frame 4800 dumped).** Character select was right after 3e and the village was not: no
+scenery, streaks on some models. `draws.txt` showed why: the fetch shaders of the scenery (`0x1dbd60f0`..`0x1dbd7ef0`, used by about
+250 of the frame's 451 draws, vertex shaders `0x169eb340`, `0x169eee80`, `0x16978000`, `0x169ad300`, and 4 draws of the skinned
+`0x1699c580`) had one `sint 16_16_16_16` stream at location 0 and every other stream all zero (location 0, offset 0, format 0), while
+the vertex shaders read a float position in R1 and an integer colour in R3 (`INT_TO_FLT`). The character's fetch shaders were right.
+The cause: the game makes these fetch shaders while it is recording the frame's display list, and `GX2InitFetchShaderEx` was recorded
+like a GPU command, so it ran only when the list was played, reading the attribute array (the caller's, gone by then) from reused
+memory; `GX2CalcFetchShaderSizeEx` returned nothing to its caller the same way. The `GX2Calc*`/`GX2Init*` calls (CPU-only: they fill
+in an object) now run when they are made, recording or not, and `GX2InitFetchShaderEx` writes only the 0x20 bytes of the
+`GX2FetchShader` (it wrote 0x28).
+
+**3g. The village's black scenery (run 5).** With the fetch shaders right, the scenery has its shape but is black while the
+characters, particles and sky are right. The scenery's pixel shaders (`ps-17101480`, `ps-1724c040`; draws 228/229 of run 4's frame
+4800) are `vertex colour x texture 1`, fogged with a table read from uniform block 5 by index, with alpha = vertex alpha x texture
+alpha x a material byte from block 1; `ps-17101480` adds four shadow lookups (`SAMPLE_C`) of texture 5, the shadow pass's
+`r32f` colour buffer `0xf561e800`. Two things were clearly wrong and are fixed: that colour buffer was read through a 1x1 depth
+stand-in (a colour buffer is not a depth texture), and every comparison was "less or equal" whatever the sampler said. The cause of
+the black is not settled from the dumps on hand (run 5's frame dump was byte-identical to run 4's): the characters use the same
+fog table and shadow lookups and are right, which leaves the scenery's own inputs (vertex colour/alpha through the vertex shader's
+`INT_TO_FLT` path, texture 1, block 1's packed material bytes). `MH3U_GFX_DEBUG_PS` and the per-draw uniform blocks are there to
+settle it in one run.
+
+**3h. A uniform block's readable size (dd1df47).** `GX2Set*UniformBlock` gives the hardware the size in 256-byte units, rounded up
+(`SQ_ALU_CONST_BUFFER_SIZE = (size + 255) >> 8`), so constants up to that rounding are now uploaded. This is what the hardware does,
+but it was **not** the cause of the black scenery: run 6's dump shows the scenery's block 1 is 1536 bytes with the constants it
+needs (draw 234: `[8] = (1, 0, 0, 0)`, `[9] = (0, 1, 0, 0)`, `[10] = (1, 1, 1, 1)`).
+
+**3i. Why the scenery was black (run 6, frame 2400).** The debug runs (`alpha1`, `input1` black; `tex` flat texture colours; `uv`
+black) said the vertex colour was zero and the UVs constant. Draw 234's fetch shader has location 0 float3 (position), 1 sint8x4
+(normal), 2 float2 (UV), 3 uint8x4 (colour), 4, 5; `vs-169eee80` reads the position in R1, the UVs in R2 (`DOT4 R4.x <- R2.x,
+KC0[8].x`) and the colour in R3 (`INT_TO_FLT R0.x <- R3.x`). Attributes were put in register `location + 1`, so R2 held the normal
+(small integers: UV about (0, 0), read at (0, 1)) and R3 the UV floats (`INT_TO_FLT` of float bits, about 1e9, through the colour
+decode `c / (1.001 - c)`: negative, clamped to black). The hardware loads an attribute into the register its vertex shader's
+`SQ_VTX_SEMANTIC` table names (`GX2VertexShader` +0x40 count, +0x44 entries: entry `i` is the semantic id, the fetch shader's
+location, loaded into R`i+1`; an attribute it does not name is not loaded). That table is now used, for ordinary and geometry
+pipelines; with no table it is `location + 1` as before. The characters' shaders read their attributes in location order, which
+is why they were right. `draws.txt` now shows each draw's semantic table, the registers the attributes go to, the vertex output
+semantics and which output each pixel input takes.
+
+**3j. Run 7: the dump was not made by 0204bae, and the streaks.** Run 7's `draws.txt` has no "vertex semantic table" lines, which
+0204bae writes for every draw, so the binary that made it predates the fix (it does have c5d6ec1's uniform blocks). The streaks
+toward the world origin come from the same register mapping: the character's skinning shader `vs-1697a580` (draw 188, fetch
+shader `0x1d526d50`: locations 0, 1, 4, 5, 6, 7, 8, 9, 10, 11, 2, 3) reads bone indices and weights from R6 to R9
+(`INT_TO_FLT`, then `x 3` and `+6..+8` as rows of uniform block 1 fetched by index) and morph deltas from R10/R11; as
+`location + 1` R7 held location 6, a signed 8-bit tangent, so the second bone set used indices from it (negative ones clamp to the
+end of the block, which reads zero rows) and those vertices went to (0, 0, 0). The builds now print their commit (`[gfx] build
+<hash>` at start, and the first line of `draws.txt`), so a run can be matched to its code.
+
+**3k. Run 8 (63c0c75): lit and textured; red shadows, black figures.** The stamp reads `build 63c0c75`, the scenery shows `vertex
+semantic table Some([0, 2, 3])` (257 draws) and the skinned characters `Some([0, 1, 2, 3, 4, 5, 7, 8, 9, 10, 11])` (92), as
+predicted, and the streaks are gone. *Red smears*: they are the shadows. `ps-17101480` (and the characters' shaders) take a shadow
+colour from block 1's `KC0[0].y`, red from its low byte (`AND_INT 0xff`), green `>> 8`, blue `>> 16`, and add the lit fraction of
+four `SAMPLE_C` taps. The village's value is `4c 4c 4c ff` in memory (grey, alpha last; every packed word of block 1 ends in `ff`);
+with every uniform word turned around it reached the shader as red `ff`, green and blue `4c`, so shade kept the red. The GPU
+reads uniform blocks as little-endian words with no swap of its own; the game's floats look right turned around only because
+`DMAECopyMem` ignored its endian argument, the 8-in-32 swap the game asks for. The copy now does the swap and the blocks go up as
+they are. *Black figures*: every one of the 46 skinned colour draws has its depth-only twin earlier in the frame (same indices,
+same matrices in the dumped rows), but the polygon offsets differ for some objects: the first object of each pass keeps the bias
+of the pass before (depth-only draws 54-58 -192, their colour draws 222-226 -32), and draws 78-98 have -384 against -224 for
+their colour draws 308-324 (also 118-135 -160 against -96, 138-160 -224 against -160). Where the colour draw is biased less, it
+is farther than the depth it wrote itself and loses a less-or-equal test, leaving what the target held (black); this matches
+the figures. Why the offsets differ is not settled (the units, 2^-24 for a 24-bit buffer, are the hardware's);
+`MH3U_GFX_DEPTH_BIAS=off` tests the explanation.
+
+**3l. Why the colour draws' bias differed from their depth-only twins (run 9).** With `MH3U_GFX_DEPTH_BIAS=off` the village's
+figures appear (and the red tint is gone with ddb7c25's uniform fix), but the player gets streaks outside (taken then for the
+shadow pass losing its bias; 3m shows the shadow pass has none of the game's). Run 9's dump has the same pattern as run 8 (offsets -192 for
+draws 0-53, then -384, -256, -512, ... changing per mesh, every draw "front true"). The pipeline cache was not it: its key holds
+the bias (constant, slope scale, clamp). The cause is `GX2SetCullOnlyControl`: GX2 does it as `GX2SetPolygonControl(face,
+cullFront, cullBack, no polygon modes, offsets off)`, writing the whole of `PA_SU_SC_MODE_CNTL` (decaf, read for facts), but here it
+only set the face and culling and left the offset enables as they were. Once a draw turned the offset on with
+`GX2SetPolygonControl`, every later draw kept it (into the next frame's shadow pass too), with whatever `GX2SetPolygonOffset` the game had set last (it sets one per
+material whether or not the offset is on), and the first mesh of a pass kept the value of the pass before. Now
+`GX2SetCullOnlyControl` turns the offset off; the offset values are kept for the next `GX2SetPolygonControl`.
+
+**3m. The streaks on the player outside the village (run 10, fb2f3db).** fb2f3db did what 3l predicted: in run 10's village dump
+(frame 2400) 453 of the 488 draws have the offset off and 35 have it on, a few per mesh group in both the depth-only and colour
+passes (the game's own decals and overlays); the figures render. The shadow pass (draws 0-53: 1024x1024 colour buffer `0x80e`
+(r32f) at `0xf561e800`, D24 depth at `0x15ef0000`) now has the offset off, so the -192 it had before was the stale one from the end
+of the frame before, and it never mattered: its pixel shader writes `z/w` of the light's projection (or `w` times a scale when
+block 4's `[0].w` is not 0) as colour, which a depth bias does not touch. The receivers (the map is read by draws 218-396; e.g. draw 218, pixel shader `0x16e2f740`)
+take four `SAMPLE_C` taps at +-1/1024 with reference `sat(z - c)`, `c` = pixel block 4 `[0].x` = 0.0115 here, against that map
+(sampler comparison 4, greater: 1 where the receiver is behind what the light sees). So the bias is the game's, in the shader.
+What broke it: colour buffers were made in `Rgba8Unorm` for every format we had not listed, `0x80e` among them, so the map held
+`z/w` in steps of 1/255 (0.0039, a third of `c`), and in the field, where the light's frustum is deep, a step is a long way: the
+lit side of the player, sloped against the light, fell behind its own stored depth in bands. The map was also blended: the draws
+leave blending on (source alpha, one minus source alpha) and the exported alpha is `z/w` itself. The 32-bit float colour formats
+(`0x80e`, `0x80d`, `0x823`) are now made as `R32Float`, `Rg32Float` and `Rgba32Float` and never blended (the hardware's blender
+does not take 32-bit float components; wgpu does not either without an extra feature); the depth copy was already
+`Depth32Float`. Also, the vertex position is now `@invariant`: every depth-only/colour pair uses the same vertex and fetch shader
+(e.g. draws 54 and 218: `0x1697a580`, `0x1d526d50`, depth test less or equal, no bias on either) with different pixel shaders, and
+without it the GPU's compiler may compute the position differently for the two pipelines. The dump's frame is the village, so the
+field itself is still to be seen; the dump's PNG of the r32f map is black (it is not read back from the GPU), so the precision is
+inferred from the format table, not measured.
+
+**3n. Run 11 (500c143): the field.** The log says `[gfx] build 500c143` and the dump's `draws.txt` begins `build 500c143`. Only
+frame 2400 was written (the run lasted about 5200 frames, so 7200 and later never came), and it is the field, not the village:
+base camp by area 1, 498 draws. The field has the village's shadow path, not a cascade of its own: one 1024x1024 r32f map
+(`0xf561e800`, draws 0-44) read by draws 196-372 with the same reference bias (pixel block 4 `[0].x` = 0.0115), so 3m's fix
+covers it, and the user saw no streaks in the field and the village unchanged. 105 draws have the polygon offset on (the field's
+decals and ground overlays). Nothing new stands out in the dump's picture; the base camp is hazy, which may be the game's
+morning fog. The user felt stutter on leaving the village; what the log shows about it is in `performance.md` (open concerns 2 and 3).
+
 ## 4. Does the generated code compile in a reasonable time? (done: as C yes, as one Rust crate no)
 
 `mh3u-tools codegen-bench <dump> <out> --lang rust|c --functions N` translates an even sample of the game's functions (found as the

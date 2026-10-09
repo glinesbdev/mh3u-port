@@ -5,7 +5,9 @@ use crate::gx2::Gx2;
 use crate::shader_cache::{FrontCache, Lookup, Ranges};
 use crate::state::State;
 use mh3u_latte::decode::decode;
-use mh3u_latte::translate::{Context, Interface, PixelInputs, TexKind, VertexAttribute, VertexInputs, translate_pixel, translate_vertex};
+use mh3u_latte::translate::{
+    Context, IDENTITY_SELECT, Interface, PixelInputs, TexKind, VertexAttribute, VertexInputs, translate_pixel, translate_vertex,
+};
 use mh3u_rt::Guest;
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
@@ -41,6 +43,77 @@ impl AttribStream {
     }
 }
 
+/// The debugging override of pixel shaders (`MH3U_GFX_DEBUG_PS`, see `DebugPs::parse`), for every pixel shader or, with
+/// `MH3U_GFX_DEBUG_PS_ONLY` (addresses in hex, comma-separated, as in `draws.txt`), only for those.
+fn debug_ps(ps: u32) -> mh3u_latte::translate::DebugPs {
+    static SETTING: std::sync::OnceLock<(mh3u_latte::translate::DebugPs, Option<Vec<u32>>)> = std::sync::OnceLock::new();
+    let (mode, only) = SETTING.get_or_init(|| {
+        let mode = std::env::var("MH3U_GFX_DEBUG_PS").map_or(Default::default(), |v| mh3u_latte::translate::DebugPs::parse(&v));
+        let only = std::env::var("MH3U_GFX_DEBUG_PS_ONLY").ok().map(|v| parse_addresses(&v));
+        (mode, only)
+    });
+    match only {
+        Some(list) if !list.contains(&ps) => Default::default(),
+        _ => *mode,
+    }
+}
+
+/// Whether draws get the depth bias `GX2SetPolygonOffset` asks for: `MH3U_GFX_DEPTH_BIAS=off` (or `0`) leaves it out, to see whether a
+/// draw lost to the depth its own depth-only pass wrote with a larger bias.
+fn depth_bias_on() -> bool {
+    static SETTING: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *SETTING.get_or_init(|| bias_setting(std::env::var("MH3U_GFX_DEPTH_BIAS").ok().as_deref()))
+}
+
+pub(crate) fn bias_setting(v: Option<&str>) -> bool {
+    !matches!(
+        v.map(|v| v.trim().to_ascii_lowercase()).as_deref(),
+        Some("off" | "0" | "no" | "false")
+    )
+}
+
+/// Addresses written in hex (with or without `0x`), separated by commas or spaces; what does not read as one is left out.
+pub(crate) fn parse_addresses(text: &str) -> Vec<u32> {
+    text.split([',', ' ', ';'])
+        .filter_map(|t| {
+            let t = t.trim();
+            let t = t.strip_prefix("0x").or_else(|| t.strip_prefix("0X")).unwrap_or(t);
+            (!t.is_empty()).then(|| u32::from_str_radix(t, 16).ok()).flatten()
+        })
+        .collect()
+}
+
+/// A vertex shader's `SQ_VTX_SEMANTIC` table (`GX2VertexShader` +0x40 the count, +0x44 the 32 entries, the semantic id in bits 0
+/// to 7): entry `i` names the attribute that register `i + 1` is loaded with. `None` when the shader has no table (count 0).
+pub(crate) fn vertex_semantics(g: &Guest, vs: u32) -> Option<Vec<u32>> {
+    let count = g.u32(vs + 0x40).min(32);
+    (count != 0).then(|| (0..count).map(|i| g.u32(vs + 0x44 + 4 * i) & 0xff).collect())
+}
+
+/// Which register each attribute stream is loaded into. The fetch shader tags each attribute with its location as the semantic id;
+/// the vertex shader's semantic table says which register has which id (the first entry that matches; an attribute it does not name
+/// is not loaded). With no table, location `n` goes to register `n + 1`. The village's scenery shaders load location 2 (the UVs) into
+/// R2 and location 3 (the colour) into R3, skipping location 1: read as `location + 1` the UVs were the normal and the colour the
+/// UVs, which made the scenery black.
+pub(crate) fn vertex_attributes(semantics: &Option<Vec<u32>>, fetch: &[AttribStream]) -> Vec<VertexAttribute> {
+    fetch
+        .iter()
+        .enumerate()
+        .filter_map(|(i, a)| {
+            let gpr = match semantics {
+                Some(table) => table.iter().position(|&id| id == a.location)? as u32 + 1,
+                None => a.location + 1,
+            };
+            Some(VertexAttribute {
+                gpr,
+                stream: i as u32,
+                per_instance: a.per_instance,
+                divisor: a.divisor,
+            })
+        })
+        .collect()
+}
+
 pub struct Compiled {
     pub module: wgpu::ShaderModule,
     pub interface: Interface,
@@ -64,8 +137,30 @@ pub struct GeometryEntry {
 pub type Fetch = Arc<[AttribStream]>;
 /// The front key of a vertex shader: (shader, program, size, fetch shader version, half z).
 pub type VertexFront = (u32, u32, u32, usize, bool);
-/// The front key of a pixel shader: (shader, program, size, hash of the words its inputs are made from, texture kinds).
-pub type PixelFront = (u32, u32, u32, u64, [u8; 18]);
+/// What else a pixel shader's translation depends on: the kinds and component selectors of the textures it reads, and the alpha test.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct PixelVariant {
+    pub kinds: [TexKind; 18],
+    pub selects: [u32; 18],
+    /// The alpha test's comparison and the bits of its reference; (7, 0), always, when it is off.
+    pub alpha: (u32, u32),
+}
+
+/// The front key of a pixel shader: (shader, program, size, hash of the words its inputs are made from, what else it depends on).
+pub type PixelFront = (u32, u32, u32, u64, PixelVariant);
+
+/// The loop constants a shader brings (`GX2LoopVar`s: the register's byte offset from the first loop constant, and its value), by
+/// the loop constant's number.
+fn loop_constants(g: &Guest, count: u32, list: u32) -> [Option<u32>; 32] {
+    let mut out = [None; 32];
+    for k in 0..count.min(32) {
+        let (offset, value) = (g.u32(list + 8 * k), g.u32(list + 8 * k + 4));
+        if let Some(slot) = out.get_mut((offset / 4) as usize) {
+            *slot = Some(value);
+        }
+    }
+    out
+}
 
 /// The front key of a geometry pipeline: the vertex and geometry shaders, their three programs (start, size), the fetch shader version,
 /// half z, and the ring item sizes (es and gs vec4s), everything its translation depends on besides the program bytes.
@@ -130,6 +225,10 @@ pub(crate) struct PipelineKey {
     depth_func: u32,
     cull: u8,
     front_face: u32,
+    /// The stencil test when it is on (and the depth buffer has stencil): the faces' settings and the read and write masks.
+    stencil: Option<([u32; 4], [u32; 4], u32, u32)>,
+    /// The depth bias: constant, and the bits of the slope scale and the clamp.
+    bias: (i32, u32, u32),
 }
 
 /// A depth buffer the game draws with, and its views (made once): the whole of it for drawing, its depth for sampling.
@@ -177,7 +276,15 @@ pub struct DrawCaches {
     /// Samplers by the three words of the `GX2Sampler` they were made from, and the two that are not the game's.
     pub samplers: HashMap<[u32; 3], wgpu::Sampler>,
     pub default_sampler: Option<wgpu::Sampler>,
-    pub compare_sampler: Option<wgpu::Sampler>,
+    /// Comparison samplers by their `GX2CompareFunction` (15 when the game set none: less or equal).
+    pub compare_samplers: HashMap<u32, wgpu::Sampler>,
+    /// How many times each colour buffer (by image) has been drawn into, cleared or copied to: a copy made of it is stale when this
+    /// has moved on.
+    pub target_version: HashMap<u32, u64>,
+    /// Colour buffers a shader reads with a comparison (a shadow map drawn as `r32f` colour), copied into depth textures, with the
+    /// `target_version` they were copied at.
+    pub depth_copies: HashMap<u32, (wgpu::Texture, wgpu::TextureView, u64)>,
+    pub depth_copy_pipeline: Option<(wgpu::RenderPipeline, wgpu::BindGroupLayout)>,
     /// Bind groups by what they bind, with the swap they were last used in.
     pub bind_groups: HashMap<GroupKey, (wgpu::BindGroup, u32)>,
     /// The uniform blocks uploaded, by (address, vec4s, bytes read): the guest bytes of each upload of the current batch, so a draw
@@ -209,15 +316,14 @@ pub struct UniformVersions {
     swap: u32,
 }
 
-/// The words of the `have` bytes of a uniform block at `address`, in the order the shader reads them, into `out` (a word cut short by
-/// the block's size is completed with zeros, as the rest of the block is).
+/// The `have` bytes of a uniform block at `address` into `out`, as they are (a word cut short by the block's size is completed with
+/// zeros, as the rest of the block is). The GPU reads uniform blocks as little-endian words with no swap (the block's buffer resource
+/// asks for none), so the game sends them already turned around: its floats come through `DMAECopyMem` with the 8-in-32 swap, and
+/// packed colours it writes as bytes (red first) are read with red in the low byte.
 pub(crate) fn uniform_words(g: &Guest, address: u32, have: usize, out: &mut Vec<u8>) {
     out.clear();
     g.with_bytes(address, have, |b| out.extend_from_slice(b));
     out.resize(have.next_multiple_of(4), 0);
-    for w in out.as_chunks_mut::<4>().0 {
-        w.reverse();
-    }
 }
 
 /// How many uploads of one block a batch remembers (a block rewritten more often than this between flushes is uploaded each time).
@@ -315,112 +421,180 @@ pub(crate) fn count_lookup(how: &Lookup, hit: &'static str, checked: &'static st
     );
 }
 
-/// The attribute's components as raw 32-bit patterns (floats for the float and normalised formats, integers as they are for the others).
-fn decode_attribute(format: u32, endian: u32, bytes: &[u8]) -> [u32; 4] {
-    let kind = format & 0xff;
-    let class = (format >> 8) & 0xf;
-    // (components, bytes per component)
-    let (n, size) = match kind {
-        0x00 => (1, 1),
-        0x04 => (2, 1),
-        0x0a => (4, 1),
-        0x02 | 0x03 => (1, 2),
-        0x07 | 0x08 => (2, 2),
-        0x0e | 0x0f => (4, 2),
-        0x05 | 0x06 => (1, 4),
-        0x0c | 0x0d => (2, 4),
-        0x10 | 0x11 => (3, 4),
-        0x12 | 0x13 => (4, 4),
-        0x0b => (4, 0),
-        0x09 => (3, 0),
-        _ => (0, 0),
-    };
-    // 0 means the data is read in the order it is stored; everything else is a big-endian guest value
-    let swap = endian != 0;
-    let u = |at: usize, len: usize| -> u32 {
-        let mut v = 0u32;
-        for k in 0..len {
-            let byte = bytes.get(at + k).copied().unwrap_or(0);
-            if swap {
-                v = (v << 8) | u32::from(byte);
-            } else {
-                v |= u32::from(byte) << (8 * k);
-            }
-        }
-        v
-    };
-    let mut out = [0u32; 4];
-    if size == 0 {
-        // packed formats
-        let word = u(0, 4);
-        if kind == 0x0b {
-            let fields = [
-                (word & 0x3ff, 1023.0),
-                ((word >> 10) & 0x3ff, 1023.0),
-                ((word >> 20) & 0x3ff, 1023.0),
-                ((word >> 30) & 3, 3.0),
-            ];
-            for (k, (v, max)) in fields.iter().enumerate() {
-                out[k] = match class {
-                    0 => (*v as f32 / max).to_bits(),
-                    _ => *v,
-                };
-            }
-        } else if kind == 0x09 {
-            let f11 = |bits: u32| -> f32 {
-                let (e, m) = ((bits >> 6) & 0x1f, bits & 0x3f);
-                if e == 0 {
-                    m as f32 / 64.0 * 2f32.powi(-14)
-                } else if e == 31 {
-                    f32::INFINITY
-                } else {
-                    (1.0 + m as f32 / 64.0) * 2f32.powi(e as i32 - 15)
-                }
-            };
-            let f10 = |bits: u32| -> f32 {
-                let (e, m) = ((bits >> 5) & 0x1f, bits & 0x1f);
-                if e == 0 {
-                    m as f32 / 32.0 * 2f32.powi(-14)
-                } else if e == 31 {
-                    f32::INFINITY
-                } else {
-                    (1.0 + m as f32 / 32.0) * 2f32.powi(e as i32 - 15)
-                }
-            };
-            out = [
-                f11(word & 0x7ff).to_bits(),
-                f11((word >> 11) & 0x7ff).to_bits(),
-                f10(word >> 22).to_bits(),
-                0,
-            ];
-        }
-        return out;
+/// How the integer components of an attribute become what the shader reads (the `GX2AttribFormat` flags: `SCALED` 0x800 wins over
+/// `INTEGER` 0x100, as in the fetch instruction's number format).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NumFormat {
+    /// Normalised to 0..1 (or -1..1 when signed).
+    Norm,
+    /// Left as integers.
+    Int,
+    /// Converted to floats as they are ("integer to float").
+    Scaled,
+}
+
+/// What an attribute format is made of: the number of components, their sizes in bits (a packed format has several in one word,
+/// lowest bits first), whether they are floats, and how the integer ones are read. `None` for a type that is not known.
+fn attribute_layout(format: u32) -> Option<(&'static [u32], bool)> {
+    Some(match format & 0x3f {
+        0x00 => (&[8], false),
+        0x01 => (&[4, 4], false),
+        0x02 => (&[16], false),
+        0x03 => (&[16], true),
+        0x04 => (&[8, 8], false),
+        0x05 => (&[32], false),
+        0x06 => (&[32], true),
+        0x07 => (&[16, 16], false),
+        0x08 => (&[16, 16], true),
+        0x09 => (&[11, 11, 10], true),
+        0x0a => (&[8, 8, 8, 8], false),
+        0x0b => (&[10, 10, 10, 2], false),
+        0x0c => (&[32, 32], false),
+        0x0d => (&[32, 32], true),
+        0x0e => (&[16, 16, 16, 16], false),
+        0x0f => (&[16, 16, 16, 16], true),
+        0x10 => (&[32, 32, 32], false),
+        0x11 => (&[32, 32, 32], true),
+        0x12 => (&[32, 32, 32, 32], false),
+        0x13 => (&[32, 32, 32, 32], true),
+        _ => return None,
+    })
+}
+
+fn num_format(format: u32) -> NumFormat {
+    if format & 0x800 != 0 {
+        NumFormat::Scaled
+    } else if format & 0x100 != 0 {
+        NumFormat::Int
+    } else {
+        NumFormat::Norm
     }
-    for (k, slot) in out.iter_mut().enumerate().take(n) {
-        let raw = u(k * size, size);
-        *slot = match (class, size) {
-            // floating point
-            (8, 4) => raw,
-            (8, 2) => half_to_f32(raw as u16).to_bits(),
-            // unsigned normalised
-            (0, 1) => (raw as f32 / 255.0).to_bits(),
-            (0, 2) => (raw as f32 / 65535.0).to_bits(),
-            (0, 4) => (raw as f32 / 4_294_967_295.0).to_bits(),
-            // signed normalised
-            (2, 1) => ((raw as u8 as i8 as f32 / 127.0).max(-1.0)).to_bits(),
-            (2, 2) => ((raw as u16 as i16 as f32 / 32767.0).max(-1.0)).to_bits(),
-            // scaled: integers converted to floats
-            (4, _) => (raw as f32).to_bits(),
-            (5, 1) => (raw as u8 as i8 as f32).to_bits(),
-            (5, 2) => (raw as u16 as i16 as f32).to_bits(),
-            (5, _) => (raw as i32 as f32).to_bits(),
-            // integers stay integers (signed ones sign-extended)
-            (3, 1) => raw as u8 as i8 as i32 as u32,
-            (3, 2) => raw as u16 as i16 as i32 as u32,
-            _ => raw,
+}
+
+/// A short name of an attribute format, for reports (`snorm 16x4`, `float 32x3`, `uint->float 8x4`...).
+pub(crate) fn attribute_format_name(format: u32) -> String {
+    let Some((sizes, float)) = attribute_layout(format) else {
+        return format!("unknown {format:#x}");
+    };
+    let signed = format & 0x200 != 0;
+    let kind = if float {
+        "float"
+    } else {
+        match (num_format(format), signed) {
+            (NumFormat::Norm, false) => "unorm",
+            (NumFormat::Norm, true) => "snorm",
+            (NumFormat::Int, false) => "uint",
+            (NumFormat::Int, true) => "sint",
+            (NumFormat::Scaled, false) => "uint->float",
+            (NumFormat::Scaled, true) => "sint->float",
+        }
+    };
+    let degamma = if format & 0x400 != 0 { " srgb" } else { "" };
+    let parts: Vec<String> = sizes.iter().map(u32::to_string).collect();
+    format!("{kind} {}{degamma}", parts.join("_"))
+}
+
+/// The attribute's components as raw 32-bit patterns: floats for the float, normalised and scaled formats, integers (sign-extended
+/// when signed) for the integer ones. A component the format does not have reads as 0, and the fourth as 1.
+///
+/// `endian` is the stream's `GX2EndianSwapMode`: 0 reads the bytes as they are (little-endian); 1 swaps the bytes in every 16 bits, 2
+/// in every 32 bits, and 3 (the default) by the size of the components (none for 8-bit ones, 16 for 16-bit ones, 32 for the rest),
+/// which reads the big-endian values the game wrote.
+fn decode_attribute(format: u32, endian: u32, bytes: &[u8]) -> [u32; 4] {
+    let Some((sizes, float)) = attribute_layout(format) else {
+        return [0; 4];
+    };
+    let signed = format & 0x200 != 0;
+    let num = num_format(format);
+    let int_out = !float && num == NumFormat::Int;
+    let one = if int_out { 1 } else { 1.0f32.to_bits() };
+    let mut out = [0, 0, 0, one];
+    let total: u32 = sizes.iter().sum();
+    let len = total.div_ceil(8) as usize;
+    let mut buf = [0u8; 16];
+    for (k, b) in buf.iter_mut().enumerate().take(len) {
+        *b = bytes.get(k).copied().unwrap_or(0);
+    }
+    // the swap unit
+    let unit = match endian {
+        0 => 1,
+        1 => 2,
+        2 => 4,
+        // the default: none for 8-bit (and 4-bit) components, 16 for 16-bit ones, 32 for the rest (the packed formats too)
+        _ => match sizes[0] {
+            0..=8 => 1,
+            16 => 2,
+            _ => 4,
+        },
+    };
+    if unit > 1 && len >= unit {
+        for chunk in buf[..len - len % unit].chunks_mut(unit) {
+            chunk.reverse();
+        }
+    }
+    let mut bit = 0usize;
+    let read = |bit: usize, n: u32| -> u32 {
+        // little-endian bit stream
+        let mut v = 0u64;
+        for k in 0..n.div_ceil(8) as usize + 1 {
+            v |= u64::from(*buf.get(bit / 8 + k).unwrap_or(&0)) << (8 * k);
+        }
+        ((v >> (bit % 8)) & ((1u64 << n) - 1)) as u32
+    };
+    for (k, &n) in sizes.iter().enumerate() {
+        let raw = read(bit, n);
+        bit += n as usize;
+        out[k] = if float {
+            match n {
+                32 => raw,
+                16 => half_to_f32(raw as u16).to_bits(),
+                11 => small_float(raw, 6).to_bits(),
+                _ => small_float(raw, 5).to_bits(),
+            }
+        } else {
+            let value = if signed && n < 32 && raw >> (n - 1) & 1 == 1 {
+                (raw | !((1u32 << n) - 1)) as i32
+            } else {
+                raw as i32
+            };
+            match num {
+                NumFormat::Int => value as u32,
+                NumFormat::Scaled if signed => (value as f32).to_bits(),
+                NumFormat::Scaled => (raw as f32).to_bits(),
+                NumFormat::Norm if signed => {
+                    let max = ((1u64 << (n - 1)) - 1).max(1) as f64;
+                    ((f64::from(value) / max).max(-1.0) as f32).to_bits()
+                }
+                NumFormat::Norm => {
+                    let v = (f64::from(raw) / ((1u64 << n) - 1) as f64) as f32;
+                    if format & 0x400 != 0 && n == 8 && k < 3 {
+                        srgb_to_linear(v)
+                    } else {
+                        v
+                    }
+                    .to_bits()
+                }
+            }
         };
     }
     out
+}
+
+/// An unsigned float of the packed 11-11-10 format: 5 exponent bits and `mantissa` bits.
+fn small_float(bits: u32, mantissa: u32) -> f32 {
+    let (e, m) = ((bits >> mantissa) & 0x1f, bits & ((1 << mantissa) - 1));
+    let scale = (1u32 << mantissa) as f32;
+    if e == 0 {
+        m as f32 / scale * 2f32.powi(-14)
+    } else if e == 31 {
+        if m == 0 { f32::INFINITY } else { f32::NAN }
+    } else {
+        (1.0 + m as f32 / scale) * 2f32.powi(e as i32 - 15)
+    }
+}
+
+fn srgb_to_linear(c: f32) -> f32 {
+    if c <= 0.04045 { c / 12.92 } else { ((c + 0.055) / 1.055).powf(2.4) }
 }
 
 fn half_to_f32(h: u16) -> f32 {
@@ -437,15 +611,7 @@ fn half_to_f32(h: u16) -> f32 {
 
 /// How many bytes one element of an attribute format takes.
 fn attribute_size(format: u32) -> u32 {
-    match format & 0xff {
-        0x00 | 0x01 => 1,
-        0x02..=0x04 => 2,
-        0x05..=0x0b => 4,
-        0x0c..=0x0f => 8,
-        0x10 | 0x11 => 12,
-        0x12 | 0x13 => 16,
-        _ => 4,
-    }
+    attribute_layout(format).map_or(4, |(sizes, _)| sizes.iter().sum::<u32>().div_ceil(8))
 }
 
 fn blend_factor(f: u32) -> wgpu::BlendFactor {
@@ -480,6 +646,116 @@ fn blend_op(op: u32) -> wgpu::BlendOperation {
     }
 }
 
+fn stencil_op(f: u32) -> wgpu::StencilOperation {
+    use wgpu::StencilOperation as S;
+    match f {
+        1 => S::Zero,
+        2 => S::Replace,
+        3 => S::IncrementClamp,
+        4 => S::DecrementClamp,
+        5 => S::Invert,
+        6 => S::IncrementWrap,
+        7 => S::DecrementWrap,
+        _ => S::Keep,
+    }
+}
+
+/// One face's stencil settings: (comparison, fail, depth fail, pass).
+fn stencil_face(f: [u32; 4]) -> wgpu::StencilFaceState {
+    wgpu::StencilFaceState {
+        compare: compare(f[0]),
+        fail_op: stencil_op(f[1]),
+        depth_fail_op: stencil_op(f[2]),
+        pass_op: stencil_op(f[3]),
+    }
+}
+
+/// How much of a uniform block the shader can read: `GX2Set*UniformBlock` gives the hardware the size in 256-byte units, rounded up
+/// (`SQ_ALU_CONST_BUFFER_SIZE`, 9 bits), so a block given as 0x80 bytes still reads 16 vec4s.
+pub(crate) fn readable_bytes(size: u32) -> u32 {
+    (size.div_ceil(256) & 0x1ff) * 256
+}
+
+/// The program that writes a colour texture's first component as depth: one triangle over the target.
+pub(crate) const DEPTH_COPY_WGSL: &str = "
+@group(0) @binding(0) var src: texture_2d<f32>;
+@vertex fn vs(@builtin(vertex_index) i: u32) -> @builtin(position) vec4<f32> {
+    let p = vec2<f32>(f32((i << 1u) & 2u), f32(i & 2u));
+    return vec4<f32>(p * 2.0 - 1.0, 0.0, 1.0);
+}
+struct DepthOut { @builtin(frag_depth) z: f32 }
+@fragment fn fs(@builtin(position) at: vec4<f32>) -> DepthOut {
+    var o: DepthOut;
+    o.z = clamp(textureLoad(src, vec2<i32>(at.xy), 0).x, 0.0, 1.0);
+    return o;
+}
+";
+
+fn depth_copy_pipeline(device: &wgpu::Device) -> (wgpu::RenderPipeline, wgpu::BindGroupLayout) {
+    let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("depth copy"),
+        source: wgpu::ShaderSource::Wgsl(DEPTH_COPY_WGSL.into()),
+    });
+    let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("depth copy"),
+        entries: &[wgpu::BindGroupLayoutEntry {
+            binding: 0,
+            visibility: wgpu::ShaderStages::FRAGMENT,
+            ty: wgpu::BindingType::Texture {
+                sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                view_dimension: wgpu::TextureViewDimension::D2,
+                multisampled: false,
+            },
+            count: None,
+        }],
+    });
+    let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("depth copy"),
+        bind_group_layouts: &[Some(&layout)],
+        immediate_size: 0,
+    });
+    let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("depth copy"),
+        layout: Some(&pipeline_layout),
+        vertex: wgpu::VertexState {
+            module: &module,
+            entry_point: Some("vs"),
+            compilation_options: Default::default(),
+            buffers: &[],
+        },
+        primitive: wgpu::PrimitiveState::default(),
+        depth_stencil: Some(wgpu::DepthStencilState {
+            format: wgpu::TextureFormat::Depth32Float,
+            depth_write_enabled: Some(true),
+            depth_compare: Some(wgpu::CompareFunction::Always),
+            stencil: Default::default(),
+            bias: Default::default(),
+        }),
+        multisample: Default::default(),
+        fragment: Some(wgpu::FragmentState {
+            module: &module,
+            entry_point: Some("fs"),
+            compilation_options: Default::default(),
+            targets: &[],
+        }),
+        multiview_mask: None,
+        cache: None,
+    });
+    (pipeline, layout)
+}
+
+/// Whether the colour hardware blends into a buffer of this format: not one of 32-bit float components (the shadow pass draws its
+/// r32f map with the blending of the draws before it still on, and the value it writes, z/w, is also its alpha), so it writes over.
+fn blends(format: wgpu::TextureFormat) -> bool {
+    use wgpu::TextureFormat as F;
+    !matches!(format, F::R32Float | F::Rg32Float | F::Rgba32Float)
+}
+
+/// The comparison of a shadow lookup's sampler: the sampler's own (`GX2CompareFunction`), or less or equal when it has none (15).
+fn compare_sampler_function(f: u32) -> wgpu::CompareFunction {
+    if f > 7 { wgpu::CompareFunction::LessEqual } else { compare(f) }
+}
+
 fn compare(f: u32) -> wgpu::CompareFunction {
     use wgpu::CompareFunction as C;
     match f {
@@ -502,7 +778,8 @@ fn depth_format(gx2: u32) -> wgpu::TextureFormat {
 }
 
 fn tex_kind(dim: u32, format: u32) -> TexKind {
-    if matches!(format & 0x3f, 0x11 | 0x13 | 0x14) || format & 0x3f == 0x16 {
+    // the depth formats (0x16 is the 10-11-11 float colour format, not a depth one)
+    if matches!(format & 0x3f, 0x11..=0x14 | 0x1c) {
         return TexKind::Depth2d;
     }
     match dim {
@@ -519,6 +796,19 @@ impl Gx2 {
             label: Some(label),
             source: wgpu::ShaderSource::Wgsl(wgsl.into()),
         })
+    }
+
+    /// Keeps a shader's listing and WGSL (or why it was not translated) for the frame that is written out.
+    pub(crate) fn keep_shader_text(&mut self, name: String, code: &[u8], result: Result<&str, &str>) {
+        if !self.diag.keeps_shaders() {
+            return;
+        }
+        let listing = decode(code).map_or_else(|e| format!("not decoded: {e}"), |d| mh3u_latte::decode::listing(&d));
+        let tail = match result {
+            Ok(wgsl) => format!("--- WGSL ---\n{wgsl}"),
+            Err(e) => format!("--- NOT TRANSLATED ---\n{e}\n"),
+        };
+        self.diag.shader_texts.insert(name, format!("--- listing ---\n{listing}\n{tail}"));
     }
 
     pub(crate) fn caches_report(&mut self, text: String) {
@@ -541,7 +831,8 @@ impl Gx2 {
         if let Some((c, _)) = found {
             return c;
         }
-        let ranges = [(program, size), (0, 0), (0, 0)];
+        // the shader's semantic table (which register each attribute goes to) is checked with its program
+        let ranges = [(program, size), (vs + 0x40, 0x84), (0, 0)];
         let compiled = self.vertex_shader_slow(g, vs, program, size, fetch, half_z);
         let hash = hash_ranges(g, &ranges);
         self.caches
@@ -562,25 +853,21 @@ impl Gx2 {
     ) -> Option<Arc<Compiled>> {
         let mut code = vec![0u8; size as usize];
         g.read(program, &mut code);
-        let key = (vs, program, hash_fast(&code, 0) ^ hash_of(&(fetch, half_z)));
+        let key = (
+            vs,
+            program,
+            hash_fast(&code, 0) ^ hash_of(&(fetch, half_z, vertex_semantics(g, vs))),
+        );
         if let Some(c) = self.caches.vertex.get(&key) {
             return c.clone();
         }
         let result = (|| {
             let decoded = decode(&code).map_err(|e| e.to_string())?;
-            let attributes = fetch
-                .iter()
-                .enumerate()
-                .map(|(i, a)| VertexAttribute {
-                    gpr: a.location + 1,
-                    stream: i as u32,
-                    per_instance: a.per_instance,
-                    divisor: a.divisor,
-                })
-                .collect();
-            let ctx = Context {
-                texture_kind: &|_| TexKind::D2,
-            };
+            let attributes = vertex_attributes(&vertex_semantics(g, vs), fetch);
+            let constants = loop_constants(g, g.u32(vs + 0xf4), g.u32(vs + 0xf8));
+            let loop_const = move |n: u32| constants.get(n as usize).copied().flatten();
+            let mut ctx = Context::new(&|_| TexKind::D2);
+            ctx.loop_const = &loop_const;
             translate_vertex(
                 &decoded,
                 &VertexInputs {
@@ -591,6 +878,11 @@ impl Gx2 {
                 &ctx,
             )
         })();
+        self.keep_shader_text(
+            format!("vs-{vs:08x}"),
+            &code,
+            result.as_ref().map(|t| t.wgsl.as_str()).map_err(String::as_str),
+        );
         let compiled = match result {
             Ok(t) => {
                 let module = self.compile("vertex shader", &t.wgsl);
@@ -600,6 +892,7 @@ impl Gx2 {
                 }))
             }
             Err(e) => {
+                self.diag.untranslated(format!("vertex shader {vs:#x}"), &e);
                 self.report(format!("vertex shader {vs:#x} not translated: {e}"));
                 None
             }
@@ -608,7 +901,7 @@ impl Gx2 {
         compiled
     }
 
-    fn pixel_shader(&mut self, g: &Guest, ps: u32, semantics_at: u32, kinds: &[TexKind; 18]) -> Option<Arc<Compiled>> {
+    fn pixel_shader(&mut self, g: &Guest, ps: u32, semantics_at: u32, variant: &PixelVariant) -> Option<Arc<Compiled>> {
         // what the translation depends on besides the program: the words the inputs are made from, and the texture kinds
         let count = g.u32(ps + 0x10).min(32);
         let mut words = [0u32; 1 + 32 + 10];
@@ -622,7 +915,7 @@ impl Gx2 {
         let words_bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
         let (size, program) = (g.u32(ps + 0xa4), g.u32(ps + 0xa8));
         let size = size.min(1 << 20);
-        let front = (ps, program, size, hash_fast(&words_bytes, 0x9), kinds.map(|k| k as u8));
+        let front = (ps, program, size, hash_fast(&words_bytes, 0x9), *variant);
         let swaps = self.swaps;
         let (found, how) = self.caches.pixel_front.get(&front, swaps, |r| hash_ranges(g, r));
         count_lookup(&how, "pixel shader hits", "pixel shader checks", "pixel shader misses");
@@ -630,14 +923,14 @@ impl Gx2 {
             return c;
         }
         let ranges = [(program, size), (0, 0), (0, 0)];
-        let compiled = self.pixel_shader_slow(g, ps, semantics_at, kinds);
+        let compiled = self.pixel_shader_slow(g, ps, semantics_at, variant);
         let hash = hash_ranges(g, &ranges);
         self.caches.pixel_front.insert(front, ranges, hash, swaps, compiled.clone());
         compiled
     }
 
     /// The pixel shader from its program bytes and inputs: translated once for each.
-    fn pixel_shader_slow(&mut self, g: &Guest, ps: u32, semantics_at: u32, kinds: &[TexKind; 18]) -> Option<Arc<Compiled>> {
+    fn pixel_shader_slow(&mut self, g: &Guest, ps: u32, semantics_at: u32, variant: &PixelVariant) -> Option<Arc<Compiled>> {
         // the inputs: pixel input i takes the vertex shader's output with the same semantic
         let count = g.u32(ps + 0x10).min(32);
         let vs_semantics: Vec<u32> = (0..40u32)
@@ -660,19 +953,30 @@ impl Gx2 {
         g.read(program, &mut code);
         let key = (
             ps,
-            hash_fast(&code, 0) ^ hash_of(&(inputs.count, &inputs.flat, &inputs.locations, kinds.map(|k| k as u8))),
+            hash_fast(&code, 0) ^ hash_of(&(inputs.count, &inputs.flat, &inputs.locations, variant)),
         );
         if let Some(c) = self.caches.pixel.get(&key) {
             return c.clone();
         }
-        let kinds = *kinds;
+        let PixelVariant { kinds, selects, alpha } = *variant;
+        let constants = loop_constants(g, g.u32(ps + 0xc8), g.u32(ps + 0xcc));
         let result = (|| {
             let decoded = decode(&code).map_err(|e| e.to_string())?;
-            let ctx = Context {
-                texture_kind: &move |r| kinds.get(r as usize).copied().unwrap_or(TexKind::D2),
-            };
+            let kind = move |r: u32| kinds.get(r as usize).copied().unwrap_or(TexKind::D2);
+            let select = move |r: u32| selects.get(r as usize).copied().unwrap_or(IDENTITY_SELECT);
+            let loop_const = move |n: u32| constants.get(n as usize).copied().flatten();
+            let mut ctx = Context::new(&kind);
+            ctx.texture_select = &select;
+            ctx.loop_const = &loop_const;
+            ctx.alpha_test = (alpha.0 != 7).then_some((alpha.0, f32::from_bits(alpha.1)));
+            ctx.debug = debug_ps(ps);
             translate_pixel(&decoded, &inputs, &ctx)
         })();
+        self.keep_shader_text(
+            format!("ps-{ps:08x}"),
+            &code,
+            result.as_ref().map(|t| t.wgsl.as_str()).map_err(String::as_str),
+        );
         let compiled = match result {
             Ok(mut t) => {
                 if std::env::var_os("MH3U_GFX_SOLID").is_some() {
@@ -688,6 +992,7 @@ impl Gx2 {
                 }))
             }
             Err(e) => {
+                self.diag.untranslated(format!("pixel shader {ps:#x}"), &e);
                 self.report(format!("pixel shader {ps:#x} not translated: {e}"));
                 None
             }
@@ -736,12 +1041,22 @@ impl Gx2 {
         if let Some(view) = slot {
             return Some(view.clone());
         }
+        let volume = cached.texture.dimension() == wgpu::TextureDimension::D3;
+        if volume != (kind == TexKind::D3) {
+            // a volume read as a flat texture or the other way round: the shader gets the stand-in
+            return None;
+        }
         let view = cached.texture.create_view(&wgpu::TextureViewDescriptor {
             dimension: Some(match kind {
+                TexKind::D3 => wgpu::TextureViewDimension::D3,
                 TexKind::Cube if cached.layers > 1 => wgpu::TextureViewDimension::D2Array,
                 _ => wgpu::TextureViewDimension::D2,
             }),
-            array_layer_count: Some(if kind == TexKind::Cube { 6.min(cached.layers) } else { 1 }),
+            array_layer_count: Some(match kind {
+                TexKind::D3 => 1,
+                TexKind::Cube => 6.min(cached.layers),
+                _ => 1,
+            }),
             ..Default::default()
         });
         *slot = Some(view.clone());
@@ -771,6 +1086,7 @@ impl Gx2 {
             lap.mark("texture decode (in texture views)");
             match decoded {
                 Ok(d) => {
+                    self.diag.decoded(&h, d.laid_pitch, d.format.block_dimensions().0);
                     if let Some(dir) = texdump {
                         let name = format!(
                             "tex-{:08x}-{}x{}-f{:x}-m{}.decoded",
@@ -787,7 +1103,11 @@ impl Gx2 {
                         },
                         mip_level_count: d.levels.len() as u32,
                         sample_count: 1,
-                        dimension: wgpu::TextureDimension::D2,
+                        dimension: if d.volume {
+                            wgpu::TextureDimension::D3
+                        } else {
+                            wgpu::TextureDimension::D2
+                        },
                         format: d.format,
                         usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
                         view_formats: &[],
@@ -808,7 +1128,7 @@ impl Gx2 {
                             wgpu::Extent3d {
                                 width: l.width,
                                 height: l.height,
-                                depth_or_array_layers: d.layers,
+                                depth_or_array_layers: l.depth,
                             },
                         );
                     }
@@ -831,6 +1151,7 @@ impl Gx2 {
                     Some(())
                 }
                 Err(e) => {
+                    self.diag.decode_failed(&h, &e);
                     self.report(format!(
                         "texture {t:#x} (format {:#x}, {}x{}, tile mode {}) not read: {e}",
                         h.format, h.width, h.height, h.tile_mode
@@ -859,6 +1180,94 @@ impl Gx2 {
             }
         }
         Lap::count("textures invalidated", marked);
+    }
+
+    /// The depth texture a colour buffer is copied into to be read with a comparison (made once, at the colour buffer's size).
+    fn depth_copy_view(&mut self, image: u32) -> wgpu::TextureView {
+        if let Some((_, view, _)) = self.caches.depth_copies.get(&image) {
+            return view.clone();
+        }
+        let (width, height) = {
+            let t = &self.targets[&image].texture;
+            (t.width(), t.height())
+        };
+        let texture = self.d.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("depth copy of a colour buffer"),
+            size: wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Depth32Float,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[],
+        });
+        let view = texture.create_view(&Default::default());
+        // u64::MAX: never copied yet
+        self.caches.depth_copies.insert(image, (texture, view.clone(), u64::MAX));
+        view
+    }
+
+    /// Copies the colour buffer's first component into its depth copy (clamped to 0..1), unless it has not changed since the last
+    /// copy. Recorded in the batch's encoder, outside any pass, before the draw that reads it.
+    fn refresh_depth_copy(&mut self, image: u32) {
+        let version = self.caches.target_version.get(&image).copied().unwrap_or(0);
+        let Some((texture, _, made)) = self.caches.depth_copies.get(&image) else {
+            return;
+        };
+        if *made == version {
+            return;
+        }
+        let depth_view = texture.create_view(&Default::default());
+        let Some(source) = self.targets.get(&image).map(|t| t.view.clone()) else {
+            return;
+        };
+        let device = self.d.device.clone();
+        let (pipeline, layout) = self
+            .caches
+            .depth_copy_pipeline
+            .get_or_insert_with(|| depth_copy_pipeline(&device))
+            .clone();
+        let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("depth copy"),
+            layout: &layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::TextureView(&source),
+            }],
+        });
+        self.end_pass();
+        let enc = self
+            .batch
+            .enc
+            .get_or_insert_with(|| device.create_command_encoder(&Default::default()));
+        {
+            let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("depth copy"),
+                color_attachments: &[],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: &depth_view,
+                    depth_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(1.0),
+                        store: wgpu::StoreOp::Store,
+                    }),
+                    stencil_ops: None,
+                }),
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            pass.set_pipeline(&pipeline);
+            pass.set_bind_group(0, &group, &[]);
+            pass.draw(0..3, 0..1);
+        }
+        if let Some(entry) = self.caches.depth_copies.get_mut(&image) {
+            entry.2 = version;
+        }
+        crate::draw::Lap::count("colour buffers copied for a comparison", 1);
     }
 
     fn fallback_texture(&mut self, kind: TexKind) -> wgpu::TextureView {
@@ -1319,7 +1728,7 @@ impl Gx2 {
     pub(crate) fn uniform_buffer(&mut self, g: &Guest, block: &crate::state::UniformBlock, vec4s: u32) -> BufRef {
         let size = u64::from(vec4s.max(1)) * 16;
         let have = if block.address != 0 {
-            (block.size as usize).min(size as usize)
+            (readable_bytes(block.size) as usize).min(size as usize)
         } else {
             0
         };
@@ -1468,17 +1877,35 @@ impl Gx2 {
             return;
         };
         *self.caches.drawn_into.entry(image).or_default() += 1;
+        *self.caches.target_version.entry(image).or_default() += 1;
         let (target_w, target_h, target_format) = {
             let t = &self.targets[&image];
             (t.texture.width(), t.texture.height(), t.format)
         };
-        // the textures the pixel shader will look at, to know their kinds
-        let mut kinds = [TexKind::D2; 18];
-        for (unit, kind) in kinds.iter_mut().enumerate() {
+        // the textures the pixel shader will look at, to know their kinds and component selectors, and the alpha test
+        let mut variant = PixelVariant {
+            kinds: [TexKind::D2; 18],
+            selects: [IDENTITY_SELECT; 18],
+            alpha: (7, 0),
+        };
+        for unit in 0..18 {
             let t = st.pixel_textures[unit];
             if t != 0 {
-                *kind = tex_kind(g.u32(t), g.u32(t + 0x14));
+                variant.kinds[unit] = tex_kind(g.u32(t), g.u32(t + 0x14));
+                variant.selects[unit] = g.u32(t + 0x84) & 0x0707_0707;
+                if self.diag.report {
+                    self.diag.texture(g, t);
+                }
             }
+        }
+        if self.diag.report {
+            for a in fetch.iter() {
+                self.diag.attribute(a.format, a.endian);
+            }
+        }
+        let (alpha_on, alpha_func, alpha_ref) = st.alpha_test;
+        if alpha_on && alpha_func & 7 != 7 {
+            variant.alpha = (alpha_func & 7, alpha_ref.to_bits());
         }
         lap.mark("target and kinds");
         let geometry = st.geometry_shader != 0 && st.shader_mode == 2;
@@ -1489,6 +1916,7 @@ impl Gx2 {
             match geo {
                 Some(x) => Some(x),
                 None => {
+                    self.diag.skipped_for(format!("geometry pipeline {:#x}", st.geometry_shader));
                     *self.caches.skipped.entry("geometry pipeline not drawn").or_default() += 1;
                     return;
                 }
@@ -1500,6 +1928,7 @@ impl Gx2 {
             Some(x) => x.copy.clone(),
             None => {
                 let Some(vs) = self.vertex_shader(g, st.vertex_shader, &fetch, st.half_z) else {
+                    self.diag.skipped_for(format!("vertex shader {:#x}", st.vertex_shader));
                     *self.caches.skipped.entry("vertex shader not translated").or_default() += 1;
                     return;
                 };
@@ -1507,7 +1936,8 @@ impl Gx2 {
             }
         };
         let semantics_at = geo.as_ref().map_or(st.vertex_shader + 0x10, |x| x.semantics_at);
-        let Some(ps) = self.pixel_shader(g, st.pixel_shader, semantics_at, &kinds) else {
+        let Some(ps) = self.pixel_shader(g, st.pixel_shader, semantics_at, &variant) else {
+            self.diag.skipped_for(format!("pixel shader {:#x}", st.pixel_shader));
             *self.caches.skipped.entry("pixel shader not translated").or_default() += 1;
             return;
         };
@@ -1551,7 +1981,36 @@ impl Gx2 {
         } else {
             None
         };
-        let use_depth = depth.filter(|_| st.depth_test || st.depth_write);
+        // culling both faces leaves no triangle (lines and points are not culled)
+        if st.cull_front
+            && st.cull_back
+            && matches!(
+                topology,
+                wgpu::PrimitiveTopology::TriangleList | wgpu::PrimitiveTopology::TriangleStrip
+            )
+        {
+            *self.caches.skipped.entry("both faces culled").or_default() += 1;
+            return;
+        }
+        let has_stencil = |d: &(u32, wgpu::TextureFormat)| d.1 == wgpu::TextureFormat::Depth24PlusStencil8;
+        let use_depth = depth.filter(|d| st.depth_test || st.depth_write || st.stencil_test && has_stencil(d));
+        let masks = st.stencil.masks.unwrap_or([0xff, 0xff, 0, 0xff, 0xff, 0]);
+        let stencil = use_depth.filter(|d| st.stencil_test && has_stencil(d)).map(|_| {
+            let back = if st.stencil.back_enabled {
+                st.stencil.back
+            } else {
+                st.stencil.front
+            };
+            (st.stencil.front, back, masks[0], masks[1])
+        });
+        // one depth bias for both faces: the front's when front faces are offset, else the back's
+        let [front_offset, front_scale, back_offset, back_scale, bias_clamp] = st.polygon_offset;
+        let bias = match (st.offset_front, st.offset_back) {
+            (true, _) => (front_offset.round() as i32, front_scale.to_bits(), bias_clamp.to_bits()),
+            (false, true) => (back_offset.round() as i32, back_scale.to_bits(), bias_clamp.to_bits()),
+            _ => (0, 0, 0),
+        };
+        let bias = if use_depth.is_some() && depth_bias_on() { bias } else { (0, 0, 0) };
         let strip = matches!(
             topology,
             wgpu::PrimitiveTopology::TriangleStrip | wgpu::PrimitiveTopology::LineStrip
@@ -1570,11 +2029,13 @@ impl Gx2 {
             depth_func: st.depth_func,
             cull: st.cull_front as u8 * 2 + st.cull_back as u8,
             front_face: st.front_face,
+            stencil,
+            bias,
         };
         let entry = match self.caches.pipelines.get(&key) {
             Some(e) => e.clone(),
             None => {
-                let blend_on = st.colour_control[1] & 1 != 0;
+                let blend_on = st.colour_control[1] & 1 != 0 && blends(target_format);
                 let b = &st.blend[0];
                 let blend = blend_on.then(|| wgpu::BlendState {
                     color: wgpu::BlendComponent {
@@ -1648,8 +2109,17 @@ impl Gx2 {
                         } else {
                             wgpu::CompareFunction::Always
                         }),
-                        stencil: Default::default(),
-                        bias: Default::default(),
+                        stencil: stencil.map_or_else(Default::default, |(front, back, read, write)| wgpu::StencilState {
+                            front: stencil_face(front),
+                            back: stencil_face(back),
+                            read_mask: read,
+                            write_mask: write,
+                        }),
+                        bias: wgpu::DepthBiasState {
+                            constant: bias.0,
+                            slope_scale: f32::from_bits(bias.1),
+                            clamp: f32::from_bits(bias.2),
+                        },
                     }),
                     multisample: wgpu::MultisampleState::default(),
                     multiview_mask: None,
@@ -1684,6 +2154,7 @@ impl Gx2 {
         // textures: white stand-ins until the real ones are decoded
         let draw_image = image;
         let mut snapshots: Vec<(wgpu::Texture, wgpu::Texture)> = Vec::new();
+        let mut depth_reads: Vec<u32> = Vec::new();
         let views: Vec<(u32, wgpu::TextureView)> = ps
             .interface
             .textures
@@ -1723,9 +2194,13 @@ impl Gx2 {
                 {
                     return (r, depth.sample_view.clone());
                 }
+                // a colour buffer read with a comparison (the village's shadow map is drawn as r32f colour): a depth copy of it
+                if k == TexKind::Depth2d && image != draw_image && self.targets.contains_key(&image) {
+                    depth_reads.push(image);
+                    return (r, self.depth_copy_view(image));
+                }
                 if t != 0
                     && k != TexKind::Depth2d
-                    && k != TexKind::D3
                     && let Some(view) = self.texture_view(g, t, k)
                 {
                     return (r, view);
@@ -1784,22 +2259,28 @@ impl Gx2 {
         for &unit in &ps.interface.samplers {
             tex_entries.push((16 + unit, Bound::Sampler(sampler_for(self, unit))));
         }
-        if !ps.interface.compare_samplers.is_empty() {
-            let compare_sampler = self
+        for &unit in &ps.interface.compare_samplers {
+            // the comparison the game gave the sampler (`GX2InitSamplerDepthCompare`), less or equal when it gave none
+            let at = st.pixel_samplers.get(unit as usize).copied().unwrap_or(0);
+            let func = if at == 0 {
+                15
+            } else {
+                crate::texture::Sampler::read(g, at).compare.unwrap_or(15)
+            };
+            let sampler = self
                 .caches
-                .compare_sampler
-                .get_or_insert_with(|| {
+                .compare_samplers
+                .entry(func)
+                .or_insert_with(|| {
                     device.create_sampler(&wgpu::SamplerDescriptor {
-                        compare: Some(wgpu::CompareFunction::LessEqual),
+                        compare: Some(compare_sampler_function(func)),
                         mag_filter: wgpu::FilterMode::Linear,
                         min_filter: wgpu::FilterMode::Linear,
                         ..Default::default()
                     })
                 })
                 .clone();
-            for s in &ps.interface.compare_samplers {
-                tex_entries.push((32 + s, Bound::Sampler(compare_sampler.clone())));
-            }
+            tex_entries.push((32 + unit, Bound::Sampler(sampler)));
         }
         lap.mark("samplers");
         // a snapshot is made for this draw only: its bind group is not kept
@@ -1831,6 +2312,9 @@ impl Gx2 {
                     },
                 );
             }
+        }
+        for image in depth_reads {
+            self.refresh_depth_copy(image);
         }
         if self.batch.key != Some(key) {
             self.end_pass();
@@ -1880,7 +2364,13 @@ impl Gx2 {
             self.batch.key = Some(key);
         }
         let Some(pass) = self.batch.pass.as_mut() else { return };
-        let [vx, vy, vw, vh, ..] = st.viewport;
+        let [vx, vy, vw, vh, near, far] = st.viewport;
+        // the depth range, when the target API can have it (0 to 1, near not past far)
+        let (near, far) = if (0.0..=1.0).contains(&near) && (0.0..=1.0).contains(&far) && near <= far && far > 0.0 {
+            (near, far)
+        } else {
+            (0.0, 1.0)
+        };
         if vw > 0.0 && vh > 0.0 {
             let x = vx.clamp(0.0, target_w as f32);
             let y = vy.clamp(0.0, target_h as f32);
@@ -1889,11 +2379,11 @@ impl Gx2 {
                 y,
                 vw.min(target_w as f32 - x).max(1.0),
                 vh.min(target_h as f32 - y).max(1.0),
-                0.0,
-                1.0,
+                near,
+                far,
             );
         } else {
-            pass.set_viewport(0.0, 0.0, target_w as f32, target_h as f32, 0.0, 1.0);
+            pass.set_viewport(0.0, 0.0, target_w as f32, target_h as f32, near, far);
         }
         let [sx, sy, sw, sh] = st.scissor;
         if sw > 0 && sh > 0 && sx < target_w && sy < target_h {
@@ -1902,6 +2392,9 @@ impl Gx2 {
             pass.set_scissor_rect(0, 0, target_w, target_h);
         }
         pass.set_pipeline(&entry.pipeline);
+        if stencil.is_some() {
+            pass.set_stencil_reference(masks[2]);
+        }
         pass.set_bind_group(0, &group0, &[]);
         pass.set_bind_group(1, &group1, &[]);
         pass.set_bind_group(2, &group2, &[]);
@@ -2333,6 +2826,74 @@ type PassKey = (u32, Option<u32>, usize);
 mod tests {
     use super::*;
 
+    fn floats(v: [u32; 4]) -> [f32; 4] {
+        v.map(f32::from_bits)
+    }
+
+    #[test]
+    fn float_attributes_read_the_big_endian_values_with_the_default_swap() {
+        let mut b = Vec::new();
+        for f in [1.0f32, 2.0, -3.0] {
+            b.extend_from_slice(&f.to_be_bytes());
+        }
+        assert_eq!(floats(decode_attribute(0x811, 3, &b)), [1.0, 2.0, -3.0, 1.0]);
+        // swap 8 in 32 says the same; no swap reads the bytes as they are
+        assert_eq!(floats(decode_attribute(0x811, 2, &b)), [1.0, 2.0, -3.0, 1.0]);
+        let le: Vec<u8> = [1.0f32, 2.0].iter().flat_map(|f| f.to_le_bytes()).collect();
+        assert_eq!(floats(decode_attribute(0x80d, 0, &le)), [1.0, 2.0, 0.0, 1.0]);
+        // half floats: 1.0 and -2.0
+        assert_eq!(floats(decode_attribute(0x808, 3, &[0x3c, 0x00, 0xc0, 0x00])), [1.0, -2.0, 0.0, 1.0]);
+    }
+
+    #[test]
+    fn scaled_attributes_become_floats_of_their_integers() {
+        // sint 16 to float: -2, 300, 7, -32768
+        let b: Vec<u8> = [-2i16, 300, 7, -32768].iter().flat_map(|v| v.to_be_bytes()).collect();
+        assert_eq!(floats(decode_attribute(0xa0e, 3, &b)), [-2.0, 300.0, 7.0, -32768.0]);
+        // uint 8 to float
+        assert_eq!(floats(decode_attribute(0x80a, 3, &[1, 2, 3, 255])), [1.0, 2.0, 3.0, 255.0]);
+        // uint 16 to float (the scaled flag on a 16-bit type is not a half float)
+        assert_eq!(floats(decode_attribute(0x802, 3, &[0x01, 0x00])), [256.0, 0.0, 0.0, 1.0]);
+    }
+
+    #[test]
+    fn normalised_and_integer_attributes() {
+        assert_eq!(floats(decode_attribute(0x00a, 3, &[255, 0, 51, 255])), [1.0, 0.0, 0.2, 1.0]);
+        assert_eq!(floats(decode_attribute(0x207, 3, &[0x80, 0x00, 0x7f, 0xff])), [-1.0, 1.0, 0.0, 1.0]);
+        assert_eq!(
+            floats(decode_attribute(0x20a, 3, &[0x81, 0x7f, 0, 0xff])),
+            [-1.0, 1.0, 0.0, -1.0 / 127.0]
+        );
+        // integers stay integers, and the missing fourth component is the integer one
+        assert_eq!(decode_attribute(0x104, 3, &[7, 200]), [7, 200, 0, 1]);
+        assert_eq!(decode_attribute(0x304, 3, &[0xff, 2]), [u32::MAX, 2, 0, 1]);
+        assert_eq!(decode_attribute(0x107, 3, &[0x12, 0x34, 0, 1]), [0x1234, 1, 0, 1]);
+    }
+
+    #[test]
+    fn packed_attributes_are_read_from_the_lowest_bits() {
+        // 10-10-10-2 signed normalised: x = 511, y = -511, z = 0, w = 1
+        let word: u32 = 511 | ((-511i32 as u32 & 0x3ff) << 10) | (1 << 30);
+        let v = floats(decode_attribute(0x20b, 3, &word.to_be_bytes()));
+        assert_eq!(v, [1.0, -1.0, 0.0, 1.0]);
+        let word: u32 = 1023 | (3 << 30);
+        assert_eq!(floats(decode_attribute(0x00b, 3, &word.to_be_bytes())), [1.0, 0.0, 0.0, 1.0]);
+        // 11-11-10 float: 1.0 in each (exponent 15)
+        let word: u32 = (15 << 6) | ((15 << 6) << 11) | ((15 << 5) << 22);
+        assert_eq!(floats(decode_attribute(0x809, 3, &word.to_be_bytes())), [1.0, 1.0, 1.0, 1.0]);
+    }
+
+    #[test]
+    fn attribute_sizes_and_names() {
+        assert_eq!(attribute_size(0x811), 12);
+        assert_eq!(attribute_size(0xa0e), 8);
+        assert_eq!(attribute_size(0x00b), 4);
+        assert_eq!(attribute_size(0x001), 1);
+        assert_eq!(attribute_format_name(0xa0e), "sint->float 16_16_16_16");
+        assert_eq!(attribute_format_name(0x813), "float 32_32_32_32");
+        assert_eq!(attribute_format_name(0x20a), "snorm 8_8_8_8");
+    }
+
     /// A texture header at 0x100 with its image at 0x1000 (0x100 bytes) and its smaller levels at 0x2000 (0x40 bytes), in a buffer
     /// that stands for guest memory.
     fn memory() -> Vec<u8> {
@@ -2353,19 +2914,43 @@ mod tests {
         texture_source_hash(&g, 0x100, &h)
     }
 
-    /// What a uniform upload held before the uploads were made cheaper: the whole block (`vec4s` of them) with the guest's bytes in front,
-    /// every word turned around.
+    /// What a uniform upload held before the uploads were made cheaper: the whole block (`vec4s` of them) with the guest's bytes in front
+    /// (as they are: the GPU reads little-endian words).
     fn uniform_as_before(g: &Guest, block: &crate::state::UniformBlock, vec4s: u32) -> Vec<u8> {
         let size = vec4s.max(1) as usize * 16;
         let mut bytes = vec![0u8; size];
         let have = (block.size as usize).min(size);
         if block.address != 0 && have > 0 {
             g.read(block.address, &mut bytes[..have]);
-            for w in bytes.as_chunks_mut::<4>().0 {
-                w.reverse();
-            }
         }
         bytes
+    }
+
+    #[test]
+    fn the_depth_bias_is_on_unless_turned_off() {
+        assert!(bias_setting(None));
+        assert!(bias_setting(Some("on")));
+        for off in ["off", " OFF ", "0", "no", "false"] {
+            assert!(!bias_setting(Some(off)), "{off}");
+        }
+    }
+
+    /// Uniform blocks go up as they are: the GPU reads little-endian words. The game's floats arrive turned around already (through the
+    /// DMA engine's 8-in-32 swap), and a colour it packs as bytes (red first, alpha last) is read with red in the low byte, which is
+    /// where its shaders take red from (`AND_INT 0xff`, then `>> 8`, `>> 16` for green and blue): the village's shadow colour
+    /// `4c 4c 4c ff` is grey, not the red `ff 4c 4c` the words turned around gave.
+    #[test]
+    fn uniform_blocks_go_up_as_the_little_endian_words_the_gpu_reads() {
+        let mut m = vec![0u8; 0x200];
+        let g = Guest::new(m.as_mut_ptr());
+        g.write(0x100, &0.5f32.to_le_bytes());
+        g.write(0x104, &[0x4c, 0x4c, 0x4c, 0xff]);
+        let mut out = Vec::new();
+        uniform_words(&g, 0x100, 8, &mut out);
+        assert_eq!(f32::from_le_bytes(out[0..4].try_into().unwrap()), 0.5);
+        let colour = u32::from_le_bytes(out[4..8].try_into().unwrap());
+        let (r, gr, b, a) = (colour & 0xff, (colour >> 8) & 0xff, (colour >> 16) & 0xff, colour >> 24);
+        assert_eq!((r, gr, b, a), (0x4c, 0x4c, 0x4c, 0xff));
     }
 
     #[test]
@@ -2395,6 +2980,176 @@ mod tests {
                 "block at {address:#x}, {size} bytes, {vec4s} vec4"
             );
         }
+    }
+
+    #[test]
+    fn a_shadow_map_drawn_as_colour_is_copied_into_depth_once_per_change() {
+        let mut gx2 = Gx2::new(crate::Display::noop());
+        // the copy's program and pipeline are valid (wgpu would panic on a validation error)
+        let _ = depth_copy_pipeline(&gx2.d.device);
+        let image = 0xf561_e800;
+        let texture = gx2.d.device.create_texture(&wgpu::TextureDescriptor {
+            label: None,
+            size: wgpu::Extent3d {
+                width: 16,
+                height: 16,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::R32Float,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[],
+        });
+        let view = texture.create_view(&Default::default());
+        gx2.targets.insert(
+            image,
+            crate::gx2::Target {
+                texture,
+                format: wgpu::TextureFormat::R32Float,
+                view,
+            },
+        );
+        let _ = gx2.depth_copy_view(image);
+        assert_eq!(gx2.caches.depth_copies[&image].2, u64::MAX);
+        gx2.refresh_depth_copy(image);
+        assert_eq!(gx2.caches.depth_copies[&image].2, 0);
+        assert_eq!(gx2.caches.depth_copies[&image].0.format(), wgpu::TextureFormat::Depth32Float);
+        // drawn into again: copied again
+        *gx2.caches.target_version.entry(image).or_default() += 1;
+        gx2.refresh_depth_copy(image);
+        assert_eq!(gx2.caches.depth_copies[&image].2, 1);
+        gx2.end_pass();
+    }
+
+    fn stream(location: u32, offset: u32, format: u32) -> AttribStream {
+        AttribStream {
+            location,
+            buffer: 0,
+            offset,
+            format,
+            per_instance: false,
+            divisor: 0,
+            select: [0, 1, 2, 3],
+            endian: 3,
+        }
+    }
+
+    /// Draw 234 of the run-6 village frame: the fetch shader has locations 0 to 5 (position, normal, UV, colour, ...), and
+    /// `vs-169eee80` reads the position in R1, the UVs in R2 (`DOT4 R4.x <- R2.x, KC0[8].x`) and the colour in R3 (`INT_TO_FLT R0.x
+    /// <- R3.x`): its semantic table is 0, 2, 3.
+    #[test]
+    fn attributes_go_to_the_registers_the_semantic_table_names() {
+        let fetch = [
+            stream(0, 0, 0x811),
+            stream(1, 12, 0x30a),
+            stream(2, 16, 0x80d),
+            stream(3, 24, 0x10a),
+            stream(4, 28, 0x30a),
+            stream(5, 32, 0x80d),
+        ];
+        let mut m = vec![0u8; 0x1000];
+        let g = Guest::new(m.as_mut_ptr());
+        let vs = 0x100;
+        g.put_u32(vs + 0x40, 3);
+        for (i, id) in [0u32, 2, 3].iter().enumerate() {
+            g.put_u32(vs + 0x44 + 4 * i as u32, *id);
+        }
+        let table = vertex_semantics(&g, vs);
+        assert_eq!(table, Some(vec![0, 2, 3]));
+        let got: Vec<(u32, u32)> = vertex_attributes(&table, &fetch).iter().map(|a| (a.stream, a.gpr)).collect();
+        // position R1, UV (stream 2) R2, colour (stream 3) R3; the normal and the rest are not loaded
+        assert_eq!(got, [(0, 1), (2, 2), (3, 3)]);
+        // no table: location + 1, as before
+        g.put_u32(vs + 0x40, 0);
+        let got: Vec<u32> = vertex_attributes(&vertex_semantics(&g, vs), &fetch).iter().map(|a| a.gpr).collect();
+        assert_eq!(got, [1, 2, 3, 4, 5, 6]);
+    }
+
+    /// The character's skinning shader (`vs-1697a580`, fetch shader `0x1d526d50`, run 7 draw 188) reads bone set 1 from R6
+    /// (`INT_TO_FLT R0.w <- R6.x`, uint8x4 location 5), sets 2 to 4 from R7, R8, R9 (uint8x4 locations 7, 8, 9) and morph deltas from
+    /// R10, R11 (sint16x4 locations 10, 11): location 6 (a signed 8-bit tangent) is not in R7. As `location + 1` R7 held the tangent,
+    /// read as bone indices (negative ones too), and vertices weighted to those bones were pulled toward the world origin.
+    #[test]
+    fn the_skinned_characters_bone_sets_skip_the_tangent() {
+        let order = [0u32, 1, 4, 5, 6, 7, 8, 9, 10, 11, 2, 3];
+        let fetch: Vec<AttribStream> = order.iter().map(|&l| stream(l, 0, 0x10a)).collect();
+        // the table the listing implies: R1..R11 <- 0, 1, 2, 3, 4, 5, 7, 8, 9, 10, 11
+        let table = Some(vec![0, 1, 2, 3, 4, 5, 7, 8, 9, 10, 11]);
+        let gpr_of = |location: u32| {
+            vertex_attributes(&table, &fetch)
+                .iter()
+                .find(|a| fetch[a.stream as usize].location == location)
+                .map(|a| a.gpr)
+        };
+        assert_eq!(gpr_of(5), Some(6));
+        assert_eq!(gpr_of(7), Some(7));
+        assert_eq!(gpr_of(9), Some(9));
+        assert_eq!(gpr_of(11), Some(11));
+        assert_eq!(gpr_of(6), None, "the tangent is not loaded");
+    }
+
+    #[test]
+    fn uniform_blocks_are_readable_to_the_next_256_bytes() {
+        assert_eq!(readable_bytes(0), 0);
+        assert_eq!(readable_bytes(0x80), 0x100);
+        assert_eq!(readable_bytes(0x100), 0x100);
+        assert_eq!(readable_bytes(0x101), 0x200);
+        assert_eq!(readable_bytes(0x1_0000), 0x1_0000);
+        // a block given as 8 vec4s: constant 10 is still uploaded
+        let mut gx2 = Gx2::new(crate::Display::noop());
+        let mut m = vec![0u8; 0x2_0000];
+        let g = Guest::new(m.as_mut_ptr());
+        g.write(0x1000 + 16 * 10, &0.5f32.to_le_bytes());
+        let block = crate::state::UniformBlock {
+            address: 0x1000,
+            size: 0x80,
+        };
+        let _ = gx2.uniform_buffer(&g, &block, 14);
+        // all 14 vec4s the shader declares were read from the guest, not the 8 the size says
+        assert!(gx2.caches.uniforms.contains_key(&(0x1000, 14, 14 * 16)));
+        let words = uniform_as_before(
+            &g,
+            &crate::state::UniformBlock {
+                address: 0x1000,
+                size: readable_bytes(0x80),
+            },
+            14,
+        );
+        assert_eq!(f32::from_le_bytes(words[160..164].try_into().unwrap()), 0.5);
+        gx2.end_pass();
+    }
+
+    /// The scenery's vertex colour: a `uint 8_8_8_8` attribute (format 0x10a) reaches the shader as integers, which its
+    /// `INT_TO_FLT` and `x 1/255` turn into the colour (not normalised first, which would make it about 1/255 of itself).
+    #[test]
+    fn an_integer_colour_attribute_becomes_its_colour_through_int_to_flt() {
+        let raw = decode_attribute(0x10a, 3, &[255, 128, 0, 51]);
+        assert_eq!(raw, [255, 128, 0, 51]);
+        let colour: Vec<f32> = raw.iter().map(|&v| (v as i32) as f32 * 0.003_921_569).collect();
+        assert!((colour[0] - 1.0).abs() < 1e-6 && (colour[1] - 0.502).abs() < 1e-3 && colour[2] == 0.0 && (colour[3] - 0.2).abs() < 1e-6);
+    }
+
+    #[test]
+    fn a_float_shadow_map_keeps_its_precision_and_is_written_over() {
+        // the village's shadow map: 1024x1024 colour buffer of format 0x80e (r32f)
+        let format = crate::gx2::texture_format(0x80e);
+        assert_eq!(format, wgpu::TextureFormat::R32Float);
+        assert_eq!(crate::gx2::texture_format(0x80d), wgpu::TextureFormat::Rg32Float);
+        assert_eq!(crate::gx2::texture_format(0x823), wgpu::TextureFormat::Rgba32Float);
+        // its blending, left on by the draws before, does not apply; 8-bit and 16-bit float buffers still blend
+        assert!(!blends(format));
+        assert!(blends(wgpu::TextureFormat::Rgba8Unorm));
+        assert!(blends(wgpu::TextureFormat::Rgba16Float));
+    }
+
+    #[test]
+    fn shadow_samplers_use_the_games_comparison() {
+        assert_eq!(compare_sampler_function(15), wgpu::CompareFunction::LessEqual);
+        assert_eq!(compare_sampler_function(4), wgpu::CompareFunction::Greater);
+        assert_eq!(compare_sampler_function(1), wgpu::CompareFunction::Less);
+        assert_eq!(parse_addresses("0x17101480, 1724c040 ;zz,0X10"), [0x1710_1480, 0x1724_c040, 0x10]);
     }
 
     #[test]
