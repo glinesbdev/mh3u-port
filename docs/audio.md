@@ -57,6 +57,25 @@ offset units) come from the decaf-emu sources, read for facts only: no code is t
 - `cargo run -p mh3u-audio --example tone` plays two seconds of a 440 Hz tone through the same voice, mixer and output, to check a
   machine's sound without the game.
 
+## Run 23 (PR #9, merged in 757ca77): first sound
+
+- **It works.** Played on `Speakers (Realtek(R) Audio)` at 48,000 Hz, stereo. The owner heard it as correct and clean, with no
+  popping: sound effects tied to animations, NPCs, ambient music and menu sounds. No input or graphics lag; Moga Woods 82–86 FPS.
+- **`snd_core`: 37 imported, 15 done.** Not done: `AXComputeLpfCoefs AXGetAuxCallback AXGetDRCVSMode AXQuit AXRegisterAuxCallback
+  AXRegisterDeviceFinalMixCallback AXSetDRCVSDownmixBalance AXSetDRCVSLC AXSetDRCVSMode AXSetDRCVSOutputGain AXSetDRCVSSpeakerPosition
+  AXSetDRCVSSurroundDepth AXSetDRCVSSurroundLevelGain AXSetDefaultMixerSelect AXSetVoiceLpf AXSetVoiceLpfCoefs AXSetVoiceMixerSelect
+  AXSetVoiceSrcType AXSetVoiceType AXUserBegin AXUserEnd AXUserIsProtected`.
+  - The audible ones: the voice low-pass filter (`AXSetVoiceLpf*`, `AXComputeLpfCoefs`), used for muffled and distant sounds, and the
+    auxiliary buses' callbacks (`AXRegisterAuxCallback`), where the effects run.
+  - The DRC VS functions set up the GamePad's virtual surround, and the rest is bookkeeping.
+- **`snd_user`: 37 imported, 0 done, all of them `AXFX` reverbs** (no `MIX`, chorus or delay): `MultiChReverb` (`Init`,
+  `SettingsUpdate`, `Shutdown`, `Callback`), and `ReverbHi`, `ReverbHiExp`, `ReverbStd`, `ReverbStdExp`, each with `Init`,
+  `Settings`, `Shutdown` and `Callback` in a plain and a `Dpl2` (Dolby Pro Logic II, four-channel) version, plus `AXFXSetHooks`.
+  Since the game does not use `MIX`, its voices get their mixes from `AXSetVoiceDeviceMix` directly, so the "unmixed voices are
+  centred" fallback is not what the game is heard through.
+- **What is missing** is therefore the reverb (caves and big areas sound dry) and the low-pass filter (sounds meant to be muffled,
+  such as underwater, are not).
+
 ## Building
 
 - Windows: nothing more (WASAPI is part of Windows).
@@ -66,12 +85,8 @@ offset units) come from the decaf-emu sources, read for facts only: no code is t
 
 ## Not done yet (the plan)
 
-1. **The import list.** Run once and read the `[audio] snd_core: … not done:` lines: they say which of the 74 functions are still
-   stubs. The likely ones: `AXSetVoiceLpf*`, `AXSetVoiceBiquad*` (filters), `AXSetVoicePriority`, `AXSetVoiceType`, `AXSetVoiceSrcType`
-   (only linear resampling is done), `AXRegisterAuxCallback` and `AXSetAuxReturnVolume` (effects), `AXRegisterDeviceFinalMixCallback`.
-2. **`snd_user`.** If the game uses `MIX` (input, pan, fader, aux sends computed into device mixes), write it, since its calls do nothing
-   now and unmixed voices are only played centred. `AXFX` effects (reverb, chorus, delay) take the auxiliary buses through
-   `AXRegisterAuxCallback`: the buses would need mixing and the callbacks running, or the effects done in Rust.
+1. **The import list** is known (run 23, above).
+2. **The low-pass filter and the reverbs** (`AXSetVoiceLpf*`, the auxiliary buses and their callbacks, the `AXFX` reverbs): PR #10.
 3. **The GamePad's speaker.** Its mix is used only for voices with no TV mix. A setting could send it to the same device.
 4. **Filters and effects:** the low-pass and biquad filters per voice, then the effects.
 5. **Better resampling** if linear sounds dull at high pitches. `AXSetVoiceSrcType` asks for 4-tap filtering for some voices.
