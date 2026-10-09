@@ -55,14 +55,21 @@ impl Header {
 pub struct Decoded {
     pub width: u32,
     pub height: u32,
+    /// Layers of an array or cube, or slices of a volume (`volume`).
     pub layers: u32,
+    pub volume: bool,
     pub format: wgpu::TextureFormat,
+    /// The base level's pitch in elements as the layout rules give it (what is used; when the header's own differs, the report
+    /// says so).
+    pub laid_pitch: u32,
     pub levels: Vec<Level>,
 }
 
 pub struct Level {
     pub width: u32,
     pub height: u32,
+    /// Its layers (slices for a volume, which halve with the levels).
+    pub depth: u32,
     pub bytes_per_row: u32,
     pub data: Vec<u8>,
 }
@@ -77,46 +84,59 @@ struct Info {
     convert: fn(&[u8], &mut Vec<u8>),
 }
 
+// The GPU reads texture memory little-endian and GX2 asks for no swap for any texture format (the endian field of its format table
+// is 0 for all of them), so a 16-bit texel is a little-endian 16-bit word with its first component in the lowest bits, the way
+// Cemu's decoders read them; block-compressed data and 32-bit floats go up as they are.
+
 fn copy(e: &[u8], out: &mut Vec<u8>) {
     out.extend_from_slice(e);
 }
 
-/// Swaps the bytes inside every 16-bit word (the way the console stores compressed blocks).
-fn swap16(e: &[u8], out: &mut Vec<u8>) {
-    for w in e.as_chunks::<2>().0 {
-        out.extend_from_slice(&[w[1], w[0]]);
-    }
+fn le16(e: &[u8]) -> u32 {
+    u32::from(u16::from_le_bytes([e[0], e[1]]))
 }
 
-/// Reverses the bytes of every 32-bit word.
-fn swap32(e: &[u8], out: &mut Vec<u8>) {
-    for w in e.as_chunks::<4>().0 {
-        out.extend_from_slice(&[w[3], w[2], w[1], w[0]]);
-    }
+/// A field of `bits` bits widened to 8.
+fn widen(v: u32, bits: u32) -> u8 {
+    (v * 255 / ((1 << bits) - 1)) as u8
 }
 
 fn r5g6b5(e: &[u8], out: &mut Vec<u8>) {
-    let v = u16::from_be_bytes([e[0], e[1]]);
-    let (r, g, b) = ((v >> 11) & 31, (v >> 5) & 63, v & 31);
-    out.extend_from_slice(&[(r * 255 / 31) as u8, (g * 255 / 63) as u8, (b * 255 / 31) as u8, 255]);
+    let v = le16(e);
+    out.extend_from_slice(&[widen(v & 31, 5), widen((v >> 5) & 63, 6), widen((v >> 11) & 31, 5), 255]);
 }
 
-fn a1b5g5r5(e: &[u8], out: &mut Vec<u8>) {
-    let v = u16::from_be_bytes([e[0], e[1]]);
-    let (a, b, g, r) = ((v >> 15) & 1, (v >> 10) & 31, (v >> 5) & 31, v & 31);
-    out.extend_from_slice(&[(r * 255 / 31) as u8, (g * 255 / 31) as u8, (b * 255 / 31) as u8, (a * 255) as u8]);
-}
-
+/// Red in the lowest bits, alpha in the top one.
 fn r5g5b5a1(e: &[u8], out: &mut Vec<u8>) {
-    let v = u16::from_be_bytes([e[0], e[1]]);
-    let (r, g, b, a) = ((v >> 11) & 31, (v >> 6) & 31, (v >> 1) & 31, v & 1);
-    out.extend_from_slice(&[(r * 255 / 31) as u8, (g * 255 / 31) as u8, (b * 255 / 31) as u8, (a * 255) as u8]);
+    let v = le16(e);
+    out.extend_from_slice(&[
+        widen(v & 31, 5),
+        widen((v >> 5) & 31, 5),
+        widen((v >> 10) & 31, 5),
+        widen(v >> 15, 1),
+    ]);
+}
+
+/// Alpha in the lowest bit, red in the top five.
+fn a1b5g5r5(e: &[u8], out: &mut Vec<u8>) {
+    let v = le16(e);
+    out.extend_from_slice(&[
+        widen((v >> 11) & 31, 5),
+        widen((v >> 6) & 31, 5),
+        widen((v >> 1) & 31, 5),
+        widen(v & 1, 1),
+    ]);
 }
 
 fn r4g4b4a4(e: &[u8], out: &mut Vec<u8>) {
-    let v = u16::from_be_bytes([e[0], e[1]]);
-    let n = |s: u32| (((v >> s) & 15) * 17) as u8;
-    out.extend_from_slice(&[n(12), n(8), n(4), n(0)]);
+    let v = le16(e);
+    let n = |s: u32| widen((v >> s) & 15, 4);
+    out.extend_from_slice(&[n(0), n(4), n(8), n(12)]);
+}
+
+fn r4g4(e: &[u8], out: &mut Vec<u8>) {
+    let v = u32::from(e[0]);
+    out.extend_from_slice(&[widen(v & 15, 4), widen(v >> 4, 4)]);
 }
 
 fn f16_bits(f: f32) -> u16 {
@@ -133,18 +153,90 @@ fn f16_bits(f: f32) -> u16 {
     sign | ((exp as u16) << 10) | (man >> 13) as u16
 }
 
+/// 16-bit normalised components to half floats (the 16-bit normalised formats need a device feature).
 fn unorm16_to_half(e: &[u8], out: &mut Vec<u8>) {
     for w in e.as_chunks::<2>().0 {
-        let v = f32::from(u16::from_be_bytes([w[0], w[1]])) / 65535.0;
+        let v = f32::from(u16::from_le_bytes(*w)) / 65535.0;
         out.extend_from_slice(&f16_bits(v).to_le_bytes());
     }
 }
 
+fn snorm16_to_half(e: &[u8], out: &mut Vec<u8>) {
+    for w in e.as_chunks::<2>().0 {
+        let v = (f32::from(i16::from_le_bytes(*w)) / 32767.0).max(-1.0);
+        out.extend_from_slice(&f16_bits(v).to_le_bytes());
+    }
+}
+
+/// Alpha in the lowest two bits, red in the top ten (by the name, lowest first, as the other formats are named); what the
+/// target format wants is red lowest.
 fn a2b10g10r10(e: &[u8], out: &mut Vec<u8>) {
-    // the console's 2-10-10-10: alpha in the top two bits, then red, green and blue
-    let v = u32::from_be_bytes([e[0], e[1], e[2], e[3]]);
-    let (a, r, g, b) = ((v >> 30) & 3, (v >> 20) & 0x3ff, (v >> 10) & 0x3ff, v & 0x3ff);
+    let v = u32::from_le_bytes([e[0], e[1], e[2], e[3]]);
+    let (a, b, g, r) = (v & 3, (v >> 2) & 0x3ff, (v >> 12) & 0x3ff, (v >> 22) & 0x3ff);
     out.extend_from_slice(&(r | g << 10 | b << 20 | a << 30).to_le_bytes());
+}
+
+/// How well the decoder knows a texture format: by a reference (`Exact`), by the name only (`Approximate`, e.g. the component
+/// order of a format no reference decodes), or not at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Support {
+    Exact,
+    Approximate,
+    Unsupported,
+}
+
+/// A short name of a texture format and how well it is decoded, for reports.
+pub fn format_support(format: u32) -> (String, Support) {
+    let hw = format & 0x3f;
+    let kind = match format >> 8 {
+        0 => "unorm",
+        1 => "uint",
+        2 => "snorm",
+        3 => "sint",
+        4 => "srgb",
+        8 => "float",
+        _ => "?",
+    };
+    let name = match hw {
+        0x01 => "r8",
+        0x02 => "r4g4",
+        0x05 => "r16",
+        0x06 => "r16f",
+        0x07 => "r8g8",
+        0x08 => "r5g6b5",
+        0x0a => "r5g5b5a1",
+        0x0b => "r4g4b4a4",
+        0x0c => "a1b5g5r5",
+        0x0d => "r32",
+        0x0e => "r32f",
+        0x0f => "r16g16",
+        0x10 => "r16g16f",
+        0x11 => "r24x8/d24s8",
+        0x16 => "r11g11b10f",
+        0x19 => "r10g10b10a2",
+        0x1a => "r8g8b8a8",
+        0x1b => "a2b10g10r10",
+        0x1c => "d32s8",
+        0x1d => "r32g32",
+        0x1e => "r32g32f",
+        0x1f => "r16g16b16a16",
+        0x20 => "r16g16b16a16f",
+        0x22 => "r32g32b32a32",
+        0x23 => "r32g32b32a32f",
+        0x31 => "bc1",
+        0x32 => "bc2",
+        0x33 => "bc3",
+        0x34 => "bc4",
+        0x35 => "bc5",
+        _ => "?",
+    };
+    let support = match info(format) {
+        None => Support::Unsupported,
+        // the integer kinds are read as normalised ones (a shader samples them as floats); names only for these two
+        Some(_) if matches!(format >> 8, 1 | 3) || matches!(hw, 0x1b | 0x0c | 0x02) => Support::Approximate,
+        Some(_) => Support::Exact,
+    };
+    (format!("{kind} {name} ({format:#x})"), support)
 }
 
 fn info(format: u32) -> Option<Info> {
@@ -152,150 +244,80 @@ fn info(format: u32) -> Option<Info> {
     let (hw, kind) = (format & 0x3f, format >> 8);
     let srgb = kind == 4;
     let snorm = kind == 2;
+    let rgba8 = |convert: fn(&[u8], &mut Vec<u8>)| Info {
+        bits: 16,
+        block: 1,
+        format: F::Rgba8Unorm,
+        convert,
+    };
+    let plain = |bits: u32, format: F| Info {
+        bits,
+        block: 1,
+        format,
+        convert: copy,
+    };
+    let norm16 = |bits: u32, format: F| Info {
+        bits,
+        block: 1,
+        format,
+        convert: if snorm { snorm16_to_half } else { unorm16_to_half },
+    };
+    let bc = |bits: u32, format: F| Info {
+        bits,
+        block: 4,
+        format,
+        convert: copy,
+    };
     Some(match hw {
-        0x01 => Info {
+        0x01 => plain(8, if snorm { F::R8Snorm } else { F::R8Unorm }),
+        0x02 => Info {
             bits: 8,
             block: 1,
-            format: if snorm { F::R8Snorm } else { F::R8Unorm },
-            convert: copy,
+            format: F::Rg8Unorm,
+            convert: r4g4,
         },
-        0x07 => Info {
-            bits: 16,
-            block: 1,
-            format: if snorm { F::Rg8Snorm } else { F::Rg8Unorm },
-            convert: copy,
-        },
-        0x1a => Info {
-            bits: 32,
-            block: 1,
-            format: if srgb {
+        0x07 => plain(16, if snorm { F::Rg8Snorm } else { F::Rg8Unorm }),
+        0x1a => plain(
+            32,
+            if srgb {
                 F::Rgba8UnormSrgb
             } else if snorm {
                 F::Rgba8Snorm
             } else {
                 F::Rgba8Unorm
             },
-            convert: copy,
-        },
-        0x08 => Info {
-            bits: 16,
-            block: 1,
-            format: F::Rgba8Unorm,
-            convert: r5g6b5,
-        },
-        0x0a => Info {
-            bits: 16,
-            block: 1,
-            format: F::Rgba8Unorm,
-            convert: a1b5g5r5,
-        },
-        0x0c => Info {
-            bits: 16,
-            block: 1,
-            format: F::Rgba8Unorm,
-            convert: r5g5b5a1,
-        },
-        0x0b => Info {
-            bits: 16,
-            block: 1,
-            format: F::Rgba8Unorm,
-            convert: r4g4b4a4,
-        },
-        0x05 => Info {
-            bits: 16,
-            block: 1,
-            format: F::R16Float,
-            convert: unorm16_to_half,
-        },
-        0x06 => Info {
-            bits: 16,
-            block: 1,
-            format: F::R16Float,
-            convert: swap16,
-        },
-        0x0f => Info {
-            bits: 32,
-            block: 1,
-            format: F::Rg16Float,
-            convert: unorm16_to_half,
-        },
-        0x10 => Info {
-            bits: 32,
-            block: 1,
-            format: F::Rg16Float,
-            convert: swap16,
-        },
-        0x1f => Info {
-            bits: 64,
-            block: 1,
-            format: F::Rgba16Float,
-            convert: unorm16_to_half,
-        },
-        0x20 => Info {
-            bits: 64,
-            block: 1,
-            format: F::Rgba16Float,
-            convert: swap16,
-        },
-        0x0e => Info {
-            bits: 32,
-            block: 1,
-            format: F::R32Float,
-            convert: swap32,
-        },
-        0x1e => Info {
-            bits: 64,
-            block: 1,
-            format: F::Rg32Float,
-            convert: swap32,
-        },
-        0x23 => Info {
-            bits: 128,
-            block: 1,
-            format: F::Rgba32Float,
-            convert: swap32,
-        },
-        0x19 => Info {
+        ),
+        0x08 => rgba8(r5g6b5),
+        0x0a => rgba8(r5g5b5a1),
+        0x0c => rgba8(a1b5g5r5),
+        0x0b => rgba8(r4g4b4a4),
+        0x05 => norm16(16, F::R16Float),
+        0x0f => norm16(32, F::Rg16Float),
+        0x1f => norm16(64, F::Rgba16Float),
+        0x06 => plain(16, F::R16Float),
+        0x10 => plain(32, F::Rg16Float),
+        0x20 => plain(64, F::Rgba16Float),
+        0x0e => plain(32, F::R32Float),
+        0x1e => plain(64, F::Rg32Float),
+        0x23 => plain(128, F::Rgba32Float),
+        0x16 => plain(32, F::Rg11b10Ufloat),
+        0x19 => plain(32, F::Rgb10a2Unorm),
+        0x1b => Info {
             bits: 32,
             block: 1,
             format: F::Rgb10a2Unorm,
             convert: a2b10g10r10,
         },
-        0x31 => Info {
-            bits: 64,
-            block: 4,
-            format: if srgb { F::Bc1RgbaUnormSrgb } else { F::Bc1RgbaUnorm },
-            convert: copy,
-        },
-        0x32 => Info {
-            bits: 128,
-            block: 4,
-            format: if srgb { F::Bc2RgbaUnormSrgb } else { F::Bc2RgbaUnorm },
-            convert: copy,
-        },
-        0x33 => Info {
-            bits: 128,
-            block: 4,
-            format: if srgb { F::Bc3RgbaUnormSrgb } else { F::Bc3RgbaUnorm },
-            convert: copy,
-        },
-        0x34 => Info {
-            bits: 64,
-            block: 4,
-            format: if snorm { F::Bc4RSnorm } else { F::Bc4RUnorm },
-            convert: copy,
-        },
-        0x35 => Info {
-            bits: 128,
-            block: 4,
-            format: if snorm { F::Bc5RgSnorm } else { F::Bc5RgUnorm },
-            convert: copy,
-        },
+        0x31 => bc(64, if srgb { F::Bc1RgbaUnormSrgb } else { F::Bc1RgbaUnorm }),
+        0x32 => bc(128, if srgb { F::Bc2RgbaUnormSrgb } else { F::Bc2RgbaUnorm }),
+        0x33 => bc(128, if srgb { F::Bc3RgbaUnormSrgb } else { F::Bc3RgbaUnorm }),
+        0x34 => bc(64, if snorm { F::Bc4RSnorm } else { F::Bc4RUnorm }),
+        0x35 => bc(128, if snorm { F::Bc5RgSnorm } else { F::Bc5RgUnorm }),
         _ => return None,
     })
 }
 
-/// Reads level 0 of a texture from the guest's memory.
+/// Reads a texture, every level, from the guest's memory.
 pub fn decode(g: &Guest, h: &Header) -> Result<Decoded, String> {
     let Some(info) = info(h.format) else {
         return Err(format!("the texture format {:#x}", h.format));
@@ -303,40 +325,46 @@ pub fn decode(g: &Guest, h: &Header) -> Result<Decoded, String> {
     let Some(mode) = TileMode::from_number(h.tile_mode) else {
         return Err(format!("the tile mode {}", h.tile_mode));
     };
-    if h.width == 0 || h.height.max(1) > 16384 || h.width > 16384 || h.image == 0 {
+    if h.width == 0 || h.height.max(1) > 16384 || h.width > 16384 || h.image == 0 || h.depth > 2048 {
         return Err("an empty or huge texture".into());
     }
+    let volume = h.dim == 2;
     let layers = match h.dim {
         3 => 6,
-        4..=7 => h.depth.max(1),
-        2 => return Err("a 3D texture".into()),
+        2 | 4..=7 => h.depth.max(1),
         _ => 1,
     };
     let height = if h.dim == 0 { 1 } else { h.height.max(1) };
     let block = info.block;
     let (pipe_swizzle, bank_swizzle) = tiling::swizzles(h.swizzle);
     let elem_bytes = (info.bits / 8) as usize;
-    let max_levels = 32 - h.width.max(height).leading_zeros();
+    let max_levels = 32 - h.width.max(height).max(if volume { layers } else { 1 }).leading_zeros();
     let count = h.mips.clamp(1, max_levels);
     let mut levels = Vec::new();
     let mut element = vec![0u8; elem_bytes];
+    let mut laid_pitch = 0;
     for level in 0..count {
         let (w, hgt) = ((h.width >> level).max(1), (height >> level).max(1));
+        // a volume's slices halve with the levels; an array's layers do not
+        let slices = if volume { (layers >> level).max(1) } else { layers };
         let (bw, bh) = (w.div_ceil(block), hgt.div_ceil(block));
-        // the size as laid out, by the same rules the game's own size calculation used
+        // the size as laid out, by the same rules the game's own size calculation used (the address library's)
         let laid = tiling::surface_info(&tiling::Request {
             mode,
             bits_per_element: info.bits,
             compressed: block > 1,
             width: w,
             height: hgt,
-            slices: if h.dim == 3 { layers } else { 1 },
+            slices,
             samples: 1,
             level,
             cube: h.dim == 3,
             depth: false,
             display: false,
         });
+        if level == 0 {
+            laid_pitch = laid.pitch;
+        }
         let base = match level {
             0 => h.image,
             1 => h.mip_ptr,
@@ -356,7 +384,7 @@ pub fn decode(g: &Guest, h: &Header) -> Result<Decoded, String> {
             bank_swizzle,
         };
         let mut data = Vec::new();
-        for layer in 0..layers {
+        for layer in 0..slices {
             for y in 0..bh {
                 for x in 0..bw {
                     let offset = tiling::address(&surface, x, y, layer, 0);
@@ -365,10 +393,11 @@ pub fn decode(g: &Guest, h: &Header) -> Result<Decoded, String> {
                 }
             }
         }
-        let texel_bytes = data.len() / (bw * bh * layers) as usize;
+        let texel_bytes = data.len() / (bw * bh * slices) as usize;
         levels.push(Level {
             width: bw * block,
             height: bh * block,
+            depth: slices,
             bytes_per_row: bw * texel_bytes as u32,
             data,
         });
@@ -377,7 +406,9 @@ pub fn decode(g: &Guest, h: &Header) -> Result<Decoded, String> {
         width: h.width.next_multiple_of(block),
         height: height.next_multiple_of(block),
         layers,
+        volume,
         format: info.format,
+        laid_pitch,
         levels,
     })
 }
@@ -419,5 +450,56 @@ impl Sampler {
             1 => wgpu::AddressMode::MirrorRepeat,
             _ => wgpu::AddressMode::ClampToEdge,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn run(f: fn(&[u8], &mut Vec<u8>), bytes: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        f(bytes, &mut out);
+        out
+    }
+
+    #[test]
+    fn sixteen_bit_texels_are_little_endian_with_the_first_component_lowest() {
+        // pure red in 5-6-5 is 0x001f: bytes 1f 00
+        assert_eq!(run(r5g6b5, &[0x1f, 0x00]), [255, 0, 0, 255]);
+        assert_eq!(run(r5g6b5, &[0x00, 0xf8]), [0, 0, 255, 255]);
+        assert_eq!(run(r5g6b5, &[0xe0, 0x07]), [0, 255, 0, 255]);
+        // 5-5-5-1: red lowest, alpha the top bit
+        assert_eq!(run(r5g5b5a1, &[0x1f, 0x80]), [255, 0, 0, 255]);
+        assert_eq!(run(r5g5b5a1, &[0x00, 0x7c]), [0, 0, 255, 0]);
+        // 1-5-5-5: alpha lowest, red the top five
+        assert_eq!(run(a1b5g5r5, &[0x01, 0xf8]), [255, 0, 0, 255]);
+        assert_eq!(run(a1b5g5r5, &[0x3e, 0x00]), [0, 0, 255, 0]);
+        // 4-4-4-4: red the low nibble of the first byte
+        assert_eq!(run(r4g4b4a4, &[0x0f, 0xf0]), [255, 0, 0, 255]);
+        assert_eq!(run(r4g4, &[0xf0]), [0, 255]);
+    }
+
+    #[test]
+    fn sixteen_bit_normalised_texels_become_half_floats() {
+        assert_eq!(run(unorm16_to_half, &[0xff, 0xff]), f16_bits(1.0).to_le_bytes());
+        assert_eq!(run(snorm16_to_half, &[0x01, 0x80]), f16_bits(-1.0).to_le_bytes());
+        assert_eq!(run(snorm16_to_half, &[0xff, 0x7f]), f16_bits(1.0).to_le_bytes());
+    }
+
+    #[test]
+    fn ten_bit_texels_end_with_red_lowest() {
+        // a2b10g10r10 with red 1023 only: red is the top ten bits
+        let v: u32 = 1023 << 22;
+        assert_eq!(run(a2b10g10r10, &v.to_le_bytes()), 1023u32.to_le_bytes());
+    }
+
+    #[test]
+    fn every_known_format_names_itself_and_says_how_well_it_is_read() {
+        assert_eq!(format_support(0x1a).1, Support::Exact);
+        assert_eq!(format_support(0x431).0, "srgb bc1 (0x431)");
+        assert_eq!(format_support(0x1b).1, Support::Approximate);
+        assert_eq!(format_support(0x11).1, Support::Unsupported);
+        assert_eq!(format_support(0x816).1, Support::Exact);
     }
 }

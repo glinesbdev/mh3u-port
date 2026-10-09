@@ -562,7 +562,8 @@ fn depth_format(gx2: u32) -> wgpu::TextureFormat {
 }
 
 fn tex_kind(dim: u32, format: u32) -> TexKind {
-    if matches!(format & 0x3f, 0x11 | 0x13 | 0x14) || format & 0x3f == 0x16 {
+    // the depth formats (0x16 is the 10-11-11 float colour format, not a depth one)
+    if matches!(format & 0x3f, 0x11..=0x14 | 0x1c) {
         return TexKind::Depth2d;
     }
     match dim {
@@ -796,12 +797,22 @@ impl Gx2 {
         if let Some(view) = slot {
             return Some(view.clone());
         }
+        let volume = cached.texture.dimension() == wgpu::TextureDimension::D3;
+        if volume != (kind == TexKind::D3) {
+            // a volume read as a flat texture or the other way round: the shader gets the stand-in
+            return None;
+        }
         let view = cached.texture.create_view(&wgpu::TextureViewDescriptor {
             dimension: Some(match kind {
+                TexKind::D3 => wgpu::TextureViewDimension::D3,
                 TexKind::Cube if cached.layers > 1 => wgpu::TextureViewDimension::D2Array,
                 _ => wgpu::TextureViewDimension::D2,
             }),
-            array_layer_count: Some(if kind == TexKind::Cube { 6.min(cached.layers) } else { 1 }),
+            array_layer_count: Some(match kind {
+                TexKind::D3 => 1,
+                TexKind::Cube => 6.min(cached.layers),
+                _ => 1,
+            }),
             ..Default::default()
         });
         *slot = Some(view.clone());
@@ -847,7 +858,11 @@ impl Gx2 {
                         },
                         mip_level_count: d.levels.len() as u32,
                         sample_count: 1,
-                        dimension: wgpu::TextureDimension::D2,
+                        dimension: if d.volume {
+                            wgpu::TextureDimension::D3
+                        } else {
+                            wgpu::TextureDimension::D2
+                        },
                         format: d.format,
                         usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
                         view_formats: &[],
@@ -868,7 +883,7 @@ impl Gx2 {
                             wgpu::Extent3d {
                                 width: l.width,
                                 height: l.height,
-                                depth_or_array_layers: d.layers,
+                                depth_or_array_layers: l.depth,
                             },
                         );
                     }
@@ -1785,7 +1800,6 @@ impl Gx2 {
                 }
                 if t != 0
                     && k != TexKind::Depth2d
-                    && k != TexKind::D3
                     && let Some(view) = self.texture_view(g, t, k)
                 {
                     return (r, view);
