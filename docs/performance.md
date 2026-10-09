@@ -103,6 +103,8 @@ move the village on its own.
      stream goes after 120 frames unused. `vertex_data_rewritten_every_frame_does_not_pile_up_streams` checks it: 1,000
      frames of one mesh that stays and one rewritten every frame keep at most 64 streams. `[gfx caches]` shows the streams'
      megabytes and `[draw counts]` shows `vertex streams aged out`.
+   - **Run 15 (7b89bb8) confirmed the fix:** vertex streams stayed between about 460 and 1,500, and Moga Woods held a steady
+     70–76 FPS while standing still (it used to slide to 46).
    - The shader fronts show 0 entries at each window's end because the game invalidates its shader memory every frame. The
      content-keyed caches behind them catch every miss (translations stay flat), so this costs a constant ~0.3 ms (`shaders`),
      not a slowdown.
@@ -114,6 +116,11 @@ move the village on its own.
    18 → 30 MB); not measured on the game.
 
 ## Fixed (for the record)
+
+- Field slowdown while standing still (runs 11–13): vertex streams made every frame were kept until 1 GiB, and wgpu's per-pass
+  bookkeeping grew with them. Fixed in PR #5 (f88327a); run 15 held 70–76 FPS in Moga Woods (open concern 3 has the details).
+- Gamepad face buttons: run 15's log showed `[gamepad] East is the GamePad's A` with the new default layout, so an Xbox pad's A is
+  the game's A (7b89bb8; `MH3U_PAD_LAYOUT=nintendo` gives the earlier mapping).
 
 - Gamepad thread suspected of spinning: it was not; that profile was mislabelled baton time.
 - Textures re-decoded after every overlapping `GX2Invalidate` (~15k a second): now re-hashed and only decoded if changed.
