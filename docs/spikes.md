@@ -263,8 +263,7 @@ base camp by area 1, 498 draws. The field has the village's shadow path, not a c
 (`0xf561e800`, draws 0-44) read by draws 196-372 with the same reference bias (pixel block 4 `[0].x` = 0.0115), so 3m's fix
 covers it, and the user saw no streaks in the field and the village unchanged. 105 draws have the polygon offset on (the field's
 decals and ground overlays). Nothing new stands out in the dump's picture; the base camp is hazy, which may be the game's
-morning fog. The user felt stutter on leaving the village; what the log shows about it is in `performance.md`
-("Area changes and the slowing replay").
+morning fog. The user felt stutter on leaving the village; what the log shows about it is in `performance.md` (open concerns 2 and 3).
 
 ## 4. Does the generated code compile in a reasonable time? (done: as C yes, as one Rust crate no)
 

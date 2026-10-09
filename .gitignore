@@ -13,3 +13,6 @@ rpx_data.bin
 # local editor/tool state
 .claude/
 *.log
+
+# core dumps QEMU writes when a guest test program crashes (qemu_mh3u-ppc-*.core)
+*.core
