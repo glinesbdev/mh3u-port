@@ -65,8 +65,8 @@ of something else is the translator's job to find (see "What is not translated y
 
 ## What is not translated yet
 
-- The table for indirect calls (30,605 `rt_call(c, t)` sites) and for the 4,312 indirect tail jumps that are not switches: both go through
-  the runtime, which must map an address to a translated function.
+- Indirect calls (30,605 `rt_call(c, t)` sites) and the 4,312 indirect tail jumps that are not switches are not resolved ahead of
+  time: each goes through `game_call` in `dispatch.c`, which looks the address up in a hash table (see "The whole executable").
 - The imports: a call to one of the 568 import trampolines (placed after the end of `.text`, from 0x31963d8) is `rt_import(c, number)`,
   and `imports.h` names each number ("library:function"). Which import a trampoline stands for comes from the relocations of `.text`
   (7,231 name an import; each trampoline serves one import, checked); the runtime implements `rt_import`. Imports reached through a
@@ -85,9 +85,17 @@ checked against the interpreter in `c_diff.rs`. The other 4,312 `bctr` are tail 
 ## The whole executable (`mh3u-tools translate`, `build-game`, `run`)
 
 The 82,209 functions become 412 C files of 200 functions (247 MB, written in 2 seconds, outside any git tree) with `game.h`
-(declarations), `imports.h` (the names of the system functions), and `dispatch.c`: the table that finds a function by address (for the
-30,605 indirect calls and the indirect tail jumps), the table of import trampolines (an import called through a pointer reaches the
+(declarations), `imports.h` (the names of the system functions), and `dispatch.c`: the table that finds a function or an import
+trampoline by its address (for the 30,605 indirect calls and the indirect tail jumps; an import called through a pointer reaches the
 host as an import), and the hooks that route `rt_*` to the host. Every file passes `clang -fsyntax-only`.
+
+The lookup, `game_call`, is a hash table made by the translator (`dispatch_c` in `mh3u-tools/src/translate.rs`), not a search: open
+addressing with linear probing, the start slot from the address times a constant, and at least twice as many slots as addresses. For
+the game's 82,209 functions and 568 trampolines that is 2^18 slots of 8 bytes, 2 MiB of read-only data, at about 1.2 probes per
+lookup on average. A slot holds the address and either the function's place in the `functions` array or the import's number (as
+`-1 - n`); a function wins over a trampoline at the same address. Before this, every indirect call was a binary search over all the
+functions and then over the trampolines. A test (`game_call_finds_every_function_and_import_and_nothing_else`) builds the table for
+made-up addresses with the system C compiler and checks every hit and some misses.
 
 `build-game` compiles the files on every core into a shared library (`libgame.so` / `game.dll`): 41 s at `-O0` on 24 cores (measured
 before the registers moved into locals). The flags come from `mh3u_recomp::CFlags`, which the tests in `c_diff.rs` compile with too:
