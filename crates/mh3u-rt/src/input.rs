@@ -192,8 +192,16 @@ pub fn key_axis(code: &str) -> Option<(usize, f32)> {
     })
 }
 
-/// Reads gamepads on a thread of their own, as long as the program runs.
+/// How long the gamepad thread sleeps when there is no event: short next to a frame (the game reads the pads once a frame), long
+/// enough that the thread costs nothing.
+const PAD_IDLE: std::time::Duration = std::time::Duration::from_millis(4);
+
+/// Reads gamepads on a thread of their own, as long as the program runs. MH3U_GAMEPADS=0 turns them off (no thread, no backend).
 pub fn start_gamepads() {
+    if std::env::var("MH3U_GAMEPADS").is_ok_and(|v| v.trim() == "0") {
+        eprintln!("gamepads off (MH3U_GAMEPADS=0)");
+        return;
+    }
     let _ = std::thread::Builder::new().name("gamepads".into()).spawn(|| {
         let mut gilrs = match gilrs::Gilrs::new() {
             Ok(g) => g,
@@ -208,9 +216,12 @@ pub fn start_gamepads() {
         }
         use gilrs::{Axis, Button, EventType};
         let trace = std::env::var_os("MH3U_TRACE_PAD").is_some();
-        // wake up now and then rather than waiting for ever: a wait that is cut short must not end the thread
+        // The pending events are taken without waiting, and the thread sleeps a little when there are none. It does not wait in
+        // gilrs's blocking call (`next_event_blocking` with a timeout), which was where a Windows profile found this thread taking
+        // a whole core; a plain sleep costs nothing on any platform whatever the backend does.
         loop {
-            let Some(event) = gilrs.next_event_blocking(Some(std::time::Duration::from_millis(200))) else {
+            let Some(event) = gilrs.next_event() else {
+                std::thread::sleep(PAD_IDLE);
                 continue;
             };
             if trace {
