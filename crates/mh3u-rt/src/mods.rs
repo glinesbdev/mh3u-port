@@ -341,8 +341,95 @@ pub(crate) fn report_write(address: u32, value: u64, size: u32, lr: u32) -> bool
     true
 }
 
+/// Where `pattern` occurs (word-aligned) in `piece`, which starts at guest address `base`.
+pub fn copies_in(piece: &[u8], base: u32, pattern: &[u8], out: &mut Vec<u32>) {
+    if pattern.is_empty() || piece.len() < pattern.len() {
+        return;
+    }
+    for i in (0..=piece.len() - pattern.len()).step_by(4) {
+        if piece[i..i + pattern.len()] == *pattern {
+            out.push(base + i as u32);
+        }
+    }
+}
+
+/// `MH3U_WATCH=live`: the save the overlay found may be only the save image (written when saving), so this looks for other copies
+/// of its `len` bytes at `at` (the pouch) in `ranges`, in the background, logs them, and watches the copy `MH3U_WATCH_COPY` (0, the
+/// first, by default) as `lo..hi` around it; `label` names a watched address by its distance from the copy.
+pub fn watch_copies(at: u32, len: u32, ranges: Vec<(u32, u32)>, around: (i64, i64), label: Arc<dyn Fn(i64) -> String + Send + Sync>) {
+    if WATCH_FNS.get().is_none() {
+        return;
+    }
+    let _ = std::thread::Builder::new().name("watch copies".into()).spawn(move || {
+        let base = loop {
+            match GUEST_BASE.load(Relaxed) {
+                0 => std::thread::sleep(std::time::Duration::from_millis(50)),
+                b => break b,
+            }
+        };
+        let mut pattern = vec![0u8; len as usize];
+        read_tolerant(base, at, &mut pattern);
+        let filled = pattern.as_chunks::<4>().0.iter().filter(|s| s[..2] != [0, 0]).count();
+        if filled < 3 {
+            eprintln!("[watch-live] the pouch has {filled} items; put at least 3 in it and run again so its copies can be found");
+            return;
+        }
+        let mut found = Vec::new();
+        let piece = 0x10_0000u32;
+        let mut buf = vec![0u8; (piece + len) as usize];
+        for (from, n) in ranges {
+            let to = from.saturating_add(n);
+            let mut p = from & !3;
+            while p < to {
+                let m = piece.min(to - p);
+                let slice = &mut buf[..(m + len).min(to - p) as usize];
+                read_tolerant(base, p, slice);
+                copies_in(slice, p, &pattern, &mut found);
+                p = p.saturating_add(m);
+                std::thread::sleep(std::time::Duration::from_micros(200));
+            }
+        }
+        found.sort_unstable();
+        found.dedup();
+        found.retain(|&c| c != at);
+        if found.is_empty() {
+            eprintln!("[watch-live] the pouch is in no other place than the save at {at:#x}; still watching the save");
+            return;
+        }
+        let list: Vec<String> = found.iter().take(16).map(|c| format!("{c:#x}")).collect();
+        eprintln!(
+            "[watch-live] the pouch is also at {} (MH3U_WATCH_COPY=n picks one, 0 = the first)",
+            list.join(", ")
+        );
+        let pick = std::env::var("MH3U_WATCH_COPY")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .unwrap_or(0);
+        let Some(&copy) = found.get(pick).or(found.first()) else { return };
+        let lo = (i64::from(copy) + around.0).max(0) as u32;
+        let hi = (i64::from(copy) + around.1).min(i64::from(u32::MAX)) as u32;
+        let label = label.clone();
+        watch_writes(
+            lo,
+            hi,
+            Box::new(move |a| format!("copy {copy:#x}: {}", label(i64::from(a) - i64::from(copy)))),
+        );
+    });
+}
+
 #[cfg(test)]
 mod write_watch_tests {
+    #[test]
+    fn copies_of_the_pouch_are_found_word_aligned() {
+        let pat = [1u8, 2, 3, 4, 5, 6, 7, 8];
+        let mut piece = vec![0u8; 64];
+        piece[8..16].copy_from_slice(&pat);
+        piece[41..49].copy_from_slice(&pat); // not aligned
+        let mut out = Vec::new();
+        super::copies_in(&piece, 0x1000, &pat, &mut out);
+        assert_eq!(out, vec![0x1008]);
+    }
+
     #[test]
     fn reports_are_rate_limited_per_writer() {
         let shown: Vec<u32> = (0..250).filter(|&n| super::should_report(n)).collect();

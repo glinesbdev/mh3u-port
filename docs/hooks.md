@@ -71,7 +71,32 @@ Remove-Item Env:MH3U_WATCH
    4. buy or sell something (money);
    5. craft or upgrade a piece at the smithy (equipment added, materials removed);
    6. start a quest, then come back from it (quest start and end; not watched directly, but the pouch and the supplies change).
-3. Quit, and send `Desktop\watch.log` back (attach it), with the order of the actions.
+3. Quit, and send `Desktop\watch.log` back. If it lists several copies and none is written, run again with
+   `$env:MH3U_WATCH_COPY = '1'` (then `'2'`...) (attach it), with the order of the actions.
+
+### Run 29 (user): no writes
+
+All 6 actions were done, and the log shows the save found at `0x2e686b00` and watched (`0x2e686b49..0x2e68bad0`), but there is
+not one write. All of the translated code's stores go through the `WATCH` check, so the block was not written at all. It is the
+**save image**: the copy the game loads and writes when saving. That is why the overlay's counts were right in run 27. The pouch
+and box the game changes during play are kept somewhere else.
+
+Fix (`mods::watch_copies`): once the save is found, a background thread reads its pouch (24 slots) and searches guest memory
+for other copies of those 96 bytes. It logs them all (`[watch-live] the pouch is also at ...`) and moves the watch to copy
+`MH3U_WATCH_COPY` (0, the first, by default). Writes are then labelled `copy 0x…: pouch 3 count`, using the save's layout
+around the copy; where the layout differs, labels read `pouch -N` or `save +0x…`. The pouch needs at least 3 items for the
+search.
+
+Hook-point table (filled in from the next log):
+
+| Action | Function | Confidence |
+|---|---|---|
+| item added (pickup) | not found yet | – |
+| item used / removed | not found yet | – |
+| pouch <-> box | not found yet | – |
+| money (buy/sell) | not found yet | – |
+| craft / upgrade | not found yet | – |
+| quest start / end | not found yet (second pass) | – |
 
 From that log, the functions that wrote each field go into `mods/hooks.txt`. Menu-open and quest hooks need a second pass:
 `MH3U_ENTER_LR` on the callers found here, or watching a menu or quest field once one is known.
@@ -90,6 +115,6 @@ From that log, the functions that wrote each field go into `mods/hooks.txt`. Men
 
 See the bottom of this file. It is updated with each commit of PR #13.
 
-- Status: step 5 started (draft PR #14). The `MH3U_WATCH=live` tool and `win-build.ps1 -Watch` are ready.
-- Next: the user runs the steps above and sends `watch.log`. The writers found go into `mods/hooks.txt`, then a run with
-  `MH3U_HOOK_LOG=1` confirms them.
+- Status: run 29 found no writes, because the watched block is the save image. The tool now finds and watches the working copies
+  of the pouch (PR #14). `mods/hooks.txt` has no candidates yet.
+- Next: the user rebuilds the watch build and repeats the 6 actions with at least 3 items in the pouch, then sends `watch.log`.

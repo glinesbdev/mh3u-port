@@ -238,7 +238,20 @@ impl Overlay {
                         mods::watch(&[(at, live::LEN)]);
                         // MH3U_WATCH=live: log the stores to it, to find the functions to hook (docs/hooks.md)
                         let (lo, hi) = live::WATCH_SPAN;
-                        mods::watch_writes(at + lo, at + hi, Box::new(move |a| live::field(a - at)));
+                        if mods::watch_writes(at + lo, at + hi, Box::new(move |a| live::field(a - at))) {
+                            // and the working copies of the pouch, if the save is only the save image
+                            const POUCH: i64 = 0xd0;
+                            mods::watch_copies(
+                                at + POUCH as u32,
+                                24 * 4,
+                                live::RANGES.to_vec(),
+                                (i64::from(lo) - POUCH, i64::from(hi) - POUCH),
+                                std::sync::Arc::new(|d: i64| match u32::try_from(d + POUCH) {
+                                    Ok(o) => live::field(o),
+                                    Err(_) => format!("pouch {d}"),
+                                }),
+                            );
+                        }
                         self.failures = 0;
                         self.logged.clear();
                         self.save = Save::At(at, name, None);
