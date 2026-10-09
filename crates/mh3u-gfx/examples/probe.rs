@@ -3,11 +3,12 @@ fn main() -> anyhow::Result<()> {
     mh3u_gfx::run(|d| {
         let info = d.adapter.get_info();
         println!("adapter: {} ({:?}, {:?})", info.name, info.backend, info.device_type);
-        let size = d.window.inner_size();
-        let caps = d.surface.get_capabilities(&d.adapter);
+        let (window, surface) = (d.window.as_ref().expect("a window"), d.surface.as_ref().expect("a surface"));
+        let size = window.inner_size();
+        let caps = surface.get_capabilities(&d.adapter);
         let format = caps.formats[0];
         println!("surface {}x{} {:?} modes {:?}", size.width, size.height, format, caps.present_modes);
-        d.surface.configure(
+        surface.configure(
             &d.device,
             &wgpu::SurfaceConfiguration {
                 usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
@@ -22,7 +23,7 @@ fn main() -> anyhow::Result<()> {
             },
         );
         for i in 0..180 {
-            let frame = d.surface.get_current_texture();
+            let frame = surface.get_current_texture();
             let wgpu::CurrentSurfaceTexture::Success(frame) = frame else {
                 println!("no frame: {:?}", "x");
                 break;

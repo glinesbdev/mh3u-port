@@ -162,10 +162,15 @@ struct Out { @builtin(position) position: vec4<f32>, @location(0) uv: vec2<f32> 
 
 impl Gx2 {
     pub fn new(d: Display) -> Gx2 {
-        let size = d.window.inner_size();
-        let caps = d.surface.get_capabilities(&d.adapter);
+        let size = d
+            .window
+            .as_ref()
+            .map_or(winit::dpi::PhysicalSize::new(1280, 720), |w| w.inner_size());
+        let caps = d.surface.as_ref().map(|s| s.get_capabilities(&d.adapter));
         // the game's colours are already in the display's encoding, so a surface that does not encode them again
-        let format = caps.formats.iter().copied().find(|f| !f.is_srgb()).unwrap_or(caps.formats[0]);
+        let format = caps.as_ref().map_or(wgpu::TextureFormat::Bgra8Unorm, |caps| {
+            caps.formats.iter().copied().find(|f| !f.is_srgb()).unwrap_or(caps.formats[0])
+        });
         let config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
             format,
@@ -173,11 +178,13 @@ impl Gx2 {
             height: size.height.max(1),
             present_mode: wgpu::PresentMode::Fifo,
             desired_maximum_frame_latency: 2,
-            alpha_mode: caps.alpha_modes[0],
+            alpha_mode: caps.as_ref().map_or(wgpu::CompositeAlphaMode::Auto, |caps| caps.alpha_modes[0]),
             view_formats: vec![],
             color_space: wgpu::SurfaceColorSpace::Auto,
         };
-        d.surface.configure(&d.device, &config);
+        if let Some(surface) = &d.surface {
+            surface.configure(&d.device, &config);
+        }
         let module = d.device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("blit"),
             source: wgpu::ShaderSource::Wgsl(BLIT.into()),
@@ -483,19 +490,22 @@ impl Gx2 {
     /// Shows the TV picture, scaled to the window with the picture's proportions kept.
     fn present(&mut self) {
         self.flush_draws();
-        let size = self.d.window.inner_size();
+        let (Some(window), Some(surface)) = (&self.d.window, &self.d.surface) else {
+            return;
+        };
+        let size = window.inner_size();
         if size.width == 0 || size.height == 0 {
             return;
         }
         if size.width != self.config.width || size.height != self.config.height {
             self.config.width = size.width;
             self.config.height = size.height;
-            self.d.surface.configure(&self.d.device, &self.config);
+            surface.configure(&self.d.device, &self.config);
         }
-        let frame = match self.d.surface.get_current_texture() {
+        let frame = match surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(f) | wgpu::CurrentSurfaceTexture::Suboptimal(f) => f,
             wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
-                self.d.surface.configure(&self.d.device, &self.config);
+                surface.configure(&self.d.device, &self.config);
                 return;
             }
             _ => return,
@@ -1092,6 +1102,26 @@ impl Gx2 {
     }
 }
 
+/// A context with every register zero (for the tests).
+#[cfg(test)]
+pub(crate) fn blank_ctx() -> Ctx {
+    Ctx {
+        r: [0; 32],
+        f: [0; 32],
+        ps1: [0; 32],
+        cr: 0,
+        xer: 0,
+        lr: 0,
+        ctr: 0,
+        fpscr: 0,
+        gqr: [0; 8],
+        reservation: 0,
+        has_reservation: 0,
+        tb: 0,
+        mem: std::ptr::null_mut(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1140,24 +1170,6 @@ mod tests {
             .collect::<Vec<_>>()
         );
         assert_eq!(immediate.len(), 8);
-    }
-
-    fn blank_ctx() -> Ctx {
-        Ctx {
-            r: [0; 32],
-            f: [0; 32],
-            ps1: [0; 32],
-            cr: 0,
-            xer: 0,
-            lr: 0,
-            ctr: 0,
-            fpscr: 0,
-            gqr: [0; 8],
-            reservation: 0,
-            has_reservation: 0,
-            tb: 0,
-            mem: std::ptr::null_mut(),
-        }
     }
 
     #[test]
