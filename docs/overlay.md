@@ -84,13 +84,14 @@ that is not optional. So the six modules the wishlist needs are copied into `cra
 function that needs the drop tables were left out). If the companion puts its `/proc` reader behind `cfg(unix)` or a feature, the
 copy can become a git dependency (the repository is private, so cargo would fetch it with `net.git-fetch-with-cli`).
 
-## Not verified yet
+## Run 27 (PR #11, merged in fab2efe): it works
 
-- **Finding the live save in the port.** Run 25 (PR #11's first test) never found it, with only MEM2 searched, for the header alone,
-  and the search on the game thread made the game stutter and the sound drop. Since the fix it is tested on fake memory with the
-  three copies, not on the game. Watch for `[overlay] the live save is at 0x… (why): <hunter>`, or the one `no live save: …` line
-  saying what was seen.
-- **The game data**, read from a real dump. The test that does it runs only with `MH3U_GAME_DIR` set, and there is no dump where
-  this was written. Watch for `[overlay] game data: N items, N recipes, N upgrades` at start.
-- **How it looks and feels**, and fullscreen on a real monitor: the tests run egui and the draw path on a no-op GPU, and the window
-  logic only as functions.
+- **The live save was found** at `0x2e686b00` (Shamus), by the hunter's name with the word at +0x24 pointing at itself. That is the
+  port's form of the companion's header; the word at +0x08 is 0 here. The first search, before the hunter was loaded, found nothing
+  and the next one 5 s later found it.
+- **The game data** loaded once from the dump: 1551 items, 2155 recipes, 1437 upgrades.
+- **Item counts, have/need per material and the shopping list are correct** against the game.
+- **No flicker**: the filter box can be typed in. No stutter or audio pops while the search runs.
+- **Fullscreen works**, with the picture's proportions kept.
+- **Still open:** what the word at +0x08 holds in the port (0) against Cemu (a pointer); the clipboard and cursor icon for egui;
+  hooks patched in at translation time.

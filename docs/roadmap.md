@@ -4,8 +4,10 @@ What comes after the current work. Order: graphics and performance, then audio (
 
 ## After audio: mod hooks and an overlay
 
-**Started in PR #11** (`overlay.md`): the overlay, read-only memory through frame snapshots, and the wishlist. Still to do: hooks
-patched in at translation time, and native in-game menus.
+**First milestone done in PR #11** (merged in fab2efe; confirmed in run 27, see `overlay.md`): the overlay (F1 or Back + RB),
+read-only memory through frame snapshots and a search thread, the blacksmith wishlist over the live save (have/need, a shopping
+list, notices), and borderless fullscreen. Still to do: hooks patched in at translation time (so mods hear of events instead of
+reading memory), more overlay features from the companion (drops, hunt plans), and native in-game menus.
 
 A layer for mods that read the game without changing it:
 
