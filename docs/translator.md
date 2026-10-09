@@ -126,6 +126,14 @@ and the C library, `sync.rs` for threads and what they wait on) or, when none is
   wait (locked mutex, unset event, sleep), yields, or ends. A waiting function is run again when its thread gets the baton back.
   This makes runs repeatable; the cost is that a thread that waits by spinning on memory, never calling the system, would hold the
   baton forever, and that all guest threads share one core of the host for now.
+  The baton goes to the next ready thread in thread order (a sleeping thread stays ready and looks at the clock when the baton
+  reaches it). Each guest thread has its own condition variable, so a handoff wakes only the host thread that receives the baton;
+  a thread that has ended is never woken again (its host thread ends if its entry function returned, and parks for good if it
+  called `OSExitThread` from inside translated code). The baton used to be one condition variable woken for all on every pass, with
+  ended threads waiting on it forever: every pass woke every one of them, so the cost grew with each thread the game had finished
+  (a Windows profile had 64% of the time in the ended threads' waits; the kernel test `baton_goes_round_the_live_threads_in_order`
+  measures it: 50 ended and 8 live threads went from about 150 us per pass to 5 us). With `MH3U_GFX_TIMES=1` a `[baton]` line
+  every report window gives the passes and idle sleeps per frame and how many guest threads have ended.
 - **Data imports** (variables the loader fills in, such as the default-heap function pointers) get an address the runtime treats as the
   function's entry, so a call through them reaches the same handler.
 - **Relocations of the code**: the file holds stale halves in the `lis`/`addi`/`lwz` that build the address of an import; the
@@ -240,7 +248,7 @@ with their text and the cloth background, upright, in the right places (the hunt
   right stick, Enter A, Backspace B, X, C the X and Y buttons, I/J/K/L the D-pad, Q/E L and R, 1/3 ZL and ZR, P plus, O minus, Left
   and Right Shift the stick clicks. A pushed stick also
   sets the stick's direction buttons (the menus read those). Gamepad face buttons go by label (the Xbox A is the GamePad's A); `MH3U_PAD_LAYOUT=position` puts them where the GamePad's are. The gamepad thread takes the pending events without waiting and sleeps 4 ms when there are none (it used to wait in
-  gilrs's blocking call, and a Windows profile found it taking a whole core); `MH3U_GAMEPADS=0` turns gamepads off entirely (no thread,
+  gilrs's blocking call; a Windows profile seemed to put a whole core there, but the time was the baton's, see Threads above); `MH3U_GAMEPADS=0` turns gamepads off entirely (no thread,
   no backend), for comparing. The mouse is the touch panel (the picture is the TV's, so it only matters once
   the GamePad's screen is shown). `VPADGetTPCalibratedPoint` scales the raw touch values (0 to 4095) to 1280 x 720 (a guess). The Wii
   Remote and Pro Controller functions (`KPAD*`, `WPAD*`) are not answered: no controller of those kinds exists for the game.
