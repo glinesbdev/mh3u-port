@@ -236,6 +236,9 @@ impl Overlay {
                             .unwrap_or_default();
                         eprintln!("[overlay] the live save is at {at:#x} ({why}): {name}");
                         mods::watch(&[(at, live::LEN)]);
+                        // MH3U_WATCH=live: log the stores to it, to find the functions to hook (docs/hooks.md)
+                        let (lo, hi) = live::WATCH_SPAN;
+                        mods::watch_writes(at + lo, at + hi, Box::new(move |a| live::field(a - at)));
                         self.failures = 0;
                         self.logged.clear();
                         self.save = Save::At(at, name, None);

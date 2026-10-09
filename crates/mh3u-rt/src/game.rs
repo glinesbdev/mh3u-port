@@ -266,6 +266,9 @@ extern "C" fn enter(c: *mut Ctx, function: u32) {
 extern "C" fn watch(c: *mut Ctx, address: u32, value: u64, size: u32) {
     // SAFETY: `c` is the context the translated code passed us
     let (lr, r1) = unsafe { ((*c).lr, (*c).r[1]) };
+    if crate::mods::report_write(address, value, size, lr) {
+        return;
+    }
     let thread = lock().as_ref().map_or(99, |k| k.current);
     eprintln!("[watch] thread {thread}: {size} bytes at {address:#x} <- {value:#x}   (lr {lr:#x}, sp {r1:#x})");
 }
@@ -691,7 +694,22 @@ pub fn run(library: &Path, pieces: &[Piece], options: Options) -> Result<Report>
             });
         }
     }
-    if let Ok(spec) = std::env::var("MH3U_WATCH") {
+    if std::env::var("MH3U_WATCH").is_ok_and(|v| v.trim() == "live") {
+        // the range is set when the overlay finds the live save (docs/hooks.md)
+        // SAFETY: the symbols exist only in a library built with the watch, with these signatures
+        match unsafe {
+            (
+                lib.get::<unsafe extern "C" fn(u32, u32)>(b"game_set_watch\0"),
+                lib.get::<unsafe extern "C" fn() -> u32>(b"game_last_function\0"),
+            )
+        } {
+            (Ok(set), Ok(last)) => {
+                let _ = crate::mods::WATCH_FNS.set((*set, *last));
+                eprintln!("[watch-live] on: the live save's items, equipment and money are watched once the overlay finds it");
+            }
+            _ => eprintln!("MH3U_WATCH=live is set but the library was not built with --watch"),
+        }
+    } else if let Ok(spec) = std::env::var("MH3U_WATCH") {
         // "address,length" in hex: report every store to that range (needs a library built with --watch)
         let mut parts = spec.split(',').map(|p| u32::from_str_radix(p.trim_start_matches("0x"), 16));
         if let (Some(Ok(lo)), Some(Ok(len))) = (parts.next(), parts.next()) {

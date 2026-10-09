@@ -8,6 +8,8 @@ param(
     [switch]$Profile,
     # Optimise the game's C across files when linking (build-game --lto; needs clang and lld; the link takes longer).
     [switch]$Lto,
+    # A debugging build that reports stores to a watched range (build-game --watch; slower). Use a separate -Out for it. See docs/hooks.md.
+    [switch]$Watch,
     # Translate the game into -Out again first (needed after the translator changes; done anyway when -Out has no game.h).
     [switch]$Translate,
     # Where the translated C and game.dll go (outside any git working tree).
@@ -53,6 +55,9 @@ try {
     $buildArgs = @('build-game', $Out, '--native')
     if ($Lto) {
         $buildArgs += '--lto'
+    }
+    if ($Watch) {
+        $buildArgs += '--watch'
     }
     Step $tools $buildArgs
     Write-Host "built $tools and $(Join-Path $Out 'game.dll')"

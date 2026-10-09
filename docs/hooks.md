@@ -43,6 +43,39 @@ Hooks work end to end. Five hooks (0x02000020, 0x02000084, 0x020000e4, 0x0200017
 installed (`[hooks] 5 hooks installed`). Each fired with sensible arguments. For example, `0x020000e4` was called over and over
 from one lr (`0x3122638`), with r3 stepping through `0x108001xx`–`0x108002xx`, which looks like a constructor walking a table.
 
+## Finding hook points (step 5, PR #14)
+
+`MH3U_WATCH=live`, in a watch build, logs every write the game makes to the live save once the overlay finds it. That covers
+money, the worn equipment, the pouch, the item box and the equipment box (`live::WATCH_SPAN`).
+- **Each line names** the field (`pouch 3 count`, `box 120 id`, `equipment 7`, `money`), the value written, the function most
+  recently entered (`f_XXXXXXXX`, the writer or a function it just called), and the lr (the writer's caller, or the return
+  address of its last call).
+- **Repeats are cut:** for each writer (function, lr and field kind), the first 5 writes are logged, then every 100th.
+
+### What to run (PowerShell)
+
+```powershell
+git pull; git checkout mods/hook-points
+# a watch build in its own folder (the normal build in ...\mh3u\c is left alone)
+.\scripts\win-build.ps1 -Watch -Out "$env:LOCALAPPDATA\mh3u\c-watch"
+$env:MH3U_WATCH = 'live'
+.\scripts\win-run.ps1 -Out "$env:LOCALAPPDATA\mh3u\c-watch" *> "$env:USERPROFILE\Desktop\watch.log"
+Remove-Item Env:MH3U_WATCH
+```
+
+1. Load the hunter and wait for `[watch-live] watching ...` in the log (it appears when the overlay finds the live save).
+2. Do each action once, with a few seconds' pause between them, and **note the order you did them in**:
+   1. pick up a gathering item (pouch item added);
+   2. use or drop a pouch item (removed);
+   3. move an item between the pouch and the box at the item box;
+   4. buy or sell something (money);
+   5. craft or upgrade a piece at the smithy (equipment added, materials removed);
+   6. start a quest, then come back from it (quest start and end; not watched directly, but the pouch and the supplies change).
+3. Quit, and send `Desktop\watch.log` back (attach it), with the order of the actions.
+
+From that log, the functions that wrote each field go into `mods/hooks.txt`. Menu-open and quest hooks need a second pass:
+`MH3U_ENTER_LR` on the callers found here, or watching a menu or quest field once one is known.
+
 ## Plan
 
 1. Write this doc. **(done)**
@@ -57,5 +90,6 @@ from one lr (`0x3122638`), with r3 stepping through `0x108001xx`–`0x108002xx`,
 
 See the bottom of this file. It is updated with each commit of PR #13.
 
-- Status: milestone 1 is merged (PR #13) and proven in run 28.
-- Next: step 5, finding real gameplay addresses (PR #14, branch `mods/hook-points`).
+- Status: step 5 started (draft PR #14). The `MH3U_WATCH=live` tool and `win-build.ps1 -Watch` are ready.
+- Next: the user runs the steps above and sends `watch.log`. The writers found go into `mods/hooks.txt`, then a run with
+  `MH3U_HOOK_LOG=1` confirms them.

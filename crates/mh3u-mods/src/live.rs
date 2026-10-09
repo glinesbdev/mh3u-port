@@ -241,3 +241,40 @@ pub(crate) mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 }
+
+/// The part of the live save `MH3U_WATCH=live` watches (offsets from the block): money, the worn equipment, the pouch, the item box
+/// and the equipment box.
+pub const WATCH_SPAN: (u32, u32) = (0x49, 0x1150 + 1000 * 16);
+
+/// What a byte of the live save at `offset` is, for the write log: `pouch 3 count`, `box 120 id`, `equipment 7`, `money`...
+pub fn field(offset: u32) -> String {
+    let slot = |base: u32, len: u32| ((offset - base) / len, (offset - base) % len);
+    match offset {
+        0x49..0x4d => "money".into(),
+        0xc0..0xd0 => "worn equipment".into(),
+        0xd0..0x130 => {
+            let (n, b) = slot(0xd0, 4);
+            format!("pouch {n} {}", if b < 2 { "id" } else { "count" })
+        }
+        0x1b0..0x1150 => {
+            let (n, b) = slot(0x1b0, 4);
+            format!("box {n} {}", if b < 2 { "id" } else { "count" })
+        }
+        0x1150..0x4fd0 => format!("equipment {}", slot(0x1150, 16).0),
+        _ => format!("save +{offset:#x}"),
+    }
+}
+
+#[cfg(test)]
+mod field_tests {
+    #[test]
+    fn writes_are_named_by_field() {
+        use super::field;
+        assert_eq!(field(0x4a), "money");
+        assert_eq!(field(0xd0), "pouch 0 id");
+        assert_eq!(field(0xd6), "pouch 1 count");
+        assert_eq!(field(0x1b0 + 4 * 120), "box 120 id");
+        assert_eq!(field(0x1150 + 16 * 7 + 3), "equipment 7");
+        assert_eq!(field(0x60), "save +0x60");
+    }
+}

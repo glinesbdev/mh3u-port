@@ -277,3 +277,76 @@ mod tests {
         assert_eq!(searching(), Searching::Idle);
     }
 }
+
+/// `MH3U_WATCH=live` (a `--watch` build, `docs/hooks.md`): stores into a range found at run time (the live save) are logged with
+/// what they write (a label from `label`), the function most recently entered and the link register, so the functions that
+/// change items, equipment and money can be found and hooked.
+pub struct WriteWatch {
+    label: Box<dyn Fn(u32) -> String + Send + Sync>,
+    seen: Mutex<std::collections::HashMap<(u32, u32, String), u32>>,
+}
+
+/// The watch build's `game_set_watch` and `game_last_function`, when `MH3U_WATCH=live`.
+pub(crate) static WATCH_FNS: std::sync::OnceLock<(unsafe extern "C" fn(u32, u32), unsafe extern "C" fn() -> u32)> =
+    std::sync::OnceLock::new();
+static WRITE_WATCH: Mutex<Option<Arc<WriteWatch>>> = Mutex::new(None);
+
+/// Watches stores to `lo..hi` (guest addresses), naming each with `label(address)`. False when this is not an `MH3U_WATCH=live`
+/// run of a watch build (then nothing is watched).
+pub fn watch_writes(lo: u32, hi: u32, label: Box<dyn Fn(u32) -> String + Send + Sync>) -> bool {
+    let Some((set, _)) = WATCH_FNS.get() else { return false };
+    *WRITE_WATCH.lock().unwrap_or_else(|e| e.into_inner()) = Some(Arc::new(WriteWatch {
+        label,
+        seen: Default::default(),
+    }));
+    crate::guest::WATCH.0.store(lo, std::sync::atomic::Ordering::Relaxed);
+    crate::guest::WATCH.1.store(hi, std::sync::atomic::Ordering::Relaxed);
+    // SAFETY: the watch build's own function, with this signature
+    unsafe { set(lo, hi) };
+    eprintln!("[watch-live] watching {lo:#x}..{hi:#x}: pick up, use, sell or craft things now");
+    true
+}
+
+/// Whether a store's log line is printed: the first 5 from each writer (function, lr, field kind), then every 100th.
+pub fn should_report(count: u32) -> bool {
+    count < 5 || count.is_multiple_of(100)
+}
+
+/// Logs a watched store in a live watch; false when there is none (the plain watch log then reports it).
+pub(crate) fn report_write(address: u32, value: u64, size: u32, lr: u32) -> bool {
+    let Some(w) = WRITE_WATCH.lock().unwrap_or_else(|e| e.into_inner()).clone() else {
+        return false;
+    };
+    let Some((_, last)) = WATCH_FNS.get() else { return false };
+    // SAFETY: a plain read of a global of the watch build
+    let function = unsafe { last() };
+    let label = (w.label)(address);
+    let kind = label.split(' ').filter(|p| p.parse::<u32>().is_err()).collect::<Vec<_>>().join(" ");
+    let count = {
+        let mut seen = w.seen.lock().unwrap_or_else(|e| e.into_inner());
+        let n = seen.entry((function, lr, kind)).or_insert(0);
+        *n += 1;
+        *n - 1
+    };
+    if should_report(count) {
+        eprintln!(
+            "[watch-live] {label} <- {value:#x} ({size} bytes at {address:#x}) by f_{function:08x}, lr {lr:#x}{}",
+            if count > 0 {
+                format!(" (write {} from here)", count + 1)
+            } else {
+                String::new()
+            }
+        );
+    }
+    true
+}
+
+#[cfg(test)]
+mod write_watch_tests {
+    #[test]
+    fn reports_are_rate_limited_per_writer() {
+        let shown: Vec<u32> = (0..250).filter(|&n| super::should_report(n)).collect();
+        assert_eq!(shown, vec![0, 1, 2, 3, 4, 100, 200]);
+        assert!(!super::watch_writes(0, 4, Box::new(|_| String::new())), "not a live watch run");
+    }
+}
