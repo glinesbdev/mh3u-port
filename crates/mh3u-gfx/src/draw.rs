@@ -5,7 +5,9 @@ use crate::gx2::Gx2;
 use crate::shader_cache::{FrontCache, Lookup, Ranges};
 use crate::state::State;
 use mh3u_latte::decode::decode;
-use mh3u_latte::translate::{Context, Interface, PixelInputs, TexKind, VertexAttribute, VertexInputs, translate_pixel, translate_vertex};
+use mh3u_latte::translate::{
+    Context, IDENTITY_SELECT, Interface, PixelInputs, TexKind, VertexAttribute, VertexInputs, translate_pixel, translate_vertex,
+};
 use mh3u_rt::Guest;
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
@@ -64,8 +66,30 @@ pub struct GeometryEntry {
 pub type Fetch = Arc<[AttribStream]>;
 /// The front key of a vertex shader: (shader, program, size, fetch shader version, half z).
 pub type VertexFront = (u32, u32, u32, usize, bool);
-/// The front key of a pixel shader: (shader, program, size, hash of the words its inputs are made from, texture kinds).
-pub type PixelFront = (u32, u32, u32, u64, [u8; 18]);
+/// What else a pixel shader's translation depends on: the kinds and component selectors of the textures it reads, and the alpha test.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct PixelVariant {
+    pub kinds: [TexKind; 18],
+    pub selects: [u32; 18],
+    /// The alpha test's comparison and the bits of its reference; (7, 0), always, when it is off.
+    pub alpha: (u32, u32),
+}
+
+/// The front key of a pixel shader: (shader, program, size, hash of the words its inputs are made from, what else it depends on).
+pub type PixelFront = (u32, u32, u32, u64, PixelVariant);
+
+/// The loop constants a shader brings (`GX2LoopVar`s: the register's byte offset from the first loop constant, and its value), by
+/// the loop constant's number.
+fn loop_constants(g: &Guest, count: u32, list: u32) -> [Option<u32>; 32] {
+    let mut out = [None; 32];
+    for k in 0..count.min(32) {
+        let (offset, value) = (g.u32(list + 8 * k), g.u32(list + 8 * k + 4));
+        if let Some(slot) = out.get_mut((offset / 4) as usize) {
+            *slot = Some(value);
+        }
+    }
+    out
+}
 
 /// The front key of a geometry pipeline: the vertex and geometry shaders, their three programs (start, size), the fetch shader version,
 /// half z, and the ring item sizes (es and gs vec4s), everything its translation depends on besides the program bytes.
@@ -639,9 +663,10 @@ impl Gx2 {
                     divisor: a.divisor,
                 })
                 .collect();
-            let ctx = Context {
-                texture_kind: &|_| TexKind::D2,
-            };
+            let constants = loop_constants(g, g.u32(vs + 0xf4), g.u32(vs + 0xf8));
+            let loop_const = move |n: u32| constants.get(n as usize).copied().flatten();
+            let mut ctx = Context::new(&|_| TexKind::D2);
+            ctx.loop_const = &loop_const;
             translate_vertex(
                 &decoded,
                 &VertexInputs {
@@ -669,7 +694,7 @@ impl Gx2 {
         compiled
     }
 
-    fn pixel_shader(&mut self, g: &Guest, ps: u32, semantics_at: u32, kinds: &[TexKind; 18]) -> Option<Arc<Compiled>> {
+    fn pixel_shader(&mut self, g: &Guest, ps: u32, semantics_at: u32, variant: &PixelVariant) -> Option<Arc<Compiled>> {
         // what the translation depends on besides the program: the words the inputs are made from, and the texture kinds
         let count = g.u32(ps + 0x10).min(32);
         let mut words = [0u32; 1 + 32 + 10];
@@ -683,7 +708,7 @@ impl Gx2 {
         let words_bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
         let (size, program) = (g.u32(ps + 0xa4), g.u32(ps + 0xa8));
         let size = size.min(1 << 20);
-        let front = (ps, program, size, hash_fast(&words_bytes, 0x9), kinds.map(|k| k as u8));
+        let front = (ps, program, size, hash_fast(&words_bytes, 0x9), *variant);
         let swaps = self.swaps;
         let (found, how) = self.caches.pixel_front.get(&front, swaps, |r| hash_ranges(g, r));
         count_lookup(&how, "pixel shader hits", "pixel shader checks", "pixel shader misses");
@@ -691,14 +716,14 @@ impl Gx2 {
             return c;
         }
         let ranges = [(program, size), (0, 0), (0, 0)];
-        let compiled = self.pixel_shader_slow(g, ps, semantics_at, kinds);
+        let compiled = self.pixel_shader_slow(g, ps, semantics_at, variant);
         let hash = hash_ranges(g, &ranges);
         self.caches.pixel_front.insert(front, ranges, hash, swaps, compiled.clone());
         compiled
     }
 
     /// The pixel shader from its program bytes and inputs: translated once for each.
-    fn pixel_shader_slow(&mut self, g: &Guest, ps: u32, semantics_at: u32, kinds: &[TexKind; 18]) -> Option<Arc<Compiled>> {
+    fn pixel_shader_slow(&mut self, g: &Guest, ps: u32, semantics_at: u32, variant: &PixelVariant) -> Option<Arc<Compiled>> {
         // the inputs: pixel input i takes the vertex shader's output with the same semantic
         let count = g.u32(ps + 0x10).min(32);
         let vs_semantics: Vec<u32> = (0..40u32)
@@ -721,17 +746,22 @@ impl Gx2 {
         g.read(program, &mut code);
         let key = (
             ps,
-            hash_fast(&code, 0) ^ hash_of(&(inputs.count, &inputs.flat, &inputs.locations, kinds.map(|k| k as u8))),
+            hash_fast(&code, 0) ^ hash_of(&(inputs.count, &inputs.flat, &inputs.locations, variant)),
         );
         if let Some(c) = self.caches.pixel.get(&key) {
             return c.clone();
         }
-        let kinds = *kinds;
+        let PixelVariant { kinds, selects, alpha } = *variant;
+        let constants = loop_constants(g, g.u32(ps + 0xc8), g.u32(ps + 0xcc));
         let result = (|| {
             let decoded = decode(&code).map_err(|e| e.to_string())?;
-            let ctx = Context {
-                texture_kind: &move |r| kinds.get(r as usize).copied().unwrap_or(TexKind::D2),
-            };
+            let kind = move |r: u32| kinds.get(r as usize).copied().unwrap_or(TexKind::D2);
+            let select = move |r: u32| selects.get(r as usize).copied().unwrap_or(IDENTITY_SELECT);
+            let loop_const = move |n: u32| constants.get(n as usize).copied().flatten();
+            let mut ctx = Context::new(&kind);
+            ctx.texture_select = &select;
+            ctx.loop_const = &loop_const;
+            ctx.alpha_test = (alpha.0 != 7).then_some((alpha.0, f32::from_bits(alpha.1)));
             translate_pixel(&decoded, &inputs, &ctx)
         })();
         let compiled = match result {
@@ -1547,13 +1577,22 @@ impl Gx2 {
             let t = &self.targets[&image];
             (t.texture.width(), t.texture.height(), t.format)
         };
-        // the textures the pixel shader will look at, to know their kinds
-        let mut kinds = [TexKind::D2; 18];
-        for (unit, kind) in kinds.iter_mut().enumerate() {
+        // the textures the pixel shader will look at, to know their kinds and component selectors, and the alpha test
+        let mut variant = PixelVariant {
+            kinds: [TexKind::D2; 18],
+            selects: [IDENTITY_SELECT; 18],
+            alpha: (7, 0),
+        };
+        for unit in 0..18 {
             let t = st.pixel_textures[unit];
             if t != 0 {
-                *kind = tex_kind(g.u32(t), g.u32(t + 0x14));
+                variant.kinds[unit] = tex_kind(g.u32(t), g.u32(t + 0x14));
+                variant.selects[unit] = g.u32(t + 0x84) & 0x0707_0707;
             }
+        }
+        let (alpha_on, alpha_func, alpha_ref) = st.alpha_test;
+        if alpha_on && alpha_func & 7 != 7 {
+            variant.alpha = (alpha_func & 7, alpha_ref.to_bits());
         }
         lap.mark("target and kinds");
         let geometry = st.geometry_shader != 0 && st.shader_mode == 2;
@@ -1582,7 +1621,7 @@ impl Gx2 {
             }
         };
         let semantics_at = geo.as_ref().map_or(st.vertex_shader + 0x10, |x| x.semantics_at);
-        let Some(ps) = self.pixel_shader(g, st.pixel_shader, semantics_at, &kinds) else {
+        let Some(ps) = self.pixel_shader(g, st.pixel_shader, semantics_at, &variant) else {
             *self.caches.skipped.entry("pixel shader not translated").or_default() += 1;
             return;
         };

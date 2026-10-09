@@ -224,9 +224,7 @@ impl Gx2 {
                 gs_vec4,
                 max_vertices,
             };
-            let ctx = Context {
-                texture_kind: &|_| TexKind::D2,
-            };
+            let ctx = Context::new(&|_| TexKind::D2);
             let attributes = fetch
                 .iter()
                 .enumerate()

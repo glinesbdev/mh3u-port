@@ -10,9 +10,7 @@ use std::collections::BTreeMap;
 pub fn wgsl(pack: &[u8], show: Option<usize>) -> Result<()> {
     use mh3u_latte::translate::{Context, PixelInputs, TexKind, translate_pixel};
     let files = gfd::parse_pack(pack)?;
-    let ctx = Context {
-        texture_kind: &|_| TexKind::D2,
-    };
+    let ctx = Context::new(&|_| TexKind::D2);
     let inputs = PixelInputs {
         count: 8,
         flat: vec![false; 8],
