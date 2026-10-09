@@ -5,7 +5,7 @@ is translated ahead of time into C, built into a library on the owner's machine,
 the console's system libraries, with the graphics on `wgpu`. It starts, reaches its character screen and the village, draws them with
 translated shaders, and reads keyboard, mouse and gamepads; much of the graphics is incomplete and there is no sound yet. Tested on
 Linux; the Windows build is checked from Linux (see [`docs/windows.md`](docs/windows.md) for building and running it there). Read [`docs/pc-port.md`](docs/pc-port.md) for what the project is meant to be, [`docs/spikes.md`](docs/spikes.md)
-for what was measured before it was built, and [`docs/translator.md`](docs/translator.md) for how the translator, the runtime and the
+for what was measured before it was built, [`docs/performance.md`](docs/performance.md) for measured costs and open performance concerns, and [`docs/translator.md`](docs/translator.md) for how the translator, the runtime and the
 graphics work and what is not done.
 
 **You must own the game.** This repository contains no game code and no game data, and the port will not run without your own dump of
