@@ -206,6 +206,10 @@ with their text and the cloth background, upright, in the right places (the hunt
     and uploaded with one write per arena when the batch is flushed; a uniform block whose contents were already uploaded in the batch
     reuses those bytes (compared, not only hashed). The vertex streams' start table lives with the cached streams, and the geometry
     draws use the stream cache too.
+  - *Textures*: a texture already made is found by the five header words of its key in one look-up. `GX2Invalidate` over its memory
+    no longer throws it away: it is marked, and at its next use the header words and the bytes of its image and smaller levels are
+    hashed and compared with what it was decoded from; it is decoded again only if they differ (a hash pass instead of untiling every
+    texel). A marked texture not drawn for a second is forgotten, as an invalidated one was before.
   - *Bind groups*: cached by layout and the resources bound (`wgpu` handles compare by identity), pruned of what a second of frames did
     not use; pipelines keep their bind group layouts; texture, target and depth views are made once with their textures; samplers are
     keyed by the three `GX2Sampler` words, and the default and compare samplers are made once. A bind group with a per-draw snapshot
@@ -215,7 +219,9 @@ with their text and the cloth background, upright, in the right places (the hunt
 
   The reports: `MH3U_GFX_TIMES=1` gives each line as a total, a count, and both per frame (`[gfx times]` per graphics call, `[draw
   times]` per part of a draw, where "geometry pass" counts only the draws with a geometry shader), and `[draw counts]`: hits, checks
-  and misses of the shader caches, bind groups, texture views and uniform uploads, and the display list calls replayed and left out.
+  and misses of the shader caches, bind groups and uniform uploads, texture decodes (and bytes), textures invalidated and
+  invalidations of textures found unchanged, and the display list calls replayed and left out. "texture decode (in texture views)"
+  and "texture upload and hash (in texture views)" are timed inside "texture views", not added to it.
   `MH3U_TIMES_WINDOW=<seconds>` sets how long each report covers (10 by default); the per-frame numbers are the ones to compare
   between builds and scenes.
 - **Textures** (`texture.rs`): a `GX2Texture` is read from the guest, untiled texel by texel (`tiling::address`) and uploaded in the

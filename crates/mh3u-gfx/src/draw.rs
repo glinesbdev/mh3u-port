@@ -78,6 +78,32 @@ pub struct CachedTexture {
     pub mips: (u32, u32),
     /// The views the shaders read it through, made once: as a 2D texture, and as a cube (see `texture_view`).
     pub views: [Option<wgpu::TextureView>; 2],
+    /// What it was decoded from: a hash of the header's words and of the bytes of its image and smaller levels.
+    pub hash: u64,
+    /// `GX2Invalidate` covered its memory since it was decoded or checked: at its next use it is hashed again, and decoded again
+    /// only if the hash differs.
+    pub dirty: bool,
+    /// The swap it was last drawn with (an invalidated texture not drawn for a second is forgotten, see `prune`).
+    pub used: u32,
+}
+
+/// The words of a `GX2Texture` header that decoding reads (`texture::Header::read` reads up to 0x88).
+const TEXTURE_HEADER_BYTES: usize = 0x88;
+
+/// A hash of what a texture is decoded from: its header's words and the bytes of its image and of its smaller levels.
+fn texture_source_hash(g: &Guest, t: u32, h: &crate::texture::Header) -> u64 {
+    let mut buf = vec![0u8; TEXTURE_HEADER_BYTES];
+    g.read(t, &mut buf);
+    let mut hash = hash_fast(&buf, 0x7e);
+    for (at, size) in [(h.image, h.image_size), (h.mip_ptr, h.mip_size)] {
+        if at == 0 || size == 0 {
+            continue;
+        }
+        buf.resize(size.min(1 << 28) as usize, 0);
+        g.read(at, &mut buf);
+        hash = hash_fast(&buf, hash);
+    }
+    hash
 }
 
 pub struct PipelineEntry {
@@ -604,12 +630,67 @@ impl Gx2 {
         compiled
     }
 
-    /// Makes the texture at `t` (a `GX2Texture`) into a GPU texture, once until the game says it changed.
+    /// Makes the texture at `t` (a `GX2Texture`) into a GPU texture, once until the game says it changed (and it did: an invalidated
+    /// texture whose header and bytes hash the same is kept).
+    ///
+    /// The path taken for a texture already made reads the five header words of the key and does one look-up.
     fn texture_view(&mut self, g: &Guest, t: u32, kind: TexKind) -> Option<wgpu::TextureView> {
+        // the key: image, width, height, format, tile mode and dimension (as `texture::Header::read` reads them)
+        let key = (
+            g.u32(t + 0x24),
+            g.u32(t + 4),
+            g.u32(t + 8),
+            g.u32(t + 0x14),
+            g.u32(t + 0x30) ^ (g.u32(t) << 8),
+        );
+        let found = match self.caches.textures.get_mut(&key) {
+            Some(cached) if cached.dirty => {
+                let h = crate::texture::Header::read(g, t);
+                if texture_source_hash(g, t, &h) == cached.hash {
+                    Lap::count("texture invalidations of unchanged textures", 1);
+                    cached.dirty = false;
+                    cached.used = self.swaps;
+                    true
+                } else {
+                    self.caches.textures.remove(&key);
+                    false
+                }
+            }
+            Some(cached) => {
+                cached.used = self.swaps;
+                true
+            }
+            None => false,
+        };
+        if !found {
+            self.decode_texture(g, t, key)?;
+        }
+        let cached = self.caches.textures.get_mut(&key)?;
+        let slot = &mut cached.views[usize::from(kind == TexKind::Cube)];
+        if let Some(view) = slot {
+            return Some(view.clone());
+        }
+        let view = cached.texture.create_view(&wgpu::TextureViewDescriptor {
+            dimension: Some(match kind {
+                TexKind::Cube if cached.layers > 1 => wgpu::TextureViewDimension::D2Array,
+                _ => wgpu::TextureViewDimension::D2,
+            }),
+            array_layer_count: Some(if kind == TexKind::Cube { 6.min(cached.layers) } else { 1 }),
+            ..Default::default()
+        });
+        *slot = Some(view.clone());
+        Some(view)
+    }
+
+    /// Decodes the texture at `t` and keeps it under `key`; None if it cannot be read.
+    #[inline(never)]
+    fn decode_texture(&mut self, g: &Guest, t: u32, key: (u32, u32, u32, u32, u32)) -> Option<()> {
+        static TEXDUMP: std::sync::OnceLock<Option<std::ffi::OsString>> = std::sync::OnceLock::new();
+        let texdump = TEXDUMP.get_or_init(|| std::env::var_os("MH3U_GFX_TEXDUMP")).as_ref();
+        let mut lap = Lap::new();
         let h = crate::texture::Header::read(g, t);
-        let key = (h.image, h.width, h.height, h.format, h.tile_mode ^ (h.dim << 8));
-        if !self.caches.textures.contains_key(&key) {
-            if let Some(dir) = std::env::var_os("MH3U_GFX_TEXDUMP") {
+        {
+            if let Some(dir) = texdump {
                 let dir = std::path::Path::new(&dir);
                 let _ = std::fs::create_dir_all(dir);
                 let mut raw = vec![0u8; h.image_size.min(1 << 26) as usize];
@@ -620,9 +701,11 @@ impl Gx2 {
                 let _ = std::fs::write(dir.join(format!("{name}.image")), raw);
                 let _ = std::fs::write(dir.join(format!("{name}.header")), header);
             }
-            match crate::texture::decode(g, &h) {
+            let decoded = crate::texture::decode(g, &h);
+            lap.mark("texture decode (in texture views)");
+            match decoded {
                 Ok(d) => {
-                    if let Some(dir) = std::env::var_os("MH3U_GFX_TEXDUMP") {
+                    if let Some(dir) = texdump {
                         let name = format!(
                             "tex-{:08x}-{}x{}-f{:x}-m{}.decoded",
                             h.image, d.width, d.height, h.format, h.tile_mode
@@ -671,35 +754,25 @@ impl Gx2 {
                             range: (h.image, h.image.saturating_add(h.image_size)),
                             mips: (h.mip_ptr, h.mip_ptr.saturating_add(h.mip_size)),
                             views: [None, None],
+                            hash: texture_source_hash(g, t, &h),
+                            dirty: false,
+                            used: self.swaps,
                         },
                     );
+                    lap.mark("texture upload and hash (in texture views)");
+                    Lap::count("texture decodes", 1);
+                    Lap::count("texture bytes decoded", u64::from(h.image_size) + u64::from(h.mip_size));
+                    Some(())
                 }
                 Err(e) => {
                     self.report(format!(
                         "texture {t:#x} (format {:#x}, {}x{}, tile mode {}) not read: {e}",
                         h.format, h.width, h.height, h.tile_mode
                     ));
-                    return None;
+                    None
                 }
             }
         }
-        let cached = self.caches.textures.get_mut(&key)?;
-        let slot = &mut cached.views[usize::from(kind == TexKind::Cube)];
-        if let Some(view) = slot {
-            Lap::count("texture view hits", 1);
-            return Some(view.clone());
-        }
-        Lap::count("texture view misses", 1);
-        let view = cached.texture.create_view(&wgpu::TextureViewDescriptor {
-            dimension: Some(match kind {
-                TexKind::Cube if cached.layers > 1 => wgpu::TextureViewDimension::D2Array,
-                _ => wgpu::TextureViewDimension::D2,
-            }),
-            array_layer_count: Some(if kind == TexKind::Cube { 6.min(cached.layers) } else { 1 }),
-            ..Default::default()
-        });
-        *slot = Some(view.clone());
-        Some(view)
     }
 
     /// `GX2Invalidate` of shader memory: the translations made from programs there are looked up by their bytes again.
@@ -709,11 +782,17 @@ impl Gx2 {
         self.caches.geometry_front.invalidate(address, size);
     }
 
+    /// `GX2Invalidate` of texture memory: the textures it overlaps are checked against their bytes at their next use.
     pub(crate) fn invalidate_textures(&mut self, address: u32, size: u32) {
         let end = address.saturating_add(size);
-        self.caches
-            .textures
-            .retain(|_, t| (t.range.1 <= address || t.range.0 >= end) && (t.mips.1 <= address || t.mips.0 >= end));
+        let mut marked = 0;
+        for t in self.caches.textures.values_mut() {
+            if !((t.range.1 <= address || t.range.0 >= end) && (t.mips.1 <= address || t.mips.0 >= end)) {
+                t.dirty = true;
+                marked += 1;
+            }
+        }
+        Lap::count("textures invalidated", marked);
     }
 
     fn fallback_texture(&mut self, kind: TexKind) -> wgpu::TextureView {
@@ -1129,11 +1208,14 @@ impl Gx2 {
         group
     }
 
-    /// Once a second of frames: forgets the bind groups not used in that time (they keep their buffers and views alive).
+    /// Once a second of frames: forgets the bind groups not used in that time (they keep their buffers and views alive), and the
+    /// invalidated textures not drawn in that time.
     pub(crate) fn prune(&mut self) {
         let swaps = self.swaps;
         if swaps.is_multiple_of(60) {
             self.caches.bind_groups.retain(|_, e| e.1 + 60 >= swaps);
+            // an invalidated texture is kept in case its bytes did not change; one not drawn since goes as it did before
+            self.caches.textures.retain(|_, t| !t.dirty || t.used + 60 >= swaps);
         }
     }
 
@@ -1943,3 +2025,45 @@ impl BufRef {
 
 /// What a render pass draws into: the colour target, the depth target, and the number of colour outputs.
 type PassKey = (u32, Option<u32>, usize);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A texture header at 0x100 with its image at 0x1000 (0x100 bytes) and its smaller levels at 0x2000 (0x40 bytes), in a buffer
+    /// that stands for guest memory.
+    fn memory() -> Vec<u8> {
+        let mut m = vec![0u8; 0x3000];
+        let mut put = |at: usize, v: u32| m[at..at + 4].copy_from_slice(&v.to_be_bytes());
+        put(0x100 + 0x24, 0x1000);
+        put(0x100 + 0x20, 0x100);
+        put(0x100 + 0x2c, 0x2000);
+        put(0x100 + 0x28, 0x40);
+        put(0x100 + 4, 16);
+        put(0x100 + 8, 16);
+        m
+    }
+
+    fn hash(m: &mut [u8]) -> u64 {
+        let g = Guest::new(m.as_mut_ptr());
+        let h = crate::texture::Header::read(&g, 0x100);
+        texture_source_hash(&g, 0x100, &h)
+    }
+
+    #[test]
+    fn a_texture_is_decoded_again_only_when_what_it_is_made_from_changed() {
+        let mut m = memory();
+        let first = hash(&mut m);
+        assert_eq!(hash(&mut m), first, "same bytes, same hash");
+        // memory around it is not part of it
+        m[0x0fff] ^= 1;
+        m[0x1100] ^= 1;
+        m[0x2040] ^= 1;
+        assert_eq!(hash(&mut m), first);
+        for at in [0x1000, 0x10ff, 0x2000, 0x203f, 0x100 + 0x34, 0x100 + 0x84] {
+            let mut changed = memory();
+            changed[at] ^= 0x10;
+            assert_ne!(hash(&mut changed), first, "a change at {at:#x}");
+        }
+    }
+}
