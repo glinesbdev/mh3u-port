@@ -255,3 +255,78 @@ fn gx2_setup(gx2: &mut Gx2, c: &mut Ctx3, call: &mut impl FnMut(&mut Gx2, &mut C
     c.r[3] = 0x6_0000;
     call(gx2, c, Call::SetupContextStateEx);
 }
+
+/// What wgpu's own bookkeeping costs as GPU buffers pile up (`cargo test -p mh3u-gfx --release live_buffers_cost -- --nocapture`): a
+/// frame of 60 render passes and one submit, with few buffers alive and with as many as run 12 had (31,000 vertex streams, two buffers
+/// each). Each pass's usage scope is sized by the most buffers ever alive, so the cost per pass follows that number, not the draws.
+#[test]
+fn live_buffers_cost() {
+    let display = Display::noop();
+    let (device, queue) = (&display.device, &display.queue);
+    let target = device.create_texture(&wgpu::TextureDescriptor {
+        label: None,
+        size: wgpu::Extent3d {
+            width: 64,
+            height: 64,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba8Unorm,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+        view_formats: &[],
+    });
+    let view = target.create_view(&Default::default());
+    let frame = || {
+        let started = Instant::now();
+        for _ in 0..10 {
+            let mut enc = device.create_command_encoder(&Default::default());
+            for _ in 0..60 {
+                let _pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: None,
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &view,
+                        depth_slice: None,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Load,
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })],
+                    depth_stencil_attachment: None,
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                    multiview_mask: None,
+                });
+            }
+            queue.submit([enc.finish()]);
+        }
+        started.elapsed() / 10
+    };
+    let mut buffers = Vec::new();
+    let mut times = Vec::new();
+    for alive in [1_000usize, 62_000] {
+        while buffers.len() < alive {
+            buffers.push(device.create_buffer(&wgpu::BufferDescriptor {
+                label: None,
+                size: 256,
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            }));
+        }
+        frame();
+        let t = frame();
+        println!(
+            "[bench] {alive} buffers alive: a frame of 60 passes and a submit, {:.3} ms",
+            t.as_secs_f64() * 1e3
+        );
+        times.push(t);
+    }
+    // and after most of them are let go (the indices freed are used again, so new buffers do not push the size further)
+    buffers.truncate(1_000);
+    frame();
+    let t = frame();
+    println!("[bench] back to 1000 buffers alive: {:.3} ms", t.as_secs_f64() * 1e3);
+    assert_eq!(times.len(), 2);
+}

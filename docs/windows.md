@@ -118,7 +118,9 @@ still, or something grows), `[gfx pipelines]`, `[gfx invalidates]`, and an `[gfx
 the 180 frames after it went (`translator.md`). Pipelines are made on worker threads and kept in `$out\cache\pipelines`, so a second
 visit to an area, or a second run, does not hitch; `$env:MH3U_GFX_ASYNC_PIPELINES = 'off'` makes each draw wait for its pipeline
 instead (the old behaviour, for comparing), `$env:MH3U_GFX_PIPELINE_CACHE = 'off'` leaves the disk out, and deleting
-`$out\cache` is always safe.
+`$out\cache` is always safe. `[draw times]` also has `render pass end`, `arena uploads` and `submit` (wgpu's own work, which used to be the untimed part of
+`GX2DirectCallDisplayList`). `[gfx caches]` shows `vertex streams N (X MB)`, which should stay roughly flat while standing still.
+Leave `MH3U_GFX_DUMP_FRAME` unset when timing: writing the frame takes about 0.6 s and shows as the window's slowest frame.
 
 **Sampling profilers and the Rust side.** A `-gnullvm` build's PDB (`-C link-arg=-Wl,--pdb=`) holds only the public symbols
 (about 12 thousand): the Rust code's own functions are local symbols, which lld does not put in it, so Visual Studio's profiler

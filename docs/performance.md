@@ -34,7 +34,9 @@ move the village on its own.
 
 1. **Untimed time inside `GX2DirectCallDisplayList`.** In areas and fights it takes 16–19 ms per frame, but the timed draw
    steps add up to about 4 ms. The other 12+ ms is not measured. *Guess:* wgpu command encoding, submission or the flush at
-   the end of the list. First step: time encode, submit and flush separately.
+   the end of the list. Run 12 showed that most of this untimed part is wgpu's own bookkeeping, and that it grows with the
+   number of GPU buffers (concern 3). `[draw times]` now has `render pass end` (wgpu checks and records a whole pass when it
+   ends; the count is the number of passes), `arena uploads` and `submit`.
 2. **Pipeline creation when entering an area.** "pipeline" reached ~4 ms per frame in the first window after a load (0.2 ms
    otherwise). Run 11 (500c143): about 3.5 s of window 1 and 2.4 s of window 2 (village load, leaving for the field) went to
    it, against 0.1 ms a frame once the field was set up: the hitching the user feels on an area change. Texture decoding (at
@@ -43,7 +45,14 @@ move the village on its own.
    draws wait a frame or two instead of the frame waiting), and kept on disk (`<out>/cache/pipelines`) and made again at the
    next start, so a second visit or a second run should not compile at all while playing. `wgpu::PipelineCache` is not used
    (an `unsafe` call outside `mh3u-rt`; a decision for later). To verify: `[gfx] area change` lines should show "0 made with
-   the draw waiting" and a slowest frame near the others.
+   the draw waiting" and a slowest frame near the others. **Runs 12 and 13 (86ec8e0):**
+   - First run: every new pipeline was made on a worker (11, 55, 73, 78 a window), "0 made with the draw waiting". On
+     entering the field the frame with the change took 41.6 ms (12 new pipelines, 5 translations, 15 textures).
+   - Second run: `217 pipelines to make again` loaded from disk and all were made on workers at startup (1.0 s of worker
+     time). After that, 0 new pipelines all run. The field change frame was 89.3 ms, all of it 31 shader translations and
+     34 texture decodes. Pipelines no longer cause the hitch; translation and decoding do, and these are not kept on disk
+     yet (a possible next step).
+   - The 593 and 645 ms frames at 2400 are `MH3U_GFX_DUMP_FRAME` writing a frame, not the game.
 3. **Shader cache misses that never stop, and a replay that slows down.** About 30 pixel and 22–30 vertex shader misses per frame
    even while standing still (run 11 in the field: ~48 pixel, ~28 vertex and 4 geometry pipeline misses a frame). In run 11 the
    field's draws (~426 a frame) and replayed display-list calls (~6190) stayed the same from window 3 to 9, but
@@ -69,6 +78,34 @@ move the village on its own.
    program near, where the `retain` walked every entry); entries unused for 600 frames go, and past 16384 the least recently
    used. `[gfx caches]` now shows each cache's size, so if something else grows it will show. To verify: in the field the
    replay's ms per frame and `[gfx caches]` should stay flat from window to window.
+
+   **Runs 12 and 13 (86ec8e0): still slower over time; the cause was the vertex streams, not the shader caches.** Standing still
+   in the field, draws (~400 a frame) and the timed draw steps (~3.3 ms a frame) stayed flat, and so did the guest's time
+   outside graphics calls (~3.8 ms). Translations stayed at 16/76/1. `GX2DirectCallDisplayList` and one cache kept growing:
+
+   | run 12 window | fps | replay ms/frame | timed draw steps ms | vertex streams kept |
+   |---|---|---|---|---|
+   | 3 (entering) | 65.5 | 9.7 | 3.7 | 8,916 |
+   | 4 | 64.1 | 10.1 | 3.1 | 18,292 |
+   | 5 | 50.5 | 14.3 | 3.4 | 26,314 |
+   | 6 | 45.8 | 16.4 | 3.3 | 31,507 |
+
+   Run 13 was the same: 5,156 → 14,074 → 23,239 → 30,000 streams, replay 5.0 → 9.6 → 13.3 → 15.5 ms.
+   - Why the streams grew: 12–15 a frame are made from vertex bytes the game rewrites every frame, and a stream was only let go
+     once all of them passed 1 GiB.
+   - Why it costs time: each stream is two GPU buffers. wgpu sizes every render pass's and submit's bookkeeping by the most
+     buffers ever alive at once, so the cost per pass grows even with the draws unchanged. `live_buffers_cost` in
+     `draw_bench.rs` (wgpu's no-op device, release build) measured a frame of 60 passes and a submit:
+     - 1,000 buffers: 0.10–0.14 ms;
+     - 62,000 buffers: 2.1–3.3 ms;
+     - back to 1,000 buffers after the 62,000 were made: 3.4 ms, because it follows the peak.
+   - Fix: a stream not drawn with in a later frame than the one it was made in goes at the next prune (once a second); any
+     stream goes after 120 frames unused. `vertex_data_rewritten_every_frame_does_not_pile_up_streams` checks it: 1,000
+     frames of one mesh that stays and one rewritten every frame keep at most 64 streams. `[gfx caches]` shows the streams'
+     megabytes and `[draw counts]` shows `vertex streams aged out`.
+   - The shader fronts show 0 entries at each window's end because the game invalidates its shader memory every frame. The
+     content-keyed caches behind them catch every miss (translations stay flat), so this costs a constant ~0.3 ms (`shaders`),
+     not a slowdown.
 4. **Vertex bytes hashed.** 1.5–3.5 MB per frame are hashed to check vertex streams. XXH3 keeps it cheap (~0.2 ms), but
    tracking writes through `GX2Invalidate` could skip most of it.
 5. **Single core for guest threads.** All guest threads share one host core through the baton (`kernel.rs`). About 15 handoffs

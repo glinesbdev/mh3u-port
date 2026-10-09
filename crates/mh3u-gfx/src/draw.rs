@@ -377,6 +377,20 @@ pub struct StreamEntry {
     meta: wgpu::Buffer,
     size: u64,
     used: u32,
+    /// Drawn with in a later frame than the one it was made in (vertex data that changes every frame makes entries that never are).
+    reused: bool,
+}
+
+/// How long a decoded vertex stream is kept without being drawn with, in frames; one never drawn with after the frame it was made in
+/// goes at the next prune (see `keep_stream`).
+const STREAM_AGE: u32 = 120;
+
+/// Whether a vertex stream last drawn with in `used` is kept at `swaps`: not drawn with for `STREAM_AGE` frames, it goes; one made from
+/// bytes that were never drawn again (vertex data the game rewrites every frame) goes once its frame is over. Every stream is two GPU
+/// buffers, and wgpu's per-pass and per-submit bookkeeping grows with how many buffers there are (run 12: 31,000 streams, the replay
+/// three times slower at the same draws).
+pub(crate) fn keep_stream(used: u32, reused: bool, swaps: u32) -> bool {
+    used.saturating_add(STREAM_AGE) >= swaps && (reused || used.saturating_add(2) >= swaps)
 }
 
 /// A quick hash of bytes (eight at a time), for telling whether vertex data is what it was.
@@ -1178,7 +1192,7 @@ impl Gx2 {
         format!(
             "shader fronts: vertex {}, pixel {}, geometry {}; translations: vertex {}, pixel {}, geometry {}; pipelines: {} by shader \
              address, {} made, {} being made, {} left from the disk; fetch shaders {} distinct; bind groups {}; textures {}; vertex \
-             streams {}; index lists {}; uniform blocks {}",
+             streams {} ({:.1} MB); index lists {}; uniform blocks {}",
             c.vertex_front.len(),
             c.pixel_front.len(),
             c.geometry_front.len(),
@@ -1193,6 +1207,7 @@ impl Gx2 {
             c.bind_groups.len(),
             c.textures.len(),
             c.streams.len(),
+            c.stream_bytes as f64 / 1e6,
             c.indices.len(),
             c.uniforms.len()
         )
@@ -1575,6 +1590,9 @@ impl Gx2 {
         lap.mark("stream hash");
         if let Some(e) = self.caches.streams.get_mut(&key) {
             lap.mark("stream hit");
+            if e.used != swaps {
+                e.reused = true;
+            }
             e.used = swaps;
             let (buffer, meta) = (e.buffer.clone(), e.meta.clone());
             let size = e.size;
@@ -1616,7 +1634,7 @@ impl Gx2 {
         self.caches.stream_bytes += size;
         if self.caches.stream_bytes > (1 << 30) {
             let before = self.caches.stream_bytes;
-            self.caches.streams.retain(|_, e| e.used + 120 >= swaps);
+            self.caches.streams.retain(|_, e| keep_stream(e.used, e.reused, swaps));
             self.caches.stream_bytes = self.caches.streams.values().map(|e| e.size).sum::<u64>() + size;
             if self.caches.stream_bytes > before / 2 && self.caches.stream_bytes > (1 << 30) {
                 self.caches.streams.clear();
@@ -1630,6 +1648,7 @@ impl Gx2 {
                 meta: meta_buffer.clone(),
                 size,
                 used: swaps,
+                reused: false,
             },
         );
         (
@@ -1886,6 +1905,11 @@ impl Gx2 {
             let aged =
                 self.caches.vertex_front.sweep(swaps) + self.caches.pixel_front.sweep(swaps) + self.caches.geometry_front.sweep(swaps);
             Lap::count("shader front entries aged out", aged as u64);
+            // vertex streams not drawn with for a while, and the ones made from bytes that were drawn once
+            let before = self.caches.streams.len();
+            self.caches.streams.retain(|_, e| keep_stream(e.used, e.reused, swaps));
+            self.caches.stream_bytes = self.caches.streams.values().map(|e| e.size).sum();
+            Lap::count("vertex streams aged out", (before - self.caches.streams.len()) as u64);
         }
     }
 
@@ -2436,7 +2460,12 @@ impl Gx2 {
 
     /// Ends the render pass the draws are recorded into (the command buffer stays open).
     pub(crate) fn end_pass(&mut self) {
-        self.batch.pass = None;
+        if self.batch.pass.is_some() {
+            // wgpu checks and records the whole pass when it ends, so this is where its cost shows
+            let mut lap = Lap::new();
+            self.batch.pass = None;
+            lap.mark("render pass end");
+        }
         self.batch.key = None;
     }
 
@@ -2444,6 +2473,7 @@ impl Gx2 {
     /// calls this first.
     pub(crate) fn flush_draws(&mut self) {
         self.end_pass();
+        let mut lap = Lap::new();
         // what the draws read, written into the arenas' copies, goes up first, one write per arena (the queue keeps writes before the
         // commands submitted after them)
         for a in &mut self.batch.arenas[Role::Read as usize] {
@@ -2464,8 +2494,10 @@ impl Gx2 {
         if let Some(enc) = self.batch.enc.take() {
             work.push(enc.finish());
         }
+        lap.mark("arena uploads");
         if !work.is_empty() {
             self.d.queue.submit(work);
+            lap.mark("submit");
         }
         for a in self.batch.arenas.iter_mut().flatten() {
             a.used = 0;
@@ -3143,6 +3175,70 @@ mod tests {
             uniform_as_before(&g, &small, 16)
         );
         assert_eq!(gx2.batch.slots_used, 0);
+    }
+
+    #[test]
+    fn a_stream_drawn_once_or_long_ago_is_let_go() {
+        // drawn again in a later frame: kept until not drawn for STREAM_AGE frames
+        assert!(keep_stream(100, true, 100 + STREAM_AGE));
+        assert!(!keep_stream(100, true, 101 + STREAM_AGE));
+        // made and never drawn after its frame: gone two frames later
+        assert!(keep_stream(100, false, 102));
+        assert!(!keep_stream(100, false, 103));
+        assert!(keep_stream(u32::MAX - 1, false, u32::MAX));
+    }
+
+    #[test]
+    fn vertex_data_rewritten_every_frame_does_not_pile_up_streams() {
+        // run 12: standing still in the field, 12 to 15 streams a frame were made from bytes never seen again and kept (31,000 after a
+        // minute, two buffers each), and the replay slowed down with them
+        let mut gx2 = Gx2::new(crate::Display::noop());
+        let mut m = vec![0u8; 0x1_0000];
+        let g = Guest::new(m.as_mut_ptr());
+        let fetch = [AttribStream {
+            location: 0,
+            buffer: 0,
+            offset: 0,
+            format: 0x811,
+            per_instance: false,
+            divisor: 0,
+            select: [0, 1, 2, 3],
+            endian: 0,
+        }];
+        let mut st = State::default();
+        st.attrib_buffers[0] = crate::state::AttribBuffer {
+            address: 0x1000,
+            size: 12 * 64,
+            stride: 12,
+        };
+        let mut most = 0;
+        for frame in 0..1000u32 {
+            gx2.swaps = frame;
+            // the same static mesh every frame, and a mesh whose bytes change every frame
+            st.attrib_buffers[0].address = 0x1000;
+            gx2.cached_streams(&g, &st, &fetch, 0, 64, 1);
+            g.put_u32(0x4000, frame);
+            st.attrib_buffers[0].address = 0x4000;
+            gx2.cached_streams(&g, &st, &fetch, 0, 64, 1);
+            gx2.prune();
+            most = most.max(gx2.caches.streams.len());
+        }
+        assert!(
+            most <= 64,
+            "at most a prune's worth of one-frame streams, not one per frame: {most}"
+        );
+        // the static mesh is still the one made first
+        let (a, _) = {
+            st.attrib_buffers[0].address = 0x1000;
+            gx2.cached_streams(&g, &st, &fetch, 0, 64, 1)
+        };
+        let (b, _) = gx2.cached_streams(&g, &st, &fetch, 0, 64, 1);
+        assert!(a.buffer == b.buffer);
+        let kept: u64 = gx2.caches.streams.values().map(|e| e.size).sum();
+        gx2.swaps += 60 - gx2.swaps % 60;
+        gx2.prune();
+        assert_eq!(gx2.caches.stream_bytes, gx2.caches.streams.values().map(|e| e.size).sum::<u64>());
+        assert!(gx2.caches.stream_bytes <= kept);
     }
 
     #[test]

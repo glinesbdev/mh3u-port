@@ -244,7 +244,10 @@ with their text and the cloth background, upright, in the right places (the hunt
     at a time. A draw's index list (made relative to its lowest vertex, fans and quads made into triangles) is kept by the draw and an
     XXH3 hash of its index bytes, which are also compared: the first time it goes into the arena, the second time it gets a buffer of
     its own that later frames use as it is, so a mesh drawn every frame builds and uploads its list once. Lists not drawn again
-    within two frames are forgotten.
+    within two frames are forgotten. Decoded vertex streams follow the same rule: one not drawn with in a later frame than the one
+    it was made in (vertex data the game rewrites every frame) goes at the next prune, and any stream goes after 120 frames unused.
+    Each stream is two GPU buffers, and wgpu's per-pass and per-submit bookkeeping grows with the most buffers ever alive (run 12:
+    31,000 streams kept, the replay three times slower at the same draws; see `docs/performance.md`, open concern 3).
   - *Textures*: a texture already made is found by the five header words of its key in one look-up. `GX2Invalidate` over its memory
     no longer throws it away: it is marked, and at its next use the header words and the bytes of its image and smaller levels are
     hashed and compared with what it was decoded from; it is decoded again only if they differ (a hash pass instead of untiling every
