@@ -25,7 +25,10 @@ param(
     [ValidateSet('xbox', 'nintendo')]
     [string]$PadLayout,
     # The log file. By default .\mh3u_latest.log; an older mh3u_latest.log is renamed after the time it was written.
-    [string]$Log
+    [string]$Log,
+    # The internal resolution scale (MH3U_GFX_RESOLUTION_SCALE): 1, 2, or 4. The default is 2.
+    [ValidateSet('1', '2', '4')]
+    [string]$Scale
 )
 $ErrorActionPreference = 'Stop'
 $repo = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot '..')).Path
@@ -43,7 +46,7 @@ foreach ($p in @($tools, (Join-Path $Out 'game.dll'), $Games)) {
 $stale = @(
     'MH3U_FPS', 'MH3U_GFX_TIMES', 'MH3U_GFX_REPORT', 'MH3U_GFX_LOG', 'MH3U_GFX_DUMP_FRAME', 'MH3U_GFX_DUMP_DIR',
     'MH3U_GFX_DEBUG_PS', 'MH3U_GFX_DEBUG_PS_ONLY', 'MH3U_GFX_SOLID', 'MH3U_GFX_DEPTH_BIAS', 'MH3U_GFX_TEXDUMP',
-    'MH3U_GFX_SAVE', 'MH3U_GFX_SAVE_EVERY', 'MH3U_GFX_SAVE_IMAGE', 'MH3U_PAD_LAYOUT'
+    'MH3U_GFX_SAVE', 'MH3U_GFX_SAVE_EVERY', 'MH3U_GFX_SAVE_IMAGE', 'MH3U_PAD_LAYOUT', 'MH3U_GFX_RESOLUTION_SCALE'
 )
 foreach ($name in $stale) {
     if (Test-Path -LiteralPath "Env:$name") {
@@ -71,6 +74,12 @@ if (-not $Log) {
     }
 } elseif (-not [System.IO.Path]::IsPathRooted($Log)) {
     $Log = Join-Path (Get-Location).Path $Log
+}
+
+if (-not $Scale) {
+    $set['MH3U_GFX_RESOLUTION_SCALE'] = '2'
+} else {
+    $set['MH3U_GFX_RESOLUTION_SCALE'] = $Scale
 }
 
 $runArgs = @('run', $Games, $Out, '--window', '--max-imports', '1000000000000')

@@ -157,6 +157,11 @@ $env:MH3U_FPS = '1'
 & $tools build-game $out --native --lto     # also -flto=thin: optimised across files at the link, which takes longer
 ```
 
+`MH3U_GFX_RESOLUTION_SCALE` renders GX2 color and depth targets at a multiple of their game-requested width and height. For example,
+set `$env:MH3U_GFX_RESOLUTION_SCALE = '2'` before launching to render at twice the dimensions (four times the pixels). Integer values
+from 1 to 4 are accepted; the adapter's texture-size limit may cap the scale for large targets. This is supersampling, not texture
+replacement, and increases GPU memory use and rendering cost. Leave it unset (or set it to `1`) for the original resolution.
+
 Where the time of a frame goes: `MH3U_GFX_TIMES` prints, every `MH3U_TIMES_WINDOW` seconds (10 by default), the graphics calls and
 the parts of a draw that took the most, as totals and per frame, and the cache hit and miss counts (`translator.md`, "What a draw
 costs on the CPU"). Stand in the same place for a whole window and compare the per-frame columns:

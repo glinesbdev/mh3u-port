@@ -11,10 +11,10 @@ use std::time::{Duration, Instant};
 const TRUE: u32 = 1;
 const FALSE: u32 = 0;
 /// The time base's rate, in ticks per second.
-const TICKS_PER_SECOND: u64 = 62_156_250;
+const TICKS_PER_SECOND: u64 = crate::cafe::TICKS_PER_SECOND;
 
 fn ticks_to_duration(ticks: u64) -> Duration {
-    Duration::from_nanos(ticks.saturating_mul(1_000_000_000) / TICKS_PER_SECOND)
+    Duration::from_secs(ticks / TICKS_PER_SECOND) + Duration::from_nanos((ticks % TICKS_PER_SECOND) * 1_000_000_000 / TICKS_PER_SECOND)
 }
 
 pub fn find(name: &str) -> Option<KernelHandler> {
@@ -331,6 +331,17 @@ fn send(k: &mut Kernel, c: &mut Ctx, front: bool) -> Step {
         q.items.push_back(m);
     }
     done(c, TRUE)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sleep_ticks_convert_correctly_after_fifty_minutes() {
+        let ticks = 50 * 60 * TICKS_PER_SECOND;
+        assert_eq!(ticks_to_duration(ticks), Duration::from_secs(50 * 60));
+    }
 }
 
 /// `OSCreateThread(thread, entry, argc, argv, stack, stack_size, priority, attributes)`: the thread starts suspended.
