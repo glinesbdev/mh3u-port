@@ -823,6 +823,7 @@ pub(crate) fn dma_copy(g: &Guest, dst: u32, src: u32, words: u32, endian: u32) {
 }
 
 fn ticks_after(elapsed: std::time::Duration) -> u64 {
+    // nanoseconds * tick rate in u64 wraps after a few minutes
     0x1_0000_0000 + (elapsed.as_nanos() * u128::from(TICKS_PER_SECOND) / 1_000_000_000) as u64
 }
 

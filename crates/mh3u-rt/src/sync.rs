@@ -14,7 +14,9 @@ const FALSE: u32 = 0;
 const TICKS_PER_SECOND: u64 = crate::cafe::TICKS_PER_SECOND;
 
 fn ticks_to_duration(ticks: u64) -> Duration {
-    Duration::from_secs(ticks / TICKS_PER_SECOND) + Duration::from_nanos((ticks % TICKS_PER_SECOND) * 1_000_000_000 / TICKS_PER_SECOND)
+    // `ticks * 1e9` in u64 saturates after a few minutes (~18e9 ticks at this rate)
+    Duration::from_secs(ticks / TICKS_PER_SECOND)
+        + Duration::from_nanos((ticks % TICKS_PER_SECOND) * 1_000_000_000 / TICKS_PER_SECOND)
 }
 
 pub fn find(name: &str) -> Option<KernelHandler> {
@@ -91,7 +93,7 @@ pub fn find(name: &str) -> Option<KernelHandler> {
         },
         "coreinit:OSSetAlarm" => |k, c| {
             let ticks = (u64::from(c.r[4]) << 32) | u64::from(c.r[5]);
-            let delay = std::time::Duration::from_secs_f64(ticks as f64 / crate::cafe::TICKS_PER_SECOND as f64);
+            let delay = ticks_to_duration(ticks);
             k.alarms.insert(
                 c.r[3],
                 crate::kernel::Alarm {
@@ -341,6 +343,15 @@ mod tests {
     fn sleep_ticks_convert_correctly_after_fifty_minutes() {
         let ticks = 50 * 60 * TICKS_PER_SECOND;
         assert_eq!(ticks_to_duration(ticks), Duration::from_secs(50 * 60));
+    }
+
+    #[test]
+    fn sleep_ticks_keep_the_fraction_past_the_old_u64_overflow() {
+        let ticks = 5 * 60 * TICKS_PER_SECOND + TICKS_PER_SECOND / 2;
+        assert_eq!(
+            ticks_to_duration(ticks),
+            Duration::from_secs(5 * 60) + Duration::from_nanos(500_000_000)
+        );
     }
 }
 

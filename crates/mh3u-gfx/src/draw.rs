@@ -2825,8 +2825,9 @@ impl Gx2 {
             self.batch.pass = Some(pass.forget_lifetime());
             self.batch.key = Some(key);
         }
-        let scale = self.render_scale_for(g.u32(st.colour_buffers[0] + 4), g.u32(st.colour_buffers[0] + 8));
         let Some(pass) = self.batch.pass.as_mut() else { return };
+        let guest_w = g.u32(st.colour_buffers[0] + 4);
+        let scale = if guest_w == 0 { 1 } else { target_w / guest_w };
         let [vx, vy, vw, vh, near, far] = st.viewport;
         let scale_f = scale as f32;
         let (vx, vy, vw, vh) = (vx * scale_f, vy * scale_f, vw * scale_f, vh * scale_f);

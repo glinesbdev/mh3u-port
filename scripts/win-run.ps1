@@ -26,8 +26,8 @@ param(
     [string]$PadLayout,
     # The log file. By default .\mh3u_latest.log; an older mh3u_latest.log is renamed after the time it was written.
     [string]$Log,
-    # The internal resolution scale (MH3U_GFX_RESOLUTION_SCALE): 1, 2, or 4. The default is 2.
-    [ValidateSet('1', '2', '4')]
+    # The internal resolution scale (MH3U_GFX_RESOLUTION_SCALE): 1, 2, 3, or 4. Unset keeps the game's own size.
+    [ValidateSet('1', '2', '3', '4')]
     [string]$Scale
 )
 $ErrorActionPreference = 'Stop'
@@ -76,9 +76,7 @@ if (-not $Log) {
     $Log = Join-Path (Get-Location).Path $Log
 }
 
-if (-not $Scale) {
-    $set['MH3U_GFX_RESOLUTION_SCALE'] = '2'
-} else {
+if ($Scale) {
     $set['MH3U_GFX_RESOLUTION_SCALE'] = $Scale
 }
 

@@ -103,7 +103,11 @@ fn resolution_scale(setting: Option<&str>) -> u32 {
 }
 
 fn target_scale(width: u32, height: u32, requested: u32, max_dimension: u32) -> u32 {
-    requested.min((max_dimension / width.max(height)).max(1))
+    let longest = width.max(height);
+    if longest == 0 {
+        return 1;
+    }
+    requested.min((max_dimension / longest).max(1))
 }
 
 pub(crate) struct Target {
@@ -1491,6 +1495,7 @@ mod tests {
         assert_eq!(target_scale(1280, 720, 2, 8192), 2);
         assert_eq!(target_scale(4096, 2160, 4, 8192), 2);
         assert_eq!(target_scale(8192, 1024, 4, 8192), 1);
+        assert_eq!(target_scale(0, 0, 4, 8192), 1);
     }
 
     #[test]
