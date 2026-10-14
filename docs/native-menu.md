@@ -310,11 +310,26 @@ draw:
 **Help line:** `f_026636d4` sets it with `f_02144d18(ui, text, 0)` (returns to `0x02663c50`), or with `f_02144998` (returns to
 `0x02663c34`) when `S+0x18` is set. Run 46 took the second path. Both are hooked (`help_set`, `help_set_alt`).
 
-**Button hints** ("Y Reorder", "X Combinable", bottom right): not found yet.
-- `f_02145dc8`/`f_02145e00` (called at the end of the draw with preset `0x1a`) reach empty functions in this build.
-- The page setup's `f_0265fae4(widget, 8)` plays layout frame 80 on pane `+0x6c8`, which may be what shows them.
-- `MH3U_NATIVE_MENU_TRACE=1` logs every text set while the Mods page is up, once per (caller, pane), with its text, to find
-  out whether they are text at all.
+**Button hints** ("Y Reorder", "X Combinable", bottom right). The trace (run 47) found them: `text_set` from `0x02620238` in
+`f_026201d4`, part of the guide object `f_0262115c(guide, mode)`.
+- `f_0265b148` calls `f_0262115c` each frame with the panel's guide (`panel + 0x2e8`). The Combo List uses modes `0x22` to
+  `0x25`. Mode 0 (used while combining) hides all four hints.
+- The `guide_set` hook on `f_0262115c` turns the mode to 0 for that guide while the Mods page is up.
+
+**Materials past the second** go in the description box below the panel (`panel + 0x2e0`, the combo's item description;
+`text_set` from `0x0265b730` in the combo path).
+- On the no-combo path the game hides that box each frame with `f_02af349c(pane, 0)`. The `vis_set` hook on `f_02af349c`
+  keeps it shown for that one pane while the Mods page is up.
+- Its text is written through the Output value's call, which runs every frame and is otherwise blank on this page. After
+  blanking the Output value once, that call's pane (`r3`) is pointed at the description box and its text at the runtime
+  buffer (`0x0ff00800`, up to 511 bytes). The Output value keeps its blank.
+- One line per material from the third on, `Name` then `have/need`. Each line is padded with spaces to 30 characters, so the
+  counts sit roughly at the right (the font is proportional, so they are close, not exact). Lines are joined with `\r\n`,
+  as in the game's own descriptions.
+- With all materials shown, the status line no longer says "(+N more)".
+- `vis_set` hooks a function the whole layout calls often. Its callback only compares the pane with one stored pointer (0 when
+  the Mods page is closed).
+- `MH3U_NATIVE_MENU_TRACE=1` logs every text set while the Mods page is up, once per (caller, pane), with its text.
 
 **Pages:** `S+0x1e8` (page) and `S+0x1e9` (pages) are the row draw's counter. The Mods page writes them every frame from its own
 page number (in the runtime). Left and right (`0xc` in `S+4`/`S+0xc`: `0x4` left, `0x8` right, as in `f_0223a0e0`) turn that
@@ -334,7 +349,7 @@ gives the hovered piece.
 and the runtime's buffer (text slots of 64 bytes from `0x0ff00200`: rows 0-7, title, order label, help, 7 panes). No save or pouch
 data.
 
-**Hooks:** three new ones in `mods/hooks.txt`: `combo_panel` (`f_0265bfac`), `help_set` (`f_02144d18`) and `help_set_alt` (`f_02144998`). They need
+**Hooks:** five new ones in `mods/hooks.txt`: `combo_panel` (`f_0265bfac`), `help_set` (`f_02144d18`), `help_set_alt` (`f_02144998`), `vis_set` (`f_02af349c`) and `guide_set` (`f_0262115c`). They need
 `win-build.ps1 -Translate`. Without them, the rows still work, and the panel and help line stay the Combo List's.
 
 ### Proposed PRs

@@ -384,7 +384,11 @@ impl Overlay {
             |i| save.item_count(i) + self.provisional.extra(i),
         );
         mh3u_rt::native_text::set(native_line(&statuses));
-        mh3u_rt::native_menu::set_entries(Some(page_entries(&statuses, |p| data.piece_name(p.kind, p.id))));
+        mh3u_rt::native_menu::set_entries(Some(page_entries(
+            &statuses,
+            |p| data.piece_name(p.kind, p.id),
+            |i| data.item_name(i),
+        )));
         let new = self.craftable.update(&statuses);
         let names: Vec<String> = new
             .iter()
@@ -706,6 +710,7 @@ fn native_line(statuses: &[mh3u_mods::wishlist::Status]) -> Option<String> {
 fn page_entries<'a>(
     statuses: &[mh3u_mods::wishlist::Status],
     name: impl Fn(mh3u_mods::wishlist::Piece) -> Option<&'a str>,
+    item_name: impl Fn(u16) -> &'a str,
 ) -> Vec<mh3u_rt::native_menu::Entry> {
     statuses
         .iter()
@@ -717,6 +722,7 @@ fn page_entries<'a>(
                 .iter()
                 .map(|m| mh3u_rt::native_menu::Material {
                     item: m.item,
+                    name: item_name(m.item).to_string(),
                     have: m.have,
                     need: m.need,
                 })

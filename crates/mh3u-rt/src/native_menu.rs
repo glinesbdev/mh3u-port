@@ -22,7 +22,7 @@
 use crate::hooks::{Hook, Registry};
 use std::sync::Mutex;
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering::Relaxed};
 
 /// Where the label goes: past the native text's (`native_text::BUFFER`, 64 bytes), in the runtime's own MiB.
 pub const LABEL_AT: u32 = crate::native_text::BUFFER + 0x100;
@@ -74,6 +74,8 @@ pub struct State {
     /// Each text slot's text as last written, and whether it was written.
     page_written: [Vec<u8>; SLOTS],
     slot_set: [bool; SLOTS],
+    /// The description box's text as last written.
+    desc_written: Option<Vec<u8>>,
 }
 
 /// The Mods page while it is up.
@@ -92,6 +94,8 @@ pub struct Page {
     hovered: Option<Entry>,
     /// The material ids last given to the panel.
     last_ids: Option<(u16, u16)>,
+    /// The Output value has been blanked once (its call then writes the description box).
+    output_blanked: bool,
 }
 
 impl State {
@@ -103,6 +107,7 @@ impl State {
             page: None,
             page_written: [const { Vec::new() }; SLOTS],
             slot_set: [false; SLOTS],
+            desc_written: None,
         }
     }
 }
@@ -200,6 +205,9 @@ fn update(h: &mut Hook) {
         if page.menu_frames > 2 {
             let opened = page.opened;
             st.page = None;
+            DESC_PANE.store(0, Relaxed);
+            GUIDE.store(0, Relaxed);
+            st.desc_written = None;
             if g.u16(s + 0x28) == PAGE_ROW {
                 g.put_u16(s + 0x28, ROW);
             }
@@ -356,6 +364,8 @@ fn panel(h: &mut Hook) {
     let (panel, s) = (h.ctx.r[3], h.ctx.r[4]);
     page.panel = panel;
     let g = crate::guest::Guest::new(h.ctx.mem);
+    DESC_PANE.store(g.u32(panel + DESC_PANE_OFFSET), Relaxed);
+    GUIDE.store(g.u32(panel + GUIDE_OFFSET), Relaxed);
     if s == 0 || g.u8(s + 1) != 0 || g.u8(s + 0x1e) != 2 {
         return;
     }
@@ -370,6 +380,66 @@ fn panel(h: &mut Hook) {
     g.write(s + 0x244, &[1]);
     g.put_u16(s + 0x234, m1);
     g.put_u16(s + 0x236, m2);
+}
+
+/// The description box under the panel (`+0x2e0`, the combo's item description; hidden on the no-combo path).
+pub const DESC_PANE_OFFSET: u32 = 0x2e0;
+/// The guide (button hints) object (`+0x2e8`; `f_0262115c(guide, mode)`, mode 0: no hints).
+pub const GUIDE_OFFSET: u32 = 0x2e8;
+/// The description's text in the runtime's buffer (up to `DESC_MOST` bytes).
+pub const DESC_AT: u32 = crate::native_text::BUFFER + 0x800;
+pub const DESC_MOST: usize = 0x1ff;
+/// The width the description's lines are padded to (the counts right-aligned with spaces: the font is proportional, so this
+/// is only close).
+pub const DESC_WIDTH: usize = 30;
+/// The panes `vis_set` keeps shown and `guide_set` keeps empty on the Mods page (0: none).
+static DESC_PANE: AtomicU32 = AtomicU32::new(0);
+static GUIDE: AtomicU32 = AtomicU32::new(0);
+
+/// The materials past the panel's two, a line each: the name on the left, `have/need` on the right.
+pub fn extra_materials(hovered: Option<&Entry>) -> String {
+    let Some(e) = hovered else { return String::new() };
+    e.materials
+        .iter()
+        .skip(2)
+        .map(|m| {
+            let count = format!("{}/{}", m.have, m.need);
+            let room = DESC_WIDTH.saturating_sub(count.len() + 1).max(1);
+            let name: String = m.name.chars().take(room).collect();
+            format!("{name}{}{count}", " ".repeat(DESC_WIDTH - name.chars().count() - count.len()))
+        })
+        .collect::<Vec<_>>()
+        .join("\r\n")
+}
+
+/// Text for a multi-line box: printable ASCII and line breaks (`\r\n`, as the game's own descriptions), bounded.
+pub fn encode_lines(text: &str) -> Vec<u8> {
+    text.chars()
+        .map(|c| {
+            if c.is_ascii_graphic() || c == ' ' || c == '\r' || c == '\n' {
+                c as u8
+            } else {
+                b'?'
+            }
+        })
+        .take(DESC_MOST)
+        .collect()
+}
+
+/// `f_02af349c(pane, shown)` (`vis_set`): the description box stays shown on the Mods page.
+fn visibility(h: &mut Hook) {
+    let d = DESC_PANE.load(Relaxed);
+    if d != 0 && h.ctx.r[3] == d {
+        h.ctx.r[4] = 1;
+    }
+}
+
+/// `f_0262115c(guide, mode)` (`guide_set`): no button hints on the Mods page (mode 0, which the Combo List uses while combining).
+fn guide(h: &mut Hook) {
+    let g = GUIDE.load(Relaxed);
+    if g != 0 && h.ctx.r[3] == g {
+        h.ctx.r[4] = 0;
+    }
 }
 
 /// Item ids for the materials function when no piece has been shown yet (their names and counts are blanked).
@@ -420,15 +490,11 @@ pub fn pane_text(pane: Pane, hovered: Option<&Entry>, entries: Option<&[Entry]>)
     Some(match pane {
         Pane::Name => e.name.clone(),
         Pane::Status => {
-            let more = match e.materials.len() {
-                0..=2 => String::new(),
-                n => format!(" (+{} more)", n - 2),
-            };
             if e.ready {
-                format!("Ready to craft{more}")
+                "Ready to craft".to_string()
             } else {
                 let missing: u32 = e.materials.iter().map(|m| m.need.saturating_sub(m.have)).sum();
-                format!("Need {missing} more{more}")
+                format!("Need {missing} more")
             }
         }
         Pane::Output | Pane::Other => String::new(),
@@ -511,6 +577,27 @@ fn page_text(h: &mut Hook) {
     let Some(&(_, which)) = PANES.iter().find(|(off, _)| g.u32(panel + off) == pane) else {
         return;
     };
+    // the Output value is set every frame and is blank on this page: after blanking it once, its call writes the materials past
+    // the second into the description box below the panel (`+0x2e0`, shown by `vis_set`) instead
+    let desc = g.u32(panel + DESC_PANE_OFFSET);
+    if which == Pane::Output && desc != 0 && st.page.as_ref().is_some_and(|p| p.output_blanked) {
+        let text = extra_materials(hovered.as_ref());
+        let bytes = encode_lines(&text);
+        if st.desc_written.as_ref() != Some(&bytes) {
+            g.write(DESC_AT, &bytes);
+            g.write(DESC_AT + bytes.len() as u32, &[0]);
+            st.desc_written = Some(bytes.clone());
+        }
+        c.r[3] = desc;
+        c.r[4] = DESC_AT;
+        c.r[5] = bytes.len() as u32;
+        return;
+    }
+    if which == Pane::Output
+        && let Some(p) = st.page.as_mut()
+    {
+        p.output_blanked = true;
+    }
     let entries = ENTRIES.lock().unwrap_or_else(|e| e.into_inner()).clone();
     if let Some(text) = pane_text(which, hovered.as_ref(), entries.as_deref()) {
         let slot = SLOT_PANE + PANES.iter().position(|(off, _)| g.u32(panel + off) == pane).unwrap_or(0);
@@ -569,9 +656,11 @@ pub struct Entry {
     pub materials: Vec<Material>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Material {
     pub item: u16,
+    /// The item's name (for the materials past the panel's two).
+    pub name: String,
     pub have: u32,
     pub need: u32,
 }
@@ -629,6 +718,13 @@ pub fn register(r: &mut Registry) -> bool {
     let panel_hook = r.on("combo_panel", Box::new(panel));
     let help_hook = r.on("help_set", Box::new(help));
     r.on("help_set_alt", Box::new(help));
+    let vis = r.on("vis_set", Box::new(visibility));
+    let hints = r.on("guide_set", Box::new(guide));
+    if !(vis && hints) {
+        eprintln!(
+            "[native-menu] the build lacks vis_set ({vis}) or guide_set ({hints}): no extra materials box or the button hints stay; translate again"
+        );
+    }
     if !(panel_hook && help_hook) {
         eprintln!(
             "[native-menu] the build lacks combo_panel ({panel_hook}) or help_set ({help_hook}): the side panel and help line stay the Combo List's; translate again"
@@ -673,7 +769,15 @@ mod tests {
     }
 
     fn entry(name: &str, mats: &[(u16, u32, u32)]) -> Entry {
-        let materials: Vec<Material> = mats.iter().map(|&(item, have, need)| Material { item, have, need }).collect();
+        let materials: Vec<Material> = mats
+            .iter()
+            .map(|&(item, have, need)| Material {
+                item,
+                name: format!("item {item}"),
+                have,
+                need,
+            })
+            .collect();
         Entry {
             name: name.into(),
             ready: materials.iter().all(|m| m.have >= m.need),
@@ -713,7 +817,16 @@ mod tests {
         let e = entry("Bone Helm", &[(10, 1, 3), (11, 2, 2), (12, 0, 1)]);
         let t = |p| pane_text(p, Some(&e), None).unwrap_or_default();
         assert_eq!(t(Pane::Name), "Bone Helm");
-        assert_eq!(t(Pane::Status), "Need 3 more (+1 more)");
+        assert_eq!(t(Pane::Status), "Need 3 more");
+        let extra = extra_materials(Some(&e));
+        assert_eq!(extra.len(), DESC_WIDTH);
+        assert!(extra.starts_with("item 12 ") && extra.ends_with(" 0/1"), "{extra:?}");
+        let four = entry("X", &[(1, 0, 1), (2, 0, 1), (3, 1, 2), (4, 10, 12)]);
+        let lines: Vec<&str> = extra_materials(Some(&four)).leak().split("\r\n").collect();
+        assert_eq!(lines.len(), 2);
+        assert!(lines[1].ends_with("10/12") && lines[1].len() == DESC_WIDTH);
+        assert_eq!(extra_materials(Some(&entry("Y", &[(1, 0, 1)]))), "");
+        assert_eq!(encode_lines("a\r\nb\u{e9}"), b"a\r\nb?".to_vec());
         assert_eq!((t(Pane::Output), t(Pane::Other)), (String::new(), String::new()));
         assert_eq!(t(Pane::Count1), "1/3");
         assert_eq!(t(Pane::Count2), "2/2");
