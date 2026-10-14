@@ -274,6 +274,25 @@ Send back `Desktop\session.log` with your notes (the order of the steps, and whi
 - **Leftover settings:** `MH3U_WATCH_AT` and `MH3U_WATCH_COPY` from earlier sessions were still set (and the startup copy
   `0x3001cc1c` was reused heap). Clear them before a run.
 
+### Run 38 (build `1ccafa3`)
+
+- **Tools:** exact call counts on; F10 found 4 pouch copies (`0x2e66bdec`, `0x2e67387c`, `0x2e6eda44`, `0x3001e418`) and
+  watched all of them at once.
+- **Menu open:** 85 functions ran only with the item menu open in both open-the-menu windows (window 4 and window 2). The
+  ones called only a few times on the second open, the likeliest to be the open itself rather than per-frame drawing, are
+  `f_02037600` (2 calls) and `f_02153480` (3; next to the run 37 group `f_02152830`–`f_02153480`). Without the translated
+  C here their callers could not be followed, so both are in `hooks.txt` as log-only probes (`menu_probe_a`, `menu_probe_b`);
+  the hook log's `lr` gives the caller. Not wired to the overlay yet. Confidence: low to medium.
+- **Item use:** the only write to any pouch copy on the quest was a pickup (`copy 3 0x3001e418: pouch 0 count <- 0x9` by
+  `f_0219acec`, lr `0x219af28`, under `item_to_pouch` / `item_gain`). So `0x3001e418` is the quest's live pouch, but using a
+  potion and another item wrote nothing to it from guest code. The count goes down some other way (a store the watch does not
+  see, or a pouch kept elsewhere during use). Not found; the next run narrows it with the call diff instead.
+- **Noise:** `[watch-host] copy: 16 bytes at 0x3001b9f0` about 2,500 times (a host copy each frame into the wide watched
+  range, outside every pouch).
+- **Next run:** a normal `-Watch -Translate` build with `MH3U_HOOK_LOG=1` and `MH3U_CALLDIFF=1`. Open the item menu twice
+  (the probes' `lr` show their callers). On a quest: F9, use a potion, F9 within 2 s, wait 5 s, F9, use a potion, F9 within
+  2 s: the `both f_` lines are what using an item runs.
+
 ## Plan
 
 1. Write this doc. **(done)**

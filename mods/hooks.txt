@@ -26,3 +26,5 @@ in:0x0219950c item_to_box
 in:0x0219b080 item_to_pouch
 # Rejected (thousands of calls a minute, queries, not actions): 0x0219acec (pouch item lookup, r4 = item id),
 # 0x02199408 (box item lookup, r4 = item id), 0x02198770 (field getter, r5 = 7/8), 0x0216afd4 (per-frame, another object).
+0x02037600 menu_probe_a       # run 38: in both item-menu-open windows (2 calls on the 2nd open); a probe for menu_open, log only
+0x02153480 menu_probe_b       # run 38: in both item-menu-open windows (3 calls on the 2nd open); a probe for menu_open, log only
