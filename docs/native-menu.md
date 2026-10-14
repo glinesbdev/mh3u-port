@@ -286,28 +286,35 @@ Run 45 (PR #22) showed the Combo List's own panes around the Mods rows: the titl
 | Help line | `f_026636d4` -> `f_02144d18(ui, message 3/0x180, 0)` (returns to `0x02663c50`) | "Wishlist (Left/Right: page, B: back)" |
 | Side panel | `f_0265bfac(panel, S)` -> `f_0265b2f0` (output and status) and `f_0265bb24` (materials), from `S+0x230` | the hovered piece |
 
-**The side panel** (`panel` = `f_0265bfac`'s `r3`, the new `combo_panel` hook keeps it; its panes are pointers in it):
+**The side panel** (`panel` = `f_0265bfac`'s `r3`; the `combo_panel` hook keeps it, and its panes are pointers in it). Run 46
+(the first PR #23 build) showed that setting the panel's state in `S` on `combo_update` does not work. The update itself rewrites
+`S+0x230` to `S+0x24b` after the hook (`f_02233834` -> `f_02233700`, `f_02231db8` for each row, then for the cursor's).
+`f_02231db8` also sets `S+0x244` = 1 when there is no combo. So the block is set on `combo_panel`, at the entry of the panel's
+draw:
 
-- **No-combo path:** with `S+0x230` = 0 and `S+0x245` = 0, `f_0265b2f0` sets:
-  - `+0x2b4`, the output name (message `0x177`);
-  - `+0x2d0` (message `0x176`);
-  - with `(char)S+0x244 < 0`, `+0x2cc` (message `0x175`) and `+0x2d4` (message `0x172`, through `f_0228f57c`).
+- **No combo:** `S+0x230` = 0 and `S+0x245` = 0, so `f_0265b2f0` takes its no-combo path:
+  - `+0x2b4` gets the output name (message `0x177`): the Mods page puts the **piece's name** there.
+  - `+0x2d0` is the value next to the layout's "Output:" label (message `0x176`): **blanked**. The label itself is part of
+    the layout and stays.
+- **The red line:** with `S+0x244` = 1, that path sets the red line `+0x2e4` (message `0x168`, "Insufficient materials.",
+  through `f_0228f57c`). It also clears `+0x2d4` and hides `+0x2cc`. The red line shows the **status**: "Ready to craft" or
+  "Need N more", plus " (+K more)" for pieces with more than two materials. On a row with no piece it shows "N of M ready" or
+  a note.
+- **Materials:** `f_0265bb24` takes two item ids at `S+0x234`/`S+0x236` and returns early if either is 0. It draws each
+  item's name (`+0x2bc`, `+0x2c4`), icon (`+0x2ac`, `+0x2b0`) and pouch count (`+0x2c0`, `+0x2c8`).
+  - The Mods page gives it the hovered piece's first two materials, and replaces the counts with `have/need`.
+  - A piece with one material gets it twice, with the second name and count blanked.
+  - **On a row with no piece,** the last ids are kept (or item 1 before any piece was shown), so the function still runs, and
+    both names and counts are blanked. The icons stay; there is no hide call in reach.
 
-  The Mods page sets `S+0x244` = `0xff` so all four are set each frame. `text_set` then replaces each pane, matched by
-  pointer:
-  - `+0x2b4`: the piece's name;
-  - `+0x2d0`: "Ready to craft" or "Need N more";
-  - `+0x2cc`: "Materials: have/need", or "+N more materials (F1)" for pieces with more than two materials;
-  - `+0x2d4`: blank.
-- **Materials:** `f_0265bb24` reads two item ids at `S+0x234`/`S+0x236`. It returns early if either is 0. It draws each
-  item's name (`+0x2bc`, `+0x2c4`) and icon (`+0x2ac`, `+0x2b0`) itself, and a count (`+0x2c0`, `+0x2c8`) from the pouch
-  (`f_02233684`, read only).
-  - The Mods page writes the hovered piece's first two material ids there, so the game draws their names and icons.
-  - The two counts are replaced with `have/need` from the overlay's wishlist status.
-  - A piece with one material gets it twice, with the second name and count blanked; its icon still shows twice.
-- **Rows with no piece** (an empty wishlist, or blank rows past the end): the ids are 0, so the materials function returns
-  early and its panes keep the last piece's text and icons. The panel's name reads "Wishlist", with "N of M ready" or a
-  note.
+**Help line:** `f_026636d4` sets it with `f_02144d18(ui, text, 0)` (returns to `0x02663c50`), or with `f_02144998` (returns to
+`0x02663c34`) when `S+0x18` is set. Run 46 took the second path. Both are hooked (`help_set`, `help_set_alt`).
+
+**Button hints** ("Y Reorder", "X Combinable", bottom right): not found yet.
+- `f_02145dc8`/`f_02145e00` (called at the end of the draw with preset `0x1a`) reach empty functions in this build.
+- The page setup's `f_0265fae4(widget, 8)` plays layout frame 80 on pane `+0x6c8`, which may be what shows them.
+- `MH3U_NATIVE_MENU_TRACE=1` logs every text set while the Mods page is up, once per (caller, pane), with its text, to find
+  out whether they are text at all.
 
 **Pages:** `S+0x1e8` (page) and `S+0x1e9` (pages) are the row draw's counter. The Mods page writes them every frame from its own
 page number (in the runtime). Left and right (`0xc` in `S+4`/`S+0xc`: `0x4` left, `0x8` right, as in `f_0223a0e0`) turn that
@@ -327,7 +334,7 @@ gives the hovered piece.
 and the runtime's buffer (text slots of 64 bytes from `0x0ff00200`: rows 0-7, title, order label, help, 7 panes). No save or pouch
 data.
 
-**Hooks:** two new ones in `mods/hooks.txt`, `combo_panel` (`f_0265bfac`) and `help_set` (`f_02144d18`). They need
+**Hooks:** three new ones in `mods/hooks.txt`: `combo_panel` (`f_0265bfac`), `help_set` (`f_02144d18`) and `help_set_alt` (`f_02144998`). They need
 `win-build.ps1 -Translate`. Without them, the rows still work, and the panel and help line stay the Combo List's.
 
 ### Proposed PRs

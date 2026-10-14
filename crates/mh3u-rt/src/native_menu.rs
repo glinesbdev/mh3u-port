@@ -90,6 +90,8 @@ pub struct Page {
     panel: u32,
     /// The wishlist piece under the cursor.
     hovered: Option<Entry>,
+    /// The material ids last given to the panel.
+    last_ids: Option<(u16, u16)>,
 }
 
 impl State {
@@ -294,18 +296,9 @@ fn page_update(h: &mut Hook) {
     g.write(s + 0x1e8, &[page.page as u8]);
     g.write(s + 0x1e9, &[pages as u8]);
     g.put_u16(s + 0x1ec, PAGE_LINES as u16);
-    // the side panel: the hovered piece's first two materials (the game draws their names and icons; the counts are ours)
+    // the hovered piece (the side panel is set up just before it is drawn, `panel`: the update rewrites it after this hook)
     let row = (g.u16(s + 0x1ea) as usize).min(PAGE_LINES - 1);
     let hovered = entries.as_ref().and_then(|e| e.get(page.page * PAGE_LINES + row)).cloned();
-    let (m1, m2) = match hovered.as_ref().map(|e| e.materials.as_slice()) {
-        Some([a, b, ..]) => (a.item, b.item),
-        Some([a]) => (a.item, a.item),
-        _ => (0, 0),
-    };
-    g.put_u16(s + 0x234, m1);
-    g.put_u16(s + 0x236, m2);
-    // a status line in the panel (the game shows it when this is negative)
-    g.write(s + 0x244, &[0xff]);
     page.hovered = hovered;
 }
 
@@ -346,40 +339,70 @@ fn empty_rows(g: &crate::guest::Guest, s: u32) {
     g.write(s + 0x24b, &[0]);
 }
 
-/// The side panel's object (`f_0265bfac(panel, S)`, `combo_panel`): kept so `text_set` can tell its panes by pointer.
+/// The side panel's draw (`f_0265bfac(panel, S)`, `combo_panel`), after the update: keeps the panel object (so `text_set` can
+/// tell its panes by pointer) and sets the panel's state in `S` (`S+0x230`) for the hovered piece. The update's
+/// `f_02233834` -> `f_02233700`/`f_02231db8` rewrite that block every frame, so it is set here, right before the draw:
+///
+/// - `+0x230` = 0 and `+0x245` = 0: no combo, so `f_0265b2f0` takes its no-combo path (name `+0x2b4`, output `+0x2d0`);
+/// - `+0x244` = 1: that path's status line is the red one, `+0x2e4` (`f_0228f57c`, message 0x168), which shows the status;
+/// - `+0x234`/`+0x236`: two item ids for `f_0265bb24` (it returns early on 0): the hovered piece's first two materials, or the
+///   last ones shown with their names and counts blanked, so no stale text stays.
 fn panel(h: &mut Hook) {
     let mut st = STATE.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(page) = st.page.as_mut() {
-        page.panel = h.ctx.r[3];
+    let Some(page) = st.page.as_mut() else { return };
+    if !page.opened {
+        return;
     }
+    let (panel, s) = (h.ctx.r[3], h.ctx.r[4]);
+    page.panel = panel;
+    let g = crate::guest::Guest::new(h.ctx.mem);
+    if s == 0 || g.u8(s + 1) != 0 || g.u8(s + 0x1e) != 2 {
+        return;
+    }
+    let (m1, m2) = match page.hovered.as_ref().map(|e| e.materials.as_slice()) {
+        Some([a, b, ..]) => (a.item, b.item),
+        Some([a]) => (a.item, a.item),
+        _ => page.last_ids.unwrap_or(FALLBACK_IDS),
+    };
+    page.last_ids = Some((m1, m2));
+    g.put_u32(s + 0x230, 0);
+    g.write(s + 0x245, &[0]);
+    g.write(s + 0x244, &[1]);
+    g.put_u16(s + 0x234, m1);
+    g.put_u16(s + 0x236, m2);
 }
+
+/// Item ids for the materials function when no piece has been shown yet (their names and counts are blanked).
+const FALLBACK_IDS: (u16, u16) = (1, 1);
 
 /// The panel's text panes (offsets in the panel object, `f_0265b2f0` and `f_0265bb24`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Pane {
-    /// `+0x2b4`: the combo's output name ("??????").
+    /// `+0x2b4`: the output name ("??????"): the piece's name.
     Name,
-    /// `+0x2d0`: the output line (message 0x176).
+    /// `+0x2d0`: the value next to the layout's "Output:" label: blank.
     Output,
-    /// `+0x2cc`: a status line (message 0x175).
+    /// `+0x2e4`: the red line ("Insufficient materials.", message 0x168): the piece's status.
     Status,
-    /// `+0x2d4`: the other status line (message 0x172, "Insufficient materials.").
-    Status2,
-    /// `+0x2c0` and `+0x2c8`: the two materials' counts.
+    /// `+0x2cc` and `+0x2d4`: the other status lines (hidden or cleared on this path; blanked if set).
+    Other,
+    /// `+0x2bc`, `+0x2c4`: the materials' names; `+0x2c0`, `+0x2c8`: their counts.
+    Name1,
+    Name2,
     Count1,
     Count2,
-    /// `+0x2c4`: the second material's name (blanked when the piece has one material).
-    Name2,
 }
 
-const PANES: [(u32, Pane); 7] = [
+const PANES: [(u32, Pane); 9] = [
     (0x2b4, Pane::Name),
     (0x2d0, Pane::Output),
-    (0x2cc, Pane::Status),
-    (0x2d4, Pane::Status2),
+    (0x2e4, Pane::Status),
+    (0x2cc, Pane::Other),
+    (0x2d4, Pane::Other),
+    (0x2bc, Pane::Name1),
+    (0x2c4, Pane::Name2),
     (0x2c0, Pane::Count1),
     (0x2c8, Pane::Count2),
-    (0x2c4, Pane::Name2),
 ];
 
 /// The text for a panel pane, for the hovered entry (`None`: leave the game's).
@@ -387,30 +410,33 @@ pub fn pane_text(pane: Pane, hovered: Option<&Entry>, entries: Option<&[Entry]>)
     let Some(e) = hovered else {
         return Some(match (pane, entries) {
             (Pane::Name, _) => "Wishlist".into(),
-            (Pane::Output, None) => "No wishlist data yet".into(),
-            (Pane::Output, Some([])) => "The wishlist is empty".into(),
-            (Pane::Output, Some(l)) => format!("{} of {} ready", l.iter().filter(|e| e.ready).count(), l.len()),
-            (Pane::Status, _) => "Add pieces in the F1 overlay".into(),
+            (Pane::Status, None) => "No wishlist data yet (F1)".into(),
+            (Pane::Status, Some([])) => "The wishlist is empty (F1)".into(),
+            (Pane::Status, Some(l)) => format!("{} of {} ready", l.iter().filter(|e| e.ready).count(), l.len()),
             _ => String::new(),
         });
     };
     let count = |i: usize| e.materials.get(i).map(|m| format!("{}/{}", m.have, m.need));
     Some(match pane {
         Pane::Name => e.name.clone(),
-        Pane::Output if e.ready => "Ready to craft".into(),
-        Pane::Output => format!(
-            "Need {} more",
-            e.materials.iter().map(|m| m.need.saturating_sub(m.have)).sum::<u32>()
-        ),
-        Pane::Status => match e.materials.len() {
-            0..=2 => "Materials: have/need".into(),
-            n => format!("+{} more materials (F1)", n - 2),
-        },
-        Pane::Status2 => String::new(),
+        Pane::Status => {
+            let more = match e.materials.len() {
+                0..=2 => String::new(),
+                n => format!(" (+{} more)", n - 2),
+            };
+            if e.ready {
+                format!("Ready to craft{more}")
+            } else {
+                let missing: u32 = e.materials.iter().map(|m| m.need.saturating_sub(m.have)).sum();
+                format!("Need {missing} more{more}")
+            }
+        }
+        Pane::Output | Pane::Other => String::new(),
         Pane::Count1 => count(0).unwrap_or_default(),
         Pane::Count2 => count(1).unwrap_or_default(),
+        Pane::Name1 if e.materials.is_empty() => String::new(),
         Pane::Name2 if e.materials.len() < 2 => String::new(),
-        Pane::Name2 => return None,
+        Pane::Name1 | Pane::Name2 => return None,
     })
 }
 
@@ -420,6 +446,8 @@ pub const TITLE_RETURNS: [u32; 2] = [0x0265_fa48, 0x0265_fa98];
 pub const ORDER_RETURNS: [u32; 3] = [0x0266_390c, 0x0266_3974, 0x0266_39d4];
 /// `f_02144d18(ui, text, 0)`'s call for the help line in the Combo List's draw returns here.
 pub const HELP_RETURN: u32 = 0x0266_3c50;
+/// The other help-line call (`f_02144998`, taken when `S+0x18` is set) returns here.
+pub const HELP_RETURN_ALT: u32 = 0x0266_3c34;
 
 /// Text slots in the runtime's buffer, 64 bytes each from `PAGE_TEXT_AT` (0 to 7 the rows).
 const SLOT_TITLE: usize = 8;
@@ -454,6 +482,7 @@ fn page_text(h: &mut Hook) {
         return;
     }
     let (opened, panel, hovered, page_no) = (page.opened, page.panel, page.hovered.clone(), page.page);
+    trace(c);
     if TITLE_RETURNS.contains(&c.lr) {
         put_text(c, &mut st, SLOT_TITLE, "Wishlist", true);
         return;
@@ -484,15 +513,39 @@ fn page_text(h: &mut Hook) {
     };
     let entries = ENTRIES.lock().unwrap_or_else(|e| e.into_inner()).clone();
     if let Some(text) = pane_text(which, hovered.as_ref(), entries.as_deref()) {
-        let slot = SLOT_PANE + PANES.iter().position(|(_, p)| *p == which).unwrap_or(0);
+        let slot = SLOT_PANE + PANES.iter().position(|(off, _)| g.u32(panel + off) == pane).unwrap_or(0);
         put_text(c, &mut st, slot, &text, true);
     }
+}
+
+/// `MH3U_NATIVE_MENU_TRACE=1`: logs each text set while the Mods page is up, once per (caller, pane), with its text, to find
+/// the panes still showing the Combo List's text (the button hints).
+fn trace(c: &crate::Ctx) {
+    static ON: OnceLock<bool> = OnceLock::new();
+    static SEEN: Mutex<Vec<(u32, u32)>> = Mutex::new(Vec::new());
+    if !*ON.get_or_init(|| std::env::var("MH3U_NATIVE_MENU_TRACE").is_ok_and(|v| v.trim() == "1")) {
+        return;
+    }
+    let key = (c.lr, c.r[3]);
+    let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    if seen.contains(&key) || seen.len() > 400 {
+        return;
+    }
+    seen.push(key);
+    let g = crate::guest::Guest::new(c.mem);
+    let text: String = g
+        .cstr(c.r[4])
+        .chars()
+        .take(60)
+        .map(|ch| if ch.is_ascii_graphic() || ch == ' ' { ch } else { '?' })
+        .collect();
+    eprintln!("[native-menu] trace: text_set lr {:#x} pane {:#x}: \"{text}\"", c.lr, c.r[3]);
 }
 
 /// The help line (`f_02144d18(ui, text, 0)`, `help_set`) from the Combo List's draw, on the Mods page.
 fn help(h: &mut Hook) {
     let c = &mut *h.ctx;
-    if c.lr != HELP_RETURN || c.r[4] == 0 {
+    if !(c.lr == HELP_RETURN || c.lr == HELP_RETURN_ALT) || c.r[4] == 0 {
         return;
     }
     let mut st = STATE.lock().unwrap_or_else(|e| e.into_inner());
@@ -575,6 +628,7 @@ pub fn register(r: &mut Registry) -> bool {
     let text = r.on("text_set", Box::new(page_text));
     let panel_hook = r.on("combo_panel", Box::new(panel));
     let help_hook = r.on("help_set", Box::new(help));
+    r.on("help_set_alt", Box::new(help));
     if !(panel_hook && help_hook) {
         eprintln!(
             "[native-menu] the build lacks combo_panel ({panel_hook}) or help_set ({help_hook}): the side panel and help line stay the Combo List's; translate again"
@@ -659,17 +713,21 @@ mod tests {
         let e = entry("Bone Helm", &[(10, 1, 3), (11, 2, 2), (12, 0, 1)]);
         let t = |p| pane_text(p, Some(&e), None).unwrap_or_default();
         assert_eq!(t(Pane::Name), "Bone Helm");
-        assert_eq!(t(Pane::Output), "Need 3 more");
+        assert_eq!(t(Pane::Status), "Need 3 more (+1 more)");
+        assert_eq!((t(Pane::Output), t(Pane::Other)), (String::new(), String::new()));
         assert_eq!(t(Pane::Count1), "1/3");
         assert_eq!(t(Pane::Count2), "2/2");
-        assert_eq!(t(Pane::Status), "+1 more materials (F1)");
-        assert_eq!(pane_text(Pane::Name2, Some(&e), None), None, "the game's own name");
+        assert_eq!(pane_text(Pane::Name1, Some(&e), None), None, "the game's own name");
+        assert_eq!(pane_text(Pane::Name2, Some(&e), None), None);
         let one = entry("Potion", &[(1, 5, 1)]);
-        assert_eq!(pane_text(Pane::Output, Some(&one), None).unwrap(), "Ready to craft");
+        assert_eq!(pane_text(Pane::Status, Some(&one), None).unwrap(), "Ready to craft");
         assert_eq!(pane_text(Pane::Name2, Some(&one), None).unwrap(), "");
         let all = [e.clone(), one.clone()];
-        assert_eq!(pane_text(Pane::Output, None, Some(&all)).unwrap(), "1 of 2 ready");
+        assert_eq!(pane_text(Pane::Status, None, Some(&all)).unwrap(), "1 of 2 ready");
         assert_eq!(pane_text(Pane::Name, None, None).unwrap(), "Wishlist");
+        for p in [Pane::Name1, Pane::Name2, Pane::Count1, Pane::Count2, Pane::Output] {
+            assert_eq!(pane_text(p, None, Some(&all)).unwrap(), "", "no stale materials on an empty row");
+        }
     }
 
     #[test]

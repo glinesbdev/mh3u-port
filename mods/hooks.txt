@@ -35,3 +35,4 @@ in:0x0219b080 item_to_pouch      # f_0219aeac(save, item, count): count -1 = an 
 0x02234218 combo_update       # f_02234218(menu, S): the Combo List page's update (Ghidra; from f_02153eb4 when S+0x1e = 2). MH3U_NATIVE_MENU borrows the page as the Mods page
 0x0265bfac combo_panel        # f_0265bfac(panel, S): the Combo List's side panel (Ghidra; from f_026636d4). MH3U_NATIVE_MENU keeps the panel object to tell its panes apart
 0x02144d18 help_set           # f_02144d18(ui, text, 0): sets the help line (Ghidra). MH3U_NATIVE_MENU swaps the Combo List's (lr 0x2663c50) on the Mods page
+0x02144998 help_set_alt       # f_02144998(ui, text): the help line's other setter (Ghidra; f_026636d4 takes it when S+0x18 is set, lr 0x2663c34). MH3U_NATIVE_MENU swaps it on the Mods page
