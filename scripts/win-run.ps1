@@ -84,7 +84,10 @@ if ($Scale) {
     $set['MH3U_GFX_RESOLUTION_SCALE'] = $Scale
 }
 if ($NativeText) {
-    $set['MH3U_NATIVE_TEXT', 'MH3U_MENU_PROBE'] = '1'
+    $set['MH3U_NATIVE_TEXT'] = '1'
+}
+if ($MenuProbe) {
+    $set['MH3U_MENU_PROBE'] = '1'
 }
 
 $runArgs = @('run', $Games, $Out, '--window', '--max-imports', '1000000000000')

@@ -124,9 +124,19 @@ fn snapshot(h: &Hook, s: u32) -> Option<(Snapshot, crate::guest::Guest)> {
     Snapshot::parse(&b).map(|x| (x, g))
 }
 
+/// Says why the probe is off when it was asked for but the build has no hooks list (`hooks.txt` in the build folder).
+pub fn no_hooks() {
+    if enabled() {
+        eprintln!("[menu-probe] off: the build has no hooks (translate again: win-build.ps1 -Translate)");
+    }
+}
+
 /// Registers the probe's callbacks when `MH3U_MENU_PROBE=1`.
 pub fn register(r: &mut Registry) -> bool {
     if !enabled() {
+        if let Ok(v) = std::env::var("MH3U_MENU_PROBE") {
+            eprintln!("[menu-probe] off: MH3U_MENU_PROBE is '{v}', not 1");
+        }
         return false;
     }
     let start = r.on(

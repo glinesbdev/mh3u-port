@@ -934,6 +934,8 @@ fn run_game(dump: &Dump, c_dir: &Path, max_imports: u64, save: PathBuf, window: 
             eprintln!("[overlay] {n} hooks feed the overlay; the live save is read on their events and every 2 s");
         }
         mh3u_rt::hooks::install(registry);
+    } else {
+        mh3u_rt::menu_probe::no_hooks();
     }
     let text = rpx::section_at(&data, TEXT_ADDRESS)?;
     let mut content: Vec<PathBuf> = Vec::new();
