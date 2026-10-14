@@ -149,6 +149,11 @@ byte-for-byte the base game's, so reading the base is not a cause.
 The live save holds no slot number, so a list belongs to the hunter's name (the name read from the live save, the one the search
 found it by). The file name is the name with anything but ASCII letters, digits, `-` and `_` written as `~` and hex bytes.
 
+- **In game or not:** the save alone does not tell. At the title screen ("PRESS A") the slot's data is already in memory (PR #25's
+  first test showed Shamus's list there). So the overlay accepts a hunter only while the game's current area is an in-game one.
+  It reads the area as `mh3u-rt/src/scene.rs` describes: `sArea`'s areas and each one's class. The village, harbor, quests, lobby,
+  results and arena count as in game. The title (`aStartMenu`), boot, options, gallery and data transfer count as not. A change is
+  logged as `[scene] InGame (areas: aVillage)`. Leaving for the title counts as unloading. `MH3U_SCENE_CHECK=off` skips the check.
 - **Before a hunter is loaded** (title screen, slot select, or while the search is still running): the overlay says "No hunter
   loaded" and offers no picker or list. The native Mods page and the item-menu line say "No hunter loaded" too. No list is read.
 - **A hunter is loaded:** once the live save is found and parsed, that hunter's list is read and everything works out from it.

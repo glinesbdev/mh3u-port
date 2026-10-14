@@ -125,6 +125,15 @@ pub struct Overlay {
     f10: u32,
 }
 
+/// Why there is no hunter while the game is not in play.
+const NOT_IN_GAME: &str = "not in game (title screen or slot select)";
+
+/// Whether a hunter is playing (`mh3u_rt::scene`); `MH3U_SCENE_CHECK=off` skips the check (if the area cannot be read).
+fn in_game() -> bool {
+    static OFF: LazyLock<bool> = LazyLock::new(|| std::env::var("MH3U_SCENE_CHECK").is_ok_and(|v| v.trim() == "off"));
+    *OFF || mh3u_rt::scene::scene() == mh3u_rt::scene::Scene::InGame
+}
+
 /// How many events the feed shows.
 const FEED: usize = 8;
 
@@ -221,6 +230,24 @@ impl Overlay {
             eprintln!(
                 "[watch-live] F10: the live save is not found yet, so there is no pouch to search for; wait for `[overlay] the live save is at`"
             );
+        }
+        // a save in memory is not a hunter playing: at the title the slot's data is already there (mh3u_rt::scene)
+        if !in_game() {
+            if !matches!(&self.save, Save::Waiting { reason, .. } if reason == NOT_IN_GAME) {
+                if !matches!(self.save, Save::Waiting { .. }) {
+                    eprintln!("[overlay] {NOT_IN_GAME}: the wishlist waits for a hunter to be loaded");
+                }
+                mods::stop_search();
+                mods::watch(&[]);
+                self.leave();
+                self.failures = 0;
+                self.logged.clear();
+                self.save = Save::Waiting {
+                    until: Instant::now(),
+                    reason: NOT_IN_GAME.into(),
+                };
+            }
+            return;
         }
         match &mut self.save {
             Save::Waiting { until, .. } => {
@@ -581,7 +608,9 @@ impl Overlay {
                         None
                     }
                     Save::Waiting { until, reason } => {
-                        if !reason.is_empty() {
+                        if reason == NOT_IN_GAME {
+                            ui.label("Not in game yet (title screen or slot select).");
+                        } else if !reason.is_empty() {
                             ui.colored_label(egui::Color32::LIGHT_RED, format!("No live save: {reason}"));
                             let left = until.saturating_duration_since(Instant::now()).as_secs();
                             ui.label(format!(
