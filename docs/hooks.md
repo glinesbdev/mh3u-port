@@ -23,7 +23,7 @@ Mods so far only read memory (`overlay.md`). Hooks let a mod run native code whe
 - **Exits (later):** at a hook's entry, the runtime will save the link register and point it at a small host trampoline, so
   the callback also runs on return (`r3` is then the result). This is not built yet.
 - **Example:** the `log` callback prints the hook's name and `r3`–`r5`. It logs the first 20 calls of each hook, then every
-  1000th. `MH3U_HOOK_LOG=1` puts it on every hook in the list, and prints at startup where each one landed (`[hooks] menu_probe_c is f_…`; the build also prints `[hooks] in:0x… name is in f_…`).
+  1000th. `MH3U_HOOK_LOG=1` puts it on every hook in the list, and prints at startup where each one landed (`[hooks] menu_open is f_…`; the build also prints `[hooks] in:0x… name is in f_…`).
 
 ## Candidate hook points
 
@@ -315,6 +315,16 @@ Send back `Desktop\session.log` with your notes (the order of the steps, and whi
 - **Menu open, next:** `in:` probes on the functions containing the run 39 callers (`menu_probe_c` to `menu_probe_f`, lr
   `0x2661768`, `0x2662a74`, `0x21546fc`, `0x21b78b8`). The translator prints the function each one landed in
   (`[hooks] in:0x… name is in f_…`). Whichever fires once per open is `menu_open`.
+
+### Run 41 (build `c213607`; item menu opened and closed twice, then the main menu once)
+
+- **Probes c to f** (`f_026615a8`, `f_0266298c`, `f_02154484`, `f_021b77e0`) run every frame (e and f all the time, c and d while
+  a menu is up), so they are not opens. Removed.
+- **`menu_open` (`f_02153480`, medium confidence):** the call with r5 = -1 from lr `0x21546fc` came exactly 3 times, once at the
+  start of each open (item, item, main); its other calls (r5 = `0x2e63c660` or `0x30296550`) follow every menu change.
+- **`menu_page` (`f_02037600`, medium confidence):** r4 = 3 (lr `0x2662a74`) came exactly twice, once in each item-menu open
+  and not for the main menu; r4 = 0 follows every change.
+- Wired as the overlay events `menu opened` and `item menu opened`. Next: confirm with a timed run (below in the PR report).
 
 ## Plan
 

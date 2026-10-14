@@ -26,6 +26,10 @@ pub enum Event {
         count: u32,
     },
     PouchRemove,
+    /// `menu_open` with r5 = -1 (run 41): a menu opened (the item menu or the main one).
+    MenuOpen,
+    /// `menu_page` with r4 = 3 (run 41): the item menu opened.
+    ItemMenu,
     Money(i32),
     Craft {
         jewel: bool,
@@ -84,6 +88,22 @@ pub fn register(r: &mut Registry) -> usize {
             }
         }),
     ));
+    n += usize::from(r.on(
+        "menu_open",
+        Box::new(|h: &mut Hook| {
+            if let Some(e) = menu_open(h.ctx.r[5], h.ctx.lr) {
+                push(e);
+            }
+        }),
+    ));
+    n += usize::from(r.on(
+        "menu_page",
+        Box::new(|h: &mut Hook| {
+            if let Some(e) = menu_page(h.ctx.r[4]) {
+                push(e);
+            }
+        }),
+    ));
     let mut on = |name: &str, f: fn(&Hook) -> Event| {
         n += usize::from(r.on(name, Box::new(move |h: &mut Hook| push(f(h)))));
     };
@@ -118,6 +138,16 @@ fn item_gain(item: u32, lr: u32) -> Option<Event> {
     Some(Event::ItemGain { item: item as u16, to })
 }
 
+/// `menu_open`: an open is r5 = -1 from lr 0x21546fc (run 41); its other calls (each frame of a change) are not.
+fn menu_open(r5: u32, lr: u32) -> Option<Event> {
+    (r5 == u32::MAX && lr == 0x0215_46fc).then_some(Event::MenuOpen)
+}
+
+/// `menu_page`: page 3 is the item menu (run 41).
+fn menu_page(r4: u32) -> Option<Event> {
+    (r4 == 3).then_some(Event::ItemMenu)
+}
+
 /// A line for the overlay's event feed.
 pub fn describe(e: &Event, item_name: &dyn Fn(u16) -> String) -> Option<String> {
     Some(match *e {
@@ -139,6 +169,8 @@ pub fn describe(e: &Event, item_name: &dyn Fn(u16) -> String) -> Option<String> 
                 format!("- {} x{count} used", item_name(item))
             }
         }
+        Event::MenuOpen => "menu opened".into(),
+        Event::ItemMenu => "item menu opened".into(),
         Event::PouchRemove => "a pouch item went to the box".into(),
         Event::Money(d) => format!("{d:+}z"),
         Event::Craft { jewel: true } => "crafted a jewel".into(),
@@ -315,5 +347,17 @@ mod tests {
             "a later pickup"
         );
         assert_eq!(item_to_pouch(9, 2), None);
+    }
+
+    #[test]
+    fn menu_opens_come_from_their_calls_only() {
+        let name = |_: u16| String::new();
+        assert_eq!(menu_open(u32::MAX, 0x0215_46fc), Some(Event::MenuOpen));
+        assert_eq!(menu_open(0x2e63_c660, 0x021b_78b8), None);
+        assert_eq!(menu_open(0x3029_6550, 0x0215_46fc), None);
+        assert_eq!(menu_page(3), Some(Event::ItemMenu));
+        assert_eq!(menu_page(0), None);
+        assert_eq!(describe(&Event::ItemMenu, &name).unwrap(), "item menu opened");
+        assert_eq!(describe(&Event::MenuOpen, &name).unwrap(), "menu opened");
     }
 }
