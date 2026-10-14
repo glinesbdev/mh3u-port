@@ -205,6 +205,11 @@ impl<F: FnOnce(Display) + Send + 'static> App<F> {
             .as_ref()
             .map_or((0, (0.0, 0.0)), |b| (b.buttons(&self.keys), b.left_stick(&self.keys)));
         INPUT.set_keyboard_buttons(buttons);
+        // the native menu's mod key (MH3U_NATIVE_MENU_KEY; docs/native-menu.md)
+        mh3u_rt::native_menu::HELD.store(
+            self.keys.contains(mh3u_rt::native_menu::key()),
+            std::sync::atomic::Ordering::Relaxed,
+        );
         for (i, v) in [x, y, 0.0, 0.0].into_iter().enumerate() {
             INPUT.set_keyboard_axis(i, v);
         }

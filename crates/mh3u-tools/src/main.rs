@@ -927,11 +927,17 @@ fn run_game(dump: &Dump, c_dir: &Path, max_imports: u64, save: PathBuf, window: 
         // the overlay's events (item gains, money, crafts, quest ends; docs/overlay.md)
         // opt-in: the wishlist's status in the item menu's last empty slot (MH3U_NATIVE_TEXT=1; docs/native-menu.md)
         mh3u_rt::native_text::register(&mut registry);
+        // opt-in, read-only: the start menu's state on each change (MH3U_MENU_PROBE=1; docs/native-menu.md)
+        mh3u_rt::menu_probe::register(&mut registry);
+        // opt-in: while the mod key is held, the start menu's Gestures row is a Mods entry (MH3U_NATIVE_MENU=1; docs/native-menu.md)
+        mh3u_rt::native_menu::register(&mut registry);
         let n = mh3u_gfx::events::register(&mut registry);
         if n > 0 {
             eprintln!("[overlay] {n} hooks feed the overlay; the live save is read on their events and every 2 s");
         }
         mh3u_rt::hooks::install(registry);
+    } else {
+        mh3u_rt::menu_probe::no_hooks();
     }
     let text = rpx::section_at(&data, TEXT_ADDRESS)?;
     let mut content: Vec<PathBuf> = Vec::new();

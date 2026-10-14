@@ -28,7 +28,7 @@ A layer for mods that read the game without changing it:
 **First target: a blacksmith wishlist.** Pick armour pieces or weapons, track the materials they need against the item box (and
 pouch), and show a notification when everything for a piece is ready.
 
-**Later, possibly:** native in-game menus (research in `native-menu.md`, with Ghidra as in `ghidra.md`; first step, opt-in game-drawn text, in PR #20; a "Mods" row in the start menu opening a mod list is planned there), by hooking the game's own menu functions so that mod entries appear in them instead of in
+**Later, possibly:** native in-game menus (research in `native-menu.md`, with Ghidra as in `ghidra.md`; first step, opt-in game-drawn text, in PR #20; a "Mods" row in the start menu opening a mod list is planned there, starting with a read-only probe, `MH3U_MENU_PROBE`; the opt-in entry, `MH3U_NATIVE_MENU`, takes the Gestures row over while a key is held, PR #21), by hooking the game's own menu functions so that mod entries appear in them instead of in
 the overlay.
 
 ### Reuse the companion's reverse engineering

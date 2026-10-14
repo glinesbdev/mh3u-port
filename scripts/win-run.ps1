@@ -30,7 +30,14 @@ param(
     [ValidateSet('1', '2', '3', '4')]
     [string]$Scale,
     # Opt-in: the wishlist's status in the item menu's last empty slot, drawn by the game (MH3U_NATIVE_TEXT; docs/native-menu.md).
-    [switch]$NativeText
+    [switch]$NativeText,
+    # Opt-in, read-only: log the start menu's state on each change (MH3U_MENU_PROBE; docs/native-menu.md).
+    [switch]$MenuProbe,
+    # Opt-in: while the mod key is held, the start menu's Gestures row reads "Mods" and A on it logs instead of opening Gestures
+    # (MH3U_NATIVE_MENU; docs/native-menu.md). Needs a build translated with the current mods/hooks.txt (win-build.ps1 -Translate).
+    [switch]$NativeMenu,
+    # The mod key for -NativeMenu, as winit names keys (ShiftRight, AltLeft, KeyM...; MH3U_NATIVE_MENU_KEY). Default ShiftRight.
+    [string]$NativeMenuKey
 )
 $ErrorActionPreference = 'Stop'
 $repo = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot '..')).Path
@@ -48,7 +55,8 @@ foreach ($p in @($tools, (Join-Path $Out 'game.dll'), $Games)) {
 $stale = @(
     'MH3U_FPS', 'MH3U_GFX_TIMES', 'MH3U_GFX_REPORT', 'MH3U_GFX_LOG', 'MH3U_GFX_DUMP_FRAME', 'MH3U_GFX_DUMP_DIR',
     'MH3U_GFX_DEBUG_PS', 'MH3U_GFX_DEBUG_PS_ONLY', 'MH3U_GFX_SOLID', 'MH3U_GFX_DEPTH_BIAS', 'MH3U_GFX_TEXDUMP',
-    'MH3U_GFX_SAVE', 'MH3U_GFX_SAVE_EVERY', 'MH3U_GFX_SAVE_IMAGE', 'MH3U_PAD_LAYOUT', 'MH3U_GFX_RESOLUTION_SCALE', 'MH3U_NATIVE_TEXT'
+    'MH3U_GFX_SAVE', 'MH3U_GFX_SAVE_EVERY', 'MH3U_GFX_SAVE_IMAGE', 'MH3U_PAD_LAYOUT', 'MH3U_GFX_RESOLUTION_SCALE', 'MH3U_NATIVE_TEXT', 'MH3U_MENU_PROBE',
+    'MH3U_NATIVE_MENU', 'MH3U_NATIVE_MENU_KEY'
 )
 foreach ($name in $stale) {
     if (Test-Path -LiteralPath "Env:$name") {
@@ -83,6 +91,15 @@ if ($Scale) {
 }
 if ($NativeText) {
     $set['MH3U_NATIVE_TEXT'] = '1'
+}
+if ($MenuProbe) {
+    $set['MH3U_MENU_PROBE'] = '1'
+}
+if ($NativeMenu) {
+    $set['MH3U_NATIVE_MENU'] = '1'
+}
+if ($NativeMenuKey) {
+    $set['MH3U_NATIVE_MENU_KEY'] = $NativeMenuKey
 }
 
 $runArgs = @('run', $Games, $Out, '--window', '--max-imports', '1000000000000')
