@@ -384,6 +384,7 @@ impl Overlay {
             |i| save.item_count(i) + self.provisional.extra(i),
         );
         mh3u_rt::native_text::set(native_line(&statuses));
+        mh3u_rt::native_menu::set_lines(Some(page_lines(&statuses, |p| data.piece_name(p.kind, p.id))));
         let new = self.craftable.update(&statuses);
         let names: Vec<String> = new
             .iter()
@@ -699,6 +700,22 @@ fn native_line(statuses: &[mh3u_mods::wishlist::Status]) -> Option<String> {
     }
     let missing: u32 = statuses.iter().flat_map(|s| s.materials.iter()).map(|n| n.missing()).sum();
     Some(format!("Wishlist: need {missing} items"))
+}
+
+/// One line a wishlist piece for the native Mods page (`MH3U_NATIVE_MENU`): `Name: ready` or `Name: need N`.
+fn page_lines<'a>(statuses: &[mh3u_mods::wishlist::Status], name: impl Fn(mh3u_mods::wishlist::Piece) -> Option<&'a str>) -> Vec<String> {
+    statuses
+        .iter()
+        .map(|s| {
+            let n = name(s.piece).unwrap_or("?");
+            if s.craftable {
+                format!("{n}: ready")
+            } else {
+                let missing: u32 = s.materials.iter().map(|m| m.missing()).sum();
+                format!("{n}: need {missing}")
+            }
+        })
+        .collect()
 }
 
 #[cfg(test)]

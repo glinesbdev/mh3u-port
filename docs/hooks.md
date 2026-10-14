@@ -340,7 +340,9 @@ Send back `Desktop\session.log` with your notes (the order of the steps, and whi
 
 `menu_rows` (`f_02152874`, called right after the start menu refills its rows) and `menu_update` also carry the opt-in Mods entry
 (`MH3U_NATIVE_MENU=1`, `native-menu.md`): while the mod key is held, the Gestures row's label is swapped and A on it is kept from
-the game. Builds translated before this need `win-build.ps1 -Translate` for `menu_rows`.
+the game. Builds translated before this need `win-build.ps1 -Translate` for `menu_rows`. `combo_update` (`f_02234218`, the Combo
+List page's update) and `text_set` carry the Mods page (PR #22): the page's buttons are cut to up, down and B, and its rows show
+the wishlist.
 
 ### Hooks that change a call
 

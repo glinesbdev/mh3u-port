@@ -209,7 +209,7 @@ default; `win-run.ps1 -NativeMenu` (`run.sh --native-menu`) turns it on. It need
     row draw (`f_026615a8`) reads the pointer each frame (`text_set` from `0x026625a0`).
   - **A on row 4:** on `menu_update`'s entry, with A (`0x10`) in `S+4`, the bit is cleared for that frame, so the game's if/else
     chain never reaches Gestures (`f_0222bdd8`). The menu stays up, no sound plays, and the log says `[native-menu] Mods selected`
-    (once per press). The next PR opens a mod list here.
+    (once per press). PR #22 opens the Mods page here (below).
 - **When the key is let go** (or another tab, the second-level list or a close comes up), the game's own pointer is written back
   at once (`[native-menu] Gestures label restored`); the game would also refill it on its next frame. Gestures works as usual.
 - **Log:** `[native-menu] on (MH3U_NATIVE_MENU): hold ShiftRight ...` at startup (or a line saying the build lacks the hooks),
@@ -218,6 +218,59 @@ default; `win-run.ps1 -NativeMenu` (`run.sh --native-menu`) turns it on. It need
 - **Risks:** if `S+4` is a held mask rather than a press, letting go of the key while A is still down would open Gestures (the
   check is every frame, so holding both keeps it off). The addresses are for the update `.rpx` (`ghidra.md`). A mode with 5 rows
   (`S+0x20` = 5) has no row 4 to take, so nothing changes there.
+
+### The Mods page (`MH3U_NATIVE_MENU=1`, PR #22): the wishlist on the Combo List page
+
+With the mod key held, A on Mods now opens a native **Mods page**: the game's own Combo List page, with its rows showing
+the wishlist. Needs a build translated with the current `mods/hooks.txt` (new hook `combo_update`).
+
+**How the start menu opens a page (Ghidra):** A on a row runs the row's opener (the if/else chain in `f_02154abc`). Combo List
+(tab 0, row 2) is `f_02152a88` -> `f_02233cec(menu, S, 1)`. That sets `S+0x1e` = 2 (which page), `S+0x20` = 8 rows, the page
+cursor `S+0x1ea` (row), `S+0x1e8` (page) and `S+0x1e9` (pages), and fills the page's display rows in `S` (`f_022338e8`). Then it
+sets `S+0` = 1 and opens UI screen (1, 5) through `ui->vtable + 0x13c`. While the page is up, `f_02153eb4(menu, S)` dispatches on
+`S+0x1e` to the page's update (2: `f_02234218`). Item Pouch and Combine open the same way.
+
+**The Combo List page:**
+- **Update `f_02234218(menu, S)`:** state `S+1` (0 browsing). In state 0:
+  - A (`0x10`) starts a combine. That flow (states 2 to 6) can change the pouch.
+  - B (`0x20`) returns 2 (back to the start menu).
+  - `0x80` reorders the list (state 10). This writes the save's combo order (`f_0219e470`).
+  - `0x200` and `0x10000` are other list functions. Left and right (`0xc`) change the page (`f_022338e8`).
+  - Up and down move the cursor (`f_0222cdc0`).
+- **Display rows in `S`:**
+  - `+0x26c`: combo id per row (`0xff` none).
+  - `+0x274`: a flag.
+  - `+0x27c + i*4`: the result item id (u16) and count (u16).
+  - `+0x230`: the selected combo's details.
+- **Draw `f_026636d4`:** it calls the item page's row draw `f_026611b8(widget, S+0x27c, S+0xb0, ..)`, so each row goes through
+  `f_02660a84`. A row with item id 0 gets the empty-slot text (message 3/`0x25c`) through `text_set` at `0x02660e64`, which
+  returns to `0x02660e68` with the row in `r24`. That is the same call the PR #20 text test uses.
+
+**What the mod does:**
+- **A on Mods:** the start menu's cursor `S+0x28` is moved to row 2 just before the game reads it, so the game opens the
+  Combo List itself. When the start menu runs again (after B), the cursor goes back to row 4.
+- **Each page frame (`combo_update` entry):**
+  - Only up, down and B reach the game: `S+4` is masked to `0x23` and `0xc` is cleared from `S+0xc`. A, reorder, the list
+    functions and the page change never run, so neither the pouch nor the save's combo order can change.
+  - The display rows are emptied with the values the game uses for "no row": id `0xff`, item 0, and no selected combo.
+- **Row text:** each row's empty-slot text set is pointed at the row's line in the runtime buffer (`0x0ff00200`, 64 bytes a
+  row). Row 0 is "Mods: Wishlist". The next rows are `Name: ready` or `Name: need N`, one per wishlist piece, as the overlay
+  works them out. With more than 7 pieces, the last row reads "...and N more (F1)". Before the overlay has read the save, or
+  with an empty wishlist, a row says so.
+- **The page is not reached** if the Combo List row is off (greyed). The game then plays its "no" sound, and the log says
+  `Mods page not opened`.
+- **Log lines:**
+  - `[native-menu] Mods selected: opening the Mods page ...`
+  - `[native-menu] Mods page closed`
+  - A line at startup if the build lacks `combo_update` or `text_set`. In that case A on Mods only logs, as in PR #21.
+- **Risks:**
+  - The page's title, help line and side panel are still the Combo List's.
+  - The first frame may show the real combos before the first update empties them.
+  - If `f_02154abc` were also to run while the page is up, the page would not be detected as closed until 3 menu frames
+    pass without a page frame.
+  - The addresses are for the update `.rpx`.
+  - Writes are limited to the page's display state in `S`, which the game rebuilds when the page opens, plus the runtime's
+    own buffer.
 
 ### Proposed PRs
 

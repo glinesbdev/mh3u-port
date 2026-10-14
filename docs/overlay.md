@@ -125,4 +125,5 @@ stay so after the quest ends (no double counting after the merge).
 With `MH3U_NATIVE_TEXT=1` (`win-run.ps1 -NativeText`), the overlay's wishlist status also shows in the item menu, in the last
 empty pouch slot, drawn by the game (`Wishlist: 1 of 2 ready`, `Wishlist: need 4 items`). The line is worked out where the
 craftable notices are (`overlay.rs`, `native_line`), so it follows the same reads of the live save. `native-menu.md` has how
-it works.
+it works. With `MH3U_NATIVE_MENU=1` (`-NativeMenu`), the same place also gives the native Mods page one line a piece
+(`page_lines`: `Name: ready` or `Name: need N`); hold Right Shift in the start menu and choose Mods.
