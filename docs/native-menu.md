@@ -160,6 +160,37 @@ the enabled byte, the label pointer at `+8` and its text) and the second-level l
 id and enabled byte). The line where the state becomes 3 ends in `(closing)`. Only labels pointing into `0x10000000`–`0xf0000000`
 are read, at most 40 bytes, printable ASCII.
 
+### Run 43 (the probe, build `298f9eb`): what it confirmed
+
+The log covers one open of the start menu with the cursor moved over Hunter tab rows 0 to 3, Item Pouch and Combine entered
+and left. No tab switch, second-level list, close or second open is in it.
+
+- **Confirmed:** `S` = `menu + 0x34` (`0x2e65df94`; `menu_update`'s `r4`). Tabs `S+0x24` = 2 ("Hunter", "Info"; both enabled),
+  cursor `S+0x25` = 0. Rows `S+0x20` = 6, cursor `S+0x28` follows up and down. Row records at `S+0xb0`, `+2` enabled
+  (all 1), `+8` the label: a pointer to the 8-bit text (`0x18fe7160` and on), which reads, in order, **Item Pouch, Combine,
+  Combo List, Hunter's Notes, Gestures, Quit Game**, as on screen. The open logged zeros before the reset (the first open).
+- **`S+0x1e`** became 1 after Item Pouch and 2 after Combine: the last page entered, not only the second list's action id.
+- **`S+0` stayed 0** in every logged frame (the menu's states 1 and 3 do not show while `f_02154abc` is running).
+- **Hunter's Notes is not the second-level list:** `S+0x1f` stayed 0. It opens its own page (`f_022365a8`, Monster List /
+  Hunter Info). The second-level list (`S+0x1f` = 2, labels from list 0x13) belongs to **Quit Game** (Hunter row 5), and on the
+  Info tab to row 3 (list 0x14) (`f_026615a8`).
+- **The start menu's row drawing (`f_026615a8`) has 6 row panes:** it draws rows while `i < S+0x20` and stops at 6 (`if (5 < i)`;
+  the pane arrays at `widget[0x161]` to `widget[0x164]` have 6 entries). A 7th row would never be drawn, while the cursor would
+  still move to it (the wrap uses the count). **So a "Mods" row cannot be added by raising the count to 7**, against the plan
+  above: that needs the layout's panes, or code, changed.
+- The row text is set with `text_set` from `0x026625a0` (the label pointer and its `strlen`).
+
+### Revised plan
+
+1. **Hijack a row label and action with a held modifier, opt-in:** with `MH3U_NATIVE_MENU=1`, while a chosen button is held (or
+   after toggling with a key), Gestures' label reads "Mods" (its record's `+8` pointing at the runtime buffer, or through
+   `text_set` at `0x026625a0` for row 4), and A on it is caught on `f_02154abc`'s entry (A cleared in `S+4` for that call). The
+   game's Gestures stays as it is otherwise.
+2. **Or a third entry in Quit Game's second-level list,** if its drawing has spare panes: to check with Ghidra (the list's
+   drawing code) and the probe (enter Quit Game, then back out).
+3. A short probe run to finish the picture: switch to the Info tab, step its rows, enter Quit Game's list and back out with B,
+   close, then open and close again.
+
 ### Proposed PRs
 
 1. **Read-only probe (small):** hooks on `f_02154abc` and `f_0215249c` that log `S+0x20`/`0x24`/`0x25`/`0x28`/`0x1f` on
