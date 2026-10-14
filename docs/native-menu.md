@@ -92,3 +92,70 @@ showing "Wishlist: 2 pieces ready". That needs:
    "mod entry" that does something.
 
 Writing into the game's memory is a change of rule (the overlay only reads), so it would be opt-in and limited to these buffers.
+
+## The start menu and a new page (research, Ghidra)
+
+### How the start menu is built
+
+- **Opening:** `f_02152c48(menu, open, kind)` (from the field's menu input `f_02154484`, `menu_open` above). `menu + 0x34` is
+  the start menu's state (`S` below; `f_02154484`'s `r4` is the same block). It resets the state, builds the lists
+  (`f_021528a0`), and then either opens the start menu screen through the UI manager, `(*ui->vtable + 0x13c)(ui, 2, 0)`, or,
+  for `kind` 1 to 6, goes straight to a page (`f_02152988` and the others: `(ui, 1, 5)` and so on). Screens and pages are opened
+  by number through that one virtual call (`ui` = `DAT_10314578`, made in `f_0213e5fc`).
+- **Not a layout file:** the entries are filled in by code with counts written as constants. The layout only gives each row's
+  panes (the shared row renderer has at most 8 rows).
+  - **Tabs:** count `S+0x24` (2, or 3 when `*(DAT_103a2f90 + 0x8b4)` is set), cursor `S+0x25`, records of 0x18 bytes at
+    `S+0x38` (`+1` selected, `+2` enabled).
+  - **Rows of the tab:** `f_0215249c` fills them each frame. Count `S+0x20` (`menu+0x54`: 6, or 5 in another mode), cursor
+    `S+0x28` (clamped), records of 0x18 bytes at `S+0xb0` (`+2` enabled, `+8` the label). There are **8 row records**
+    (`S+0xb0` to `S+0x170`), so rows 6 and 7 of a 6-row tab are space the game has but does not use.
+  - **Labels:** `f_021521ac(menu, list, i)` = message (table 3, `f_021520f4(list) + i`): consecutive message ids from a
+    per-list base (a small switch and two byte tables at `0x10020f52` and `0x10020f6b`).
+  - **Disabled rows:** each row's enabled byte is set by conditions (online, mode, the hunter's state). A disabled row is drawn
+    greyed and A on it plays the "no" sound (`f_020bfc74(.., 2)`). None is permanently unused.
+- **A second-level list** inside the start menu: sub-state `S+0x1f` (0 the tabs, 1 sliding in for 10 frames, 2 the list).
+  Count `S+0x22`, cursor `S+0x26`, records at `S+0x170` (`+0` the action id, `+1` selected (`f_02153038`), `+2` enabled).
+  A on a row stores its action id in `S+0x1e` and sets `S+0` = 1 (leave the menu to do it).
+
+### Input and dispatch (`f_02154abc`, the start menu's update, called with `S`)
+
+- Buttons from `S+4` (held/pressed) and `S+0xc` (repeat): `0x10` A, `0x20` B, `0x3` up/down (row cursor, wrapping:
+  `f_0223a0ec`), `0xc` left/right (tab cursor: `f_0223a0e0`). `f_021548cc` handles the shortcut buttons first (`0x10000`,
+  `0x80`) and can close the menu (returns 4).
+- **B:** `S+0` = 3 (close), `S+1` = 0, sound `0xc9`.
+- **A:** if the tab and row are enabled, a plain **if/else chain on (tab `S+0x25`, row `S+0x28`)**: tab 0 rows 0 to 5, tab 1
+  rows 0 to 5, tab 2 rows 0 to 4. Each calls the row's opener (e.g. tab 0 row 0: `f_02152988`, which opens UI (1, 5); row 5:
+  `f_0215481c` or `f_02154808`). It is not a jump table or function pointers, so a new row needs a hook here, not a table entry.
+- `S+0`: 0 idle, 1 doing an action, 2 open, 3 closing.
+
+### Adding an entry: add, not hijack
+
+Adding is feasible without patching code, with entry hooks that only touch the menu's own state:
+
+1. **Count and record:** after `f_0215249c` fills tab 0 (a hook on its caller, or on `f_02152874`, which runs right after it),
+   set `S+0x20` from 6 to 7 and fill record 6 (`S+0xb0 + 6*0x18`: enabled, label). That record is unused space inside the
+   game's own state block. This is a change to game memory, so opt-in as in PR #20.
+2. **Label:** the row's text is set through `f_02aff91c` like any other; the `text_set` hook from PR #20, keyed on the start
+   menu's row-draw return address and row 6, gives it "Mods".
+3. **Action:** a hook on `f_02154abc` entry: when A is pressed with tab 0, row 6, clear A in `S+4` for that call (so the game's
+   chain does nothing, as for a row past its last case) and open the mod page.
+
+Hijacking an existing row would need the same three pieces and would take a game feature away, so adding is the better choice.
+
+### The page to reuse
+
+The start menu's **own second-level list** (`S+0x1f` = 2): text rows, a cursor, count `S+0x22`, an enabled flag per row, A and B
+already handled, drawn by the start menu's layout (same font, no new layout). To open it with mod rows: set `S+0x22`, fill the
+records at `S+0x170` with action ids the game does not use, set `S+0x1f` = 1 (it slides in), and swap the rows' labels
+through `text_set`. A on a mod row puts its action id in `S+0x1e` and sets `S+0` = 1; a hook catches an action id of its own
+there before the game acts on it. The item page (`f_0266298c`) is a grid with icons and counts, so it fits a mod list less well.
+
+### Proposed PRs
+
+1. **Read-only probe (small):** hooks on `f_02154abc` and `f_0215249c` that log `S+0x20`/`0x24`/`0x25`/`0x28`/`0x1f` on
+   change, and the label message ids. This confirms the offsets and which tab and row is which. One run: open the start menu, move
+   through each tab and row, and close it.
+2. **"Mods" row (opt-in, `MH3U_NATIVE_MENU=1`):** count 6 to 7 on tab 0, record 6, the label through `text_set`, and A logs
+   "mod row selected" without leaving the menu.
+3. **Mod list:** A opens the second-level list with 2 or 3 mod rows (e.g. "Wishlist status", "Hide overlay"). Actions run in the
+   runtime; the game sees an unused action id that a hook catches.
