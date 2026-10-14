@@ -333,6 +333,11 @@ Send back `Desktop\session.log` with your notes (the order of the steps, and whi
   open and was ignored, as intended. **`menu_open`, `menu_page` and item use (`item_to_pouch` with a negative count) are
   confirmed.** The hooks' first list is complete.
 
+### The start menu probe
+
+`menu_start` (`f_02152c48`) and `menu_update` (`f_02154abc`) are in `mods/hooks.txt` for the read-only `MH3U_MENU_PROBE=1`
+(`native-menu.md`). Without it they only cost the registry's lookup, once per open and once per frame of the start menu.
+
 ### Hooks that change a call
 
 A callback may change the registers before the function runs (`Hook::ctx`; the hook runs before the function loads them). The

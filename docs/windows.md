@@ -129,7 +129,7 @@ fails on its exit code only.
 **`win-run.ps1`:**
 - It first clears the debugging variables an earlier run may have left in the session: `MH3U_FPS`, `MH3U_GFX_TIMES`,
   `MH3U_GFX_REPORT`, `MH3U_GFX_LOG`, `MH3U_GFX_DUMP_*`, `MH3U_GFX_DEBUG_PS*`, `MH3U_GFX_SOLID`, `MH3U_GFX_DEPTH_BIAS`,
-  `MH3U_GFX_TEXDUMP`, `MH3U_GFX_SAVE*`, `MH3U_PAD_LAYOUT`, `MH3U_GFX_RESOLUTION_SCALE` and `MH3U_NATIVE_TEXT`.
+  `MH3U_GFX_TEXDUMP`, `MH3U_GFX_SAVE*`, `MH3U_PAD_LAYOUT`, `MH3U_GFX_RESOLUTION_SCALE`, `MH3U_NATIVE_TEXT` and `MH3U_MENU_PROBE`.
 - Then it sets the ones its switches ask for:
   - `-Fps`: `MH3U_FPS` and `MH3U_GFX_TIMES`;
   - `-Report`: `MH3U_GFX_REPORT`;
@@ -137,7 +137,8 @@ fails on its exit code only.
   - `-DebugPs <mode>`: `MH3U_GFX_DEBUG_PS`;
   - `-PadLayout xbox|nintendo`: `MH3U_PAD_LAYOUT`;
   - `-Scale 1|2|3|4`: `MH3U_GFX_RESOLUTION_SCALE` (native size if omitted);
-  - `-NativeText`: `MH3U_NATIVE_TEXT=1` (the wishlist in the item menu, `native-menu.md`).
+  - `-NativeText`: `MH3U_NATIVE_TEXT=1` (the wishlist in the item menu, `native-menu.md`);
+  - `-MenuProbe`: `MH3U_MENU_PROBE=1` (logs the start menu's state, read-only, `native-menu.md`).
 
   It removes them again when the game ends.
 - It lists any other `MH3U_` variable still set (the cache and budget switches) as `also set:`.
@@ -148,7 +149,7 @@ fails on its exit code only.
 - It returns the game's exit code.
 
 On Linux, `scripts/run.sh` does the same as `win-run.ps1` (`--fps`, `--report`, `--dump DIR --frames N`, `--debug-ps MODE`,
-`--pad-layout L`, `--scale N`, `--native-text`, `--log FILE`; `--games` and `--out`, or `MH3U_GAMES` and `MH3U_OUT`).
+`--pad-layout L`, `--scale N`, `--native-text`, `--menu-probe`, `--log FILE`; `--games` and `--out`, or `MH3U_GAMES` and `MH3U_OUT`).
 
 ## Comparing builds (frame rate)
 

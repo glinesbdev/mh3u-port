@@ -150,6 +150,16 @@ records at `S+0x170` with action ids the game does not use, set `S+0x1f` = 1 (it
 through `text_set`. A on a mod row puts its action id in `S+0x1e` and sets `S+0` = 1; a hook catches an action id of its own
 there before the game acts on it. The item page (`f_0266298c`) is a grid with icons and counts, so it fits a mod list less well.
 
+### The probe (`MH3U_MENU_PROBE=1`, PR 1)
+
+Opt-in and read-only (`win-run.ps1 -MenuProbe`, `run.sh --menu-probe`; `mh3u-rt/src/menu_probe.rs`). Two hooks:
+`menu_start` on `f_02152c48` logs `[menu-probe] open (kind K, S 0x…); before the reset: …` (S as it was before the game resets
+it, so a later run can tell whether edits from the last open are still there), and `menu_update` on `f_02154abc` logs a line
+each time S changes: `state`, `sub`, `action`, the tabs (count, cursor, enabled bytes), the rows (count, cursor, and per row
+the enabled byte, the label pointer at `+8` and its text) and the second-level list (count, cursor, and per record the action
+id and enabled byte). The line where the state becomes 3 ends in `(closing)`. Only labels pointing into `0x10000000`–`0xf0000000`
+are read, at most 40 bytes, printable ASCII.
+
 ### Proposed PRs
 
 1. **Read-only probe (small):** hooks on `f_02154abc` and `f_0215249c` that log `S+0x20`/`0x24`/`0x25`/`0x28`/`0x1f` on

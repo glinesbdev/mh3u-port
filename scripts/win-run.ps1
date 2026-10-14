@@ -30,7 +30,9 @@ param(
     [ValidateSet('1', '2', '3', '4')]
     [string]$Scale,
     # Opt-in: the wishlist's status in the item menu's last empty slot, drawn by the game (MH3U_NATIVE_TEXT; docs/native-menu.md).
-    [switch]$NativeText
+    [switch]$NativeText,
+    # Opt-in, read-only: log the start menu's state on each change (MH3U_MENU_PROBE; docs/native-menu.md).
+    [switch]$MenuProbe
 )
 $ErrorActionPreference = 'Stop'
 $repo = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot '..')).Path
@@ -48,7 +50,7 @@ foreach ($p in @($tools, (Join-Path $Out 'game.dll'), $Games)) {
 $stale = @(
     'MH3U_FPS', 'MH3U_GFX_TIMES', 'MH3U_GFX_REPORT', 'MH3U_GFX_LOG', 'MH3U_GFX_DUMP_FRAME', 'MH3U_GFX_DUMP_DIR',
     'MH3U_GFX_DEBUG_PS', 'MH3U_GFX_DEBUG_PS_ONLY', 'MH3U_GFX_SOLID', 'MH3U_GFX_DEPTH_BIAS', 'MH3U_GFX_TEXDUMP',
-    'MH3U_GFX_SAVE', 'MH3U_GFX_SAVE_EVERY', 'MH3U_GFX_SAVE_IMAGE', 'MH3U_PAD_LAYOUT', 'MH3U_GFX_RESOLUTION_SCALE', 'MH3U_NATIVE_TEXT'
+    'MH3U_GFX_SAVE', 'MH3U_GFX_SAVE_EVERY', 'MH3U_GFX_SAVE_IMAGE', 'MH3U_PAD_LAYOUT', 'MH3U_GFX_RESOLUTION_SCALE', 'MH3U_NATIVE_TEXT', 'MH3U_MENU_PROBE'
 )
 foreach ($name in $stale) {
     if (Test-Path -LiteralPath "Env:$name") {
@@ -82,7 +84,7 @@ if ($Scale) {
     $set['MH3U_GFX_RESOLUTION_SCALE'] = $Scale
 }
 if ($NativeText) {
-    $set['MH3U_NATIVE_TEXT'] = '1'
+    $set['MH3U_NATIVE_TEXT', 'MH3U_MENU_PROBE'] = '1'
 }
 
 $runArgs = @('run', $Games, $Out, '--window', '--max-imports', '1000000000000')
