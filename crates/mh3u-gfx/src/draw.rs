@@ -2827,7 +2827,8 @@ impl Gx2 {
         }
         let Some(pass) = self.batch.pass.as_mut() else { return };
         let guest_w = g.u32(st.colour_buffers[0] + 4);
-        let scale = if guest_w == 0 { 1 } else { target_w / guest_w };
+        // the target is the guest size times the scale; never 0, even if the two disagree
+        let scale = target_w.checked_div(guest_w).unwrap_or(1).max(1);
         let [vx, vy, vw, vh, near, far] = st.viewport;
         let scale_f = scale as f32;
         let (vx, vy, vw, vh) = (vx * scale_f, vy * scale_f, vw * scale_f, vh * scale_f);

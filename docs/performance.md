@@ -287,6 +287,11 @@ move the village on its own.
 
 ## Fixed (for the record)
 
+- Game clock stalling after about 5 minutes (the 1-minute post-quest countdown lasted over 5): `OSGetTime` worked out ticks as
+  nanoseconds times 62,156,250 in a `u64`, which wraps after ~297 s, so the guest's time jumped backwards; `OSSleepTicks` and
+  `OSSetAlarm` had the same overflow the other way round (`ticks * 1e9` saturating). Fixed in PR #18 (43d696e, 1d903d6): ticks
+  are worked out in `u128` (`cafe.rs`, `ticks_after`) and split into seconds and a remainder (`sync.rs`, `ticks_to_duration`),
+  with tests at 5 and 50 minutes. The clock is wall time, so it is not tied to the frame rate, pauses or a minimised window.
 - Field slowdown while standing still (runs 11–13): vertex streams made every frame were kept until 1 GiB, and wgpu's per-pass
   bookkeeping grew with them. Fixed in PR #5 (f88327a); run 15 held 70–76 FPS in Moga Woods (open concern 3 has the details).
 - Gamepad face buttons: run 15's log showed `[gamepad] East is the GamePad's A` with the new default layout, so an Xbox pad's A is
