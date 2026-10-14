@@ -18,6 +18,7 @@ usage: scripts/run.sh [options]
   --frames N[,N...]  the frames --dump writes, counting swaps from 0 (default 2400)
   --debug-ps MODE    replace what pixel shaders put out (MH3U_GFX_DEBUG_PS): white, alpha1, tex, uv, inputN, ...
   --pad-layout L     xbox (the default) or nintendo (MH3U_PAD_LAYOUT)
+  --native-text      the wishlist's status in the item menu's last empty slot (MH3U_NATIVE_TEXT; opt-in)
   --scale N          internal resolution 1, 2, 3 or 4 (MH3U_GFX_RESOLUTION_SCALE); omit for the game's own size
   --log FILE         the log (default ./mh3u_latest.log; an older one is renamed after the time it was written)
 USAGE
@@ -26,7 +27,7 @@ USAGE
 repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 games="${MH3U_GAMES:-$HOME/Downloads/wiiu}"
 out="${MH3U_OUT:-$HOME/.local/share/mh3u/c}"
-fullscreen=0 fps=0 report=0 dump="" frames="2400" debug_ps="" pad_layout="" scale="" log=""
+fullscreen=0 fps=0 report=0 dump="" frames="2400" debug_ps="" pad_layout="" scale="" native_text=0 log=""
 while [ $# -gt 0 ]; do
     case "$1" in
         --games) games="$2"; shift 2 ;;
@@ -43,6 +44,7 @@ while [ $# -gt 0 ]; do
         --scale)
             case "$2" in 1|2|3|4) scale="$2" ;; *) echo "--scale is 1, 2, 3 or 4" >&2; exit 2 ;; esac
             shift 2 ;;
+        --native-text) native_text=1; shift ;;
         --log) log="$2"; shift 2 ;;
         -h|--help) usage; exit 0 ;;
         *) echo "unknown option: $1" >&2; usage >&2; exit 2 ;;
@@ -60,7 +62,7 @@ done
 # debugging variables left over in this shell would change what the game draws or prints
 for name in MH3U_FPS MH3U_GFX_TIMES MH3U_GFX_REPORT MH3U_GFX_LOG MH3U_GFX_DUMP_FRAME MH3U_GFX_DUMP_DIR \
     MH3U_GFX_DEBUG_PS MH3U_GFX_DEBUG_PS_ONLY MH3U_GFX_SOLID MH3U_GFX_DEPTH_BIAS MH3U_GFX_TEXDUMP \
-    MH3U_GFX_SAVE MH3U_GFX_SAVE_EVERY MH3U_GFX_SAVE_IMAGE MH3U_PAD_LAYOUT MH3U_GFX_RESOLUTION_SCALE; do
+    MH3U_GFX_SAVE MH3U_GFX_SAVE_EVERY MH3U_GFX_SAVE_IMAGE MH3U_PAD_LAYOUT MH3U_GFX_RESOLUTION_SCALE MH3U_NATIVE_TEXT; do
     if [ -n "${!name+x}" ]; then
         echo "cleared $name (was '${!name}')"
         unset "$name"
@@ -72,6 +74,7 @@ if [ -n "$dump" ]; then export MH3U_GFX_DUMP_DIR="$dump" MH3U_GFX_DUMP_FRAME="$f
 if [ -n "$debug_ps" ]; then export MH3U_GFX_DEBUG_PS="$debug_ps"; fi
 if [ -n "$pad_layout" ]; then export MH3U_PAD_LAYOUT="$pad_layout"; fi
 if [ -n "$scale" ]; then export MH3U_GFX_RESOLUTION_SCALE="$scale"; fi
+if [ "$native_text" = 1 ]; then export MH3U_NATIVE_TEXT=1; fi
 env | grep '^MH3U_' | sort || true
 
 if [ -z "$log" ]; then
