@@ -190,6 +190,7 @@ pub fn stop_search() {
 /// Called by the game thread at each buffer swap (with the baton): copies the watched ranges and goes on with the search.
 pub(crate) fn on_frame(g: &Guest) {
     GUEST_BASE.store(g.base_addr(), Relaxed);
+    crate::scene::on_frame(g);
     if !ACTIVE.load(Relaxed) {
         return;
     }

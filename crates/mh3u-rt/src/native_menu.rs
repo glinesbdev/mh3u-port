@@ -480,7 +480,7 @@ pub fn pane_text(pane: Pane, hovered: Option<&Entry>, entries: Option<&[Entry]>)
     let Some(e) = hovered else {
         return Some(match (pane, entries) {
             (Pane::Name, _) => "Wishlist".into(),
-            (Pane::Status, None) => "No wishlist data yet (F1)".into(),
+            (Pane::Status, None) => "No hunter loaded".into(),
             (Pane::Status, Some([])) => "The wishlist is empty (F1)".into(),
             (Pane::Status, Some(l)) => format!("{} of {} ready", l.iter().filter(|e| e.ready).count(), l.len()),
             _ => String::new(),
@@ -688,7 +688,7 @@ pub fn set_entries(entries: Option<Vec<Entry>>) {
 /// Page `page`'s 8 rows: one a piece; a note on row 0 when there is nothing to list.
 pub fn page_lines(entries: Option<&[Entry]>, page: usize) -> Vec<String> {
     let mut out: Vec<String> = match entries {
-        None => vec!["No wishlist data yet (F1 opens the overlay)".into()],
+        None => vec!["No hunter loaded (load a save slot)".into()],
         Some([]) => vec!["The wishlist is empty (add pieces in the F1 overlay)".into()],
         Some(l) => l.iter().skip(page * PAGE_LINES).take(PAGE_LINES).map(Entry::line).collect(),
     };
@@ -789,7 +789,7 @@ mod tests {
     fn the_page_lists_eight_pieces_a_page() {
         let p = page_lines(None, 0);
         assert_eq!(p.len(), PAGE_LINES);
-        assert!(p[0].starts_with("No wishlist data"));
+        assert!(p[0].starts_with("No hunter loaded"));
         assert!(page_lines(Some(&[]), 0)[0].contains("empty"));
         let many: Vec<Entry> = (0..10).map(|i| entry(&format!("piece {i}"), &[(1, 0, 2)])).collect();
         assert_eq!(page_lines(Some(&many), 0)[7], "piece 7: need 2");
