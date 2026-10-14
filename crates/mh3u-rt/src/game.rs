@@ -233,8 +233,11 @@ extern "C" fn unknown_call(c: *mut Ctx, target: u32) {
                     k.current, r[3], r[4], r[5]
                 );
             }
+            // the software keyboard is answered by the host (`swkbd`); everything else found at run time does nothing
+            let guest = &k.guest;
+            let r3 = crate::swkbd::call(name, |at, bytes| guest.write(at, bytes)).unwrap_or(u32::from(name.contains("Create")));
             // SAFETY: `c` is the context the translated code passed us
-            unsafe { (*c).r[3] = u32::from(name.contains("Create")) };
+            unsafe { (*c).r[3] = r3 };
             return;
         }
     }

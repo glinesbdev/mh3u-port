@@ -481,9 +481,16 @@ Each of these was found by looking at what the game was waiting for, with the de
   3 ms frame of the voices, paced by the sound device (`cpal`). A voice's position, which the game polls to refill its streams and to
   know that a sound ended, moves with what is mixed. `MH3U_AUDIO=off` mixes without playing.
 - **Alarms** (`OSSetAlarm`...) run their handlers on a thread of their own when they are due.
-- **Software keyboard** (`swkbd`, found at run time with `OSDynLoad_FindExport`): its functions still return 0 (`Create` returns 1).
-  The character screen's name field shows a notice and then does not move on, with input reaching the game correctly (checked with
-  `MH3U_TRACE_PAD`); the cause is not found. `Swkbd*Appear*` is never called, so it is not waiting for the keyboard.
+- **Software keyboard** (`swkbd.rpl`, found at run time with `OSDynLoad_FindExport`): answered by the host in
+  `mh3u-rt/src/swkbd.rs`. The name field on the character screen used to stop after its notice. The cause: the game's keyboard
+  set-up (`FUN_0293af30`) calls `SwkbdInitLearnDic` once per controller and gives up at the first 0, and every stub returned 0. So
+  the keyboard was never made and `SwkbdAppearInputForm` never came.
+  - **Set-up:** `Create` and `InitLearnDic` now return 1.
+  - **Showing it:** `AppearInputForm` makes the form's state 2 (shown).
+  - **Answering:** OK is reported once the text is decided. `GetInputFormString` returns it as UTF-16 at
+    `native_text::BUFFER + 0x8000`, at most 10 characters.
+  - **Where the text comes from:** `MH3U_SWKBD_TEXT` when it is set (taken at once), otherwise the overlay opens with a keyboard
+    window (type, then Enter or OK; Cancel cancels). See `docs/overlay.md`.
 
 Debugging aids (all in `mh3u-tools run`): `MH3U_TRACE=1` (every system call with its result, and file opens), `MH3U_DUMP_AFTER=<s>`
 (what every thread is doing and which system function it called last), `MH3U_GFX_LOG=1` (the first draws' state, and draw counts), and,

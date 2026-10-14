@@ -119,6 +119,9 @@ pub struct Overlay {
     provisional: crate::events::Provisional,
     /// F10 presses seen (see `follow_save`).
     f10: u32,
+    /// The software keyboard's text being typed, and whether the overlay was opened for it (closed again when it is done).
+    kb_text: String,
+    kb_opened: bool,
 }
 
 /// How many events the feed shows.
@@ -173,6 +176,8 @@ impl Overlay {
             feed: Default::default(),
             provisional: Default::default(),
             f10: 0,
+            kb_text: String::new(),
+            kb_opened: false,
         }
     }
 
@@ -193,6 +198,17 @@ impl Overlay {
             OVERLAY_PRESSES.lock().unwrap_or_else(|e| e.into_inner()).clear();
         }
         self.frame += 1;
+        // the game asks for text (a hunter's name): the overlay opens with its keyboard window
+        if mh3u_rt::swkbd::waiting() && !self.open && !self.kb_opened {
+            self.kb_opened = true;
+            self.kb_text.clear();
+            self.open = true;
+            OVERLAY_OPEN.store(true, Relaxed);
+        } else if self.kb_opened && !mh3u_rt::swkbd::waiting() {
+            self.kb_opened = false;
+            self.open = false;
+            OVERLAY_OPEN.store(false, Relaxed);
+        }
         // the save is followed while the overlay is open, now and then for a wishlist, and always for the live watch (PR #17 run:
         // with an empty wishlist and the overlay never opened, F10 found no save to search from)
         if self.open || mods::watching_live() || (!self.wishlist.pieces.is_empty() && self.frame.is_multiple_of(LOOK_EVERY)) {
@@ -501,6 +517,26 @@ impl Overlay {
                 });
         }
         if !self.open {
+            return;
+        }
+        if mh3u_rt::swkbd::waiting() {
+            egui::Window::new("Keyboard")
+                .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+                .collapsible(false)
+                .show(ctx, |ui| {
+                    ui.label(format!("The game asks for text (at most {} characters):", mh3u_rt::swkbd::MOST));
+                    let edit = ui.add(egui::TextEdit::singleline(&mut self.kb_text).char_limit(mh3u_rt::swkbd::MOST));
+                    edit.request_focus();
+                    let enter = edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                    ui.horizontal(|ui| {
+                        if (ui.button("OK").clicked() || enter) && !self.kb_text.trim().is_empty() {
+                            mh3u_rt::swkbd::submit(Some(self.kb_text.trim()));
+                        }
+                        if ui.button("Cancel").clicked() {
+                            mh3u_rt::swkbd::submit(None);
+                        }
+                    });
+                });
             return;
         }
         let mut changed = false;

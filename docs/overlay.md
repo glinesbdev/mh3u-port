@@ -142,3 +142,10 @@ route it chose ("upgrade from X (owned)", or "forge (or upgrade from X, not owne
 Before this, forging always won. Of the 592 weapons with a forging recipe, 457 can also be upgraded, and all 457 need different
 materials by upgrade, so any of them was wrong for a hunter on the upgrade path. Armour has only forging. The update's tables are
 byte-for-byte the base game's, so reading the base is not a cause.
+
+## The software keyboard
+
+When the game asks for text (a new hunter's name), the overlay opens by itself with a "Keyboard" window. Type the name (at most
+10 characters) and press Enter or OK; Cancel cancels. The overlay closes again once the game has the text. To skip the window,
+set `MH3U_SWKBD_TEXT=<name>` and the game gets that name at once. Typing needs a keyboard, so a gamepad-only player should use
+the variable. How the keyboard is answered: `docs/translator.md`, "Software keyboard".

@@ -23,6 +23,7 @@ pub mod menu_probe;
 pub mod mods;
 pub mod native_menu;
 pub mod native_text;
+pub mod swkbd;
 mod sync;
 
 pub use fs::Roots;
