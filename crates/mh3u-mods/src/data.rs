@@ -87,19 +87,33 @@ impl GameData {
         (!n.is_empty() && !n.starts_with("DUMMY")).then_some(n.as_str())
     }
 
-    /// How a piece is made: its forging recipe if it has one, else its upgrade.
+    /// How a piece is made when nothing is known of what the hunter owns: its forging recipe if it has one, else its upgrade.
     pub fn making(&self, kind: u8, id: u16) -> Option<Making> {
-        if let Some(r) = self.recipes.get(&(kind, id)) {
-            return Some(Making {
-                materials: stacks(&r.materials),
-                from: Vec::new(),
+        self.making_for(kind, id, |_, _| false)
+    }
+
+    /// The piece's forging recipe and its upgrade (from the weapons it descends from), each if it has one. Most weapons have
+    /// both, with different materials (an upgrade costs less and takes the parent weapon).
+    pub fn routes(&self, kind: u8, id: u16) -> (Option<Making>, Option<Making>) {
+        let forge = self.recipes.get(&(kind, id)).map(|r| Making {
+            materials: stacks(&r.materials),
+            from: Vec::new(),
+        });
+        let upgrade = self
+            .upgrades
+            .get(&(kind, id))
+            .filter(|u| !u.materials.is_empty() && !u.parents.is_empty())
+            .map(|u| Making {
+                materials: stacks(&u.materials),
+                from: u.parents.clone(),
             });
-        }
-        let u = self.upgrades.get(&(kind, id)).filter(|u| !u.materials.is_empty())?;
-        Some(Making {
-            materials: stacks(&u.materials),
-            from: u.parents.clone(),
-        })
+        (forge, upgrade)
+    }
+
+    /// How the hunter would make the piece, as the blacksmith offers it: the upgrade when they own a weapon it is upgraded from
+    /// (`owns(kind, id)`), else the forging recipe, else the upgrade.
+    pub fn making_for(&self, kind: u8, id: u16, owns: impl Fn(u8, u16) -> bool) -> Option<Making> {
+        choose(self.routes(kind, id), |from| from.iter().any(|&f| owns(kind, f)))
     }
 
     /// The pieces of a kind that can be made, by id, with their names.
@@ -112,9 +126,39 @@ impl GameData {
     }
 }
 
+/// The route to show: the upgrade when a parent is owned, else forging, else the upgrade.
+pub fn choose((forge, upgrade): (Option<Making>, Option<Making>), owns_parent: impl Fn(&[u16]) -> bool) -> Option<Making> {
+    match (forge, upgrade) {
+        (_, Some(u)) if owns_parent(&u.from) => Some(u),
+        (Some(f), _) => Some(f),
+        (None, u) => u,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn m(items: &[(u16, u16)], from: &[u16]) -> Making {
+        Making {
+            materials: items.to_vec(),
+            from: from.to_vec(),
+        }
+    }
+
+    /// Cataclysm Sword (great sword 87) in the update's tables: forged with 4 Gobul Fin (552), upgraded from 86 with 4 Gobul
+    /// Spike (555). The blacksmith shows the upgrade to a hunter who owns 86.
+    #[test]
+    fn the_upgrade_is_shown_when_the_parent_is_owned() {
+        let forge = m(&[(506, 5), (512, 3), (515, 2), (552, 4)], &[]);
+        let upgrade = m(&[(506, 4), (512, 2), (515, 1), (555, 4)], &[86]);
+        let routes = || (Some(forge.clone()), Some(upgrade.clone()));
+        assert_eq!(choose(routes(), |f| f.contains(&86)), Some(upgrade.clone()));
+        assert_eq!(choose(routes(), |_| false), Some(forge.clone()));
+        assert_eq!(choose((None, Some(upgrade.clone())), |_| false), Some(upgrade.clone()));
+        assert_eq!(choose((Some(forge.clone()), None), |_| true), Some(forge));
+        assert_eq!(choose((None, None), |_| true), None);
+    }
 
     /// With the game's files (`MH3U_GAME_DIR`): the names and recipes are read and fit together.
     #[test]
