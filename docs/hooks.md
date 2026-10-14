@@ -306,6 +306,16 @@ Send back `Desktop\session.log` with your notes (the order of the steps, and whi
   `menu_probe_b` 5 times, lr `0x21546fc` and `0x21b78b8`), so neither is the open itself. Their callers `f_02661…` and
   `f_021546…` are the next probes.
 
+### Run 40 (build `7bf9a05`)
+
+- **Item use: confirmed.** The Events window showed `- Potion used`, and the log agrees: `item_to_pouch` r4 = 9, r5 = -1,
+  lr `0x285edac`, then its `item_gain` (skipped). The Map from the supply box was `item_to_pouch` r4 = 0x3f2, r5 = +1, from
+  the same lr, shown as `+ Map -> pouch`. So `f_0285ecd4` adds to and takes from the pouch on a quest, and the count's sign
+  tells which.
+- **Menu open, next:** `in:` probes on the functions containing the run 39 callers (`menu_probe_c` to `menu_probe_f`, lr
+  `0x2661768`, `0x2662a74`, `0x21546fc`, `0x21b78b8`). The translator prints the function each one landed in
+  (`[hooks] in:0x… name is in f_…`). Whichever fires once per open is `menu_open`.
+
 ## Plan
 
 1. Write this doc. **(done)**

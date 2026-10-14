@@ -28,3 +28,7 @@ in:0x0219b080 item_to_pouch      # f_0219aeac(save, item, count): count -1 = an 
 # 0x02199408 (box item lookup, r4 = item id), 0x02198770 (field getter, r5 = 7/8), 0x0216afd4 (per-frame, another object).
 0x02037600 menu_probe_a       # run 38: in both item-menu-open windows (2 calls on the 2nd open); a probe for menu_open, log only (run 39: 3 calls per open, lr 0x2661768 / 0x2662a74)
 0x02153480 menu_probe_b       # run 38: in both item-menu-open windows (3 calls on the 2nd open); a probe for menu_open, log only (run 39: 5 calls per open, lr 0x21546fc / 0x21b78b8)
+in:0x02661768 menu_probe_c       # run 39: menu_probe_a's caller (lr 0x2661768); log only
+in:0x02662a74 menu_probe_d       # run 39: menu_probe_a's other caller (lr 0x2662a74); log only
+in:0x021546fc menu_probe_e       # run 39: menu_probe_b's caller (lr 0x21546fc); log only
+in:0x021b78b8 menu_probe_f       # run 39: menu_probe_b's other caller (lr 0x21b78b8); log only
