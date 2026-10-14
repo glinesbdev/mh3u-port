@@ -293,6 +293,19 @@ Send back `Desktop\session.log` with your notes (the order of the steps, and whi
   (the probes' `lr` show their callers). On a quest: F9, use a potion, F9 within 2 s, wait 5 s, F9, use a potion, F9 within
   2 s: the `both f_` lines are what using an item runs.
 
+### Run 39 (build `07ed040`)
+
+- **Complete:** the log is short because no write watch was on; it ends with `exit code 0`. No crash, no hook error.
+- **Item use (confident):** each potion used called `item_to_pouch` (`f_0219aeac`) with r4 = 9 (the item) and r5 = -1
+  (the count), from lr `0x285edac` in `f_0285ecd4`; both are in the call diff's `both` list for the two use windows. Using an
+  item is adding -1 to the pouch, which is why no separate writer showed in run 38. That call goes on to `item_gain` at the
+  pouch lr (`0x219b080`), so before this the overlay showed a use as a gain (`+ Potion -> pouch`) and counted it as a quest
+  pickup. Now `item_to_pouch` with a negative count is an `ItemUse` event (`- Potion used` in the feed), and the
+  `item_gain` call it makes is skipped.
+- **Menu open (not yet):** both probes fire several times per open (`menu_probe_a` 3 times, lr `0x2661768` and `0x2662a74`;
+  `menu_probe_b` 5 times, lr `0x21546fc` and `0x21b78b8`), so neither is the open itself. Their callers `f_02661…` and
+  `f_021546…` are the next probes.
+
 ## Plan
 
 1. Write this doc. **(done)**

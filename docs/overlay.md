@@ -98,14 +98,16 @@ copy can become a git dependency (the repository is private, so cargo would fetc
 
 ## Hook events (PR #16)
 
-When the build has the hooks from `mods/hooks.txt` (`docs/hooks.md`), the overlay registers callbacks on `item_gain`,
+When the build has the hooks from `mods/hooks.txt` (`docs/hooks.md`), the overlay registers callbacks on `item_gain`, `item_to_pouch`,
 `pouch_remove_slot`, `money_add`, `craft_equipment`, `craft_jewel` and `quest_end` (`mh3u-gfx/src/events.rs`).
 - **The callbacks only queue an event** (the item id, where it goes from the lr, the money change). They read nothing but
   their registers.
 - **When the save is read:** on the 3 frames after an event (a hook runs before the game writes), and every 2 s as a
   fallback. Without the hooks, it is read every frame, as before.
 - **The "craftable now" toast** comes from that read, so it appears within a few frames of the item gain.
-- **The Events window** shows the last 8 events (`+ Spongy Hide -> pouch`, `-750z`, `crafted equipment`, `quest over`).
+- **The Events window** shows the last 8 events (`+ Spongy Hide -> pouch`, `- Potion used`, `-750z`, `crafted equipment`,
+  `quest over`). An item used is `item_to_pouch` with a negative count (run 39); the `item_gain` call it makes is not counted as a
+  gain.
   The log says `[overlay] N hooks feed the overlay` when they are on.
 - **Quest pickups (PR #16 test):** during a quest, the game keeps pickups apart from the save and merges them into it at the
   quest's end. So the save's counts don't move during a quest.

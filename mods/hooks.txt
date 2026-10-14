@@ -23,8 +23,8 @@ in:0x0217f12c quest_reward       # f_0217ef68, confirmed run 33: twice on the re
 # in:0x0217f5b0 quest_reward_items # run 32 only (10 small payments); not in run 33: off for now
 # The callers of item_gain, by where the item goes (run 33's lr rule; not confirmed as hooks yet, and maybe shared code):
 in:0x0219950c item_to_box
-in:0x0219b080 item_to_pouch
+in:0x0219b080 item_to_pouch      # f_0219aeac(save, item, count): count -1 = an item used (run 39, twice, from lr 0x285edac, f_0285ecd4); the overlay's item_use
 # Rejected (thousands of calls a minute, queries, not actions): 0x0219acec (pouch item lookup, r4 = item id),
 # 0x02199408 (box item lookup, r4 = item id), 0x02198770 (field getter, r5 = 7/8), 0x0216afd4 (per-frame, another object).
-0x02037600 menu_probe_a       # run 38: in both item-menu-open windows (2 calls on the 2nd open); a probe for menu_open, log only
-0x02153480 menu_probe_b       # run 38: in both item-menu-open windows (3 calls on the 2nd open); a probe for menu_open, log only
+0x02037600 menu_probe_a       # run 38: in both item-menu-open windows (2 calls on the 2nd open); a probe for menu_open, log only (run 39: 3 calls per open, lr 0x2661768 / 0x2662a74)
+0x02153480 menu_probe_b       # run 38: in both item-menu-open windows (3 calls on the 2nd open); a probe for menu_open, log only (run 39: 5 calls per open, lr 0x21546fc / 0x21b78b8)

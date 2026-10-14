@@ -16,10 +16,20 @@ pub enum Dest {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Event {
-    ItemGain { item: u16, to: Dest },
+    ItemGain {
+        item: u16,
+        to: Dest,
+    },
+    /// An item used from the pouch: `item_to_pouch` with a negative count (run 39: r4 = item, r5 = -1, from lr 0x285edac).
+    ItemUse {
+        item: u16,
+        count: u32,
+    },
     PouchRemove,
     Money(i32),
-    Craft { jewel: bool },
+    Craft {
+        jewel: bool,
+    },
     QuestEnd,
 }
 
@@ -36,6 +46,8 @@ const MOST_QUEUED: usize = 64;
 static QUEUE: Mutex<VecDeque<Event>> = Mutex::new(VecDeque::new());
 /// Whether any of the overlay's hooks is in the build (then the save is read on events and every 2 s; else every frame).
 static HOOKED: AtomicBool = AtomicBool::new(false);
+/// Set by an `item_to_pouch` that takes items out: the `item_gain` it calls next (lr 0x219b080) is that use, not a gain.
+static USING: AtomicBool = AtomicBool::new(false);
 
 pub fn push(e: Event) {
     let mut q = QUEUE.lock().unwrap_or_else(|p| p.into_inner());
@@ -56,13 +68,25 @@ pub fn hooked() -> bool {
 /// Registers the overlay's callbacks on the hooks the build has; gives how many were registered.
 pub fn register(r: &mut Registry) -> usize {
     let mut n = 0;
+    n += usize::from(r.on(
+        "item_gain",
+        Box::new(|h: &mut Hook| {
+            if let Some(e) = item_gain(h.ctx.r[5], h.ctx.lr) {
+                push(e);
+            }
+        }),
+    ));
+    n += usize::from(r.on(
+        "item_to_pouch",
+        Box::new(|h: &mut Hook| {
+            if let Some(e) = item_to_pouch(h.ctx.r[4], h.ctx.r[5]) {
+                push(e);
+            }
+        }),
+    ));
     let mut on = |name: &str, f: fn(&Hook) -> Event| {
         n += usize::from(r.on(name, Box::new(move |h: &mut Hook| push(f(h)))));
     };
-    on("item_gain", |h| Event::ItemGain {
-        item: h.ctx.r[5] as u16,
-        to: dest_of(h.ctx.lr),
-    });
     on("pouch_remove_slot", |_| Event::PouchRemove);
     on("money_add", |h| Event::Money(h.ctx.r[4] as i32));
     on("craft_equipment", |_| Event::Craft { jewel: false });
@@ -70,6 +94,28 @@ pub fn register(r: &mut Registry) -> usize {
     on("quest_end", |_| Event::QuestEnd);
     HOOKED.store(n > 0, Relaxed);
     n
+}
+
+/// `item_to_pouch(save, item, count)`: a negative count is an item used; a positive one is left to `item_gain`.
+fn item_to_pouch(item: u32, count: u32) -> Option<Event> {
+    let count = count as i32;
+    if count >= 0 {
+        return None;
+    }
+    USING.store(true, Relaxed);
+    Some(Event::ItemUse {
+        item: item as u16,
+        count: count.unsigned_abs(),
+    })
+}
+
+/// `item_gain(save, pouch, item)`: a gain, unless the `item_to_pouch` just before it was taking items out.
+fn item_gain(item: u32, lr: u32) -> Option<Event> {
+    let to = dest_of(lr);
+    if to == Dest::Pouch && USING.swap(false, Relaxed) {
+        return None;
+    }
+    Some(Event::ItemGain { item: item as u16, to })
 }
 
 /// A line for the overlay's event feed.
@@ -86,6 +132,13 @@ pub fn describe(e: &Event, item_name: &dyn Fn(u16) -> String) -> Option<String> 
         )
         .trim_end()
         .to_string(),
+        Event::ItemUse { item, count } => {
+            if count == 1 {
+                format!("- {} used", item_name(item))
+            } else {
+                format!("- {} x{count} used", item_name(item))
+            }
+        }
         Event::PouchRemove => "a pouch item went to the box".into(),
         Event::Money(d) => format!("{d:+}z"),
         Event::Craft { jewel: true } => "crafted a jewel".into(),
@@ -247,5 +300,20 @@ mod tests {
         assert!(r.due(ms(2100), true, false), "the fallback");
         let mut r = Refresh::new();
         assert!((0..5).all(|i| r.due(ms(i * 16), false, false)), "no hooks: every frame");
+    }
+
+    #[test]
+    fn using_an_item_is_not_counted_as_a_gain() {
+        let name = |_: u16| "Potion".to_string();
+        let used = item_to_pouch(9, u32::MAX).unwrap();
+        assert_eq!(used, Event::ItemUse { item: 9, count: 1 });
+        assert_eq!(describe(&used, &name).unwrap(), "- Potion used");
+        assert_eq!(item_gain(9, 0x0219_b080), None, "the use's own item_gain call");
+        assert_eq!(
+            item_gain(9, 0x0219_b080),
+            Some(Event::ItemGain { item: 9, to: Dest::Pouch }),
+            "a later pickup"
+        );
+        assert_eq!(item_to_pouch(9, 2), None);
     }
 }
