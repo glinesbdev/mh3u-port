@@ -54,7 +54,32 @@ The item page reads the cursor from its state (`+0x1e8`, `+0x1e9`); the buttons 
 (`+0x04` held, `+0x08`/`+0x0c`/`+0x10`/`+0x14` from `f_02152b84`: pressed, repeat and mask). The page's own button handling
 (move, use, sort) is not mapped yet.
 
-## A first native-menu step (proposed)
+## In-game text test (`MH3U_NATIVE_TEXT=1`, PR #20)
+
+Off by default. With `MH3U_NATIVE_TEXT=1` (`win-run.ps1 -NativeText`, `run.sh --native-text`) and a non-empty wishlist, the item
+menu's last visible empty pouch slot shows `Wishlist: N of M ready` or `Wishlist: need X items` instead of its empty-slot text,
+drawn by the game's own text box and font.
+
+- **Confirmed with Ghidra:** `f_02aff91c(pane, text, length)` is a thunk to the text box's set-text method (vtable `+0xbc`).
+  The row function `f_02660a84` gets message 3/`0x25c` (the empty-slot text) through the message manager, copies it into a
+  string buffer (`f_0265da8c`: `strlen` and `strcpy`, so **8-bit text ending in 0**, not UTF-16), then calls
+  `f_02aff91c(row's name pane, data, length)` at `0x02660e64` (returns to `0x02660e68`). The row number is in `r24` (from the
+  function's `r4`), kept across the call.
+- **The hook:** `text_set` on `f_02aff91c` (`mods/hooks.txt`). Its callback (`mh3u-rt/src/native_text.rs`) is registered only with
+  the opt-in; without it the hook costs the registry's lookup per text set, and nothing else runs. It acts only when the return
+  address is `0x02660e68`, the row is 0 to 7, the text pointer is set and the length is at most 256. Otherwise it leaves the call
+  as it is.
+- **Which row:** the rows are drawn in order every frame, so the last empty row of the previous frame gets the text.
+- **The only write:** the text (printable ASCII, at most 63 bytes, then a 0) goes into the runtime's own buffer at `0x0ff00000`.
+  That is the last MiB below `.rodata`, at the top of the runtime's own area (`cafe.rs`, `OS_AREA`, which now stops there with an
+  assert). The game never allocates there. The callback only changes the call's `r4` (text) and `r5` (length). No game data is
+  changed: the message, the string buffer and the pane are the game's own, untouched.
+- **Log:** `[native-text] on: ...` at startup, and `[native-text] row N: "..."` each time the text written changes.
+- **Risks:** the text box may keep the pointer and not copy (then it still points at the buffer, which keeps the text); a font
+  without a glyph shows a box (ASCII only, to be safe); the addresses are for the update `.rpx` (`ghidra.md`).
+
+## Next native-menu steps
+
 
 Replace a string, not the layout: hook `f_02660a84` (entry: r4 = row, r6 = the slot) or the message lookup, and when the slot or
 id is one chosen for the mod, return a mod string, for example the empty-slot text (`table 3, 0x25c`) on the last empty pouch slot

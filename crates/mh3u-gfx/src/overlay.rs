@@ -383,6 +383,7 @@ impl Overlay {
             |p| data.making(p.kind, p.id).map(|m| m.materials),
             |i| save.item_count(i) + self.provisional.extra(i),
         );
+        mh3u_rt::native_text::set(native_line(&statuses));
         let new = self.craftable.update(&statuses);
         let names: Vec<String> = new
             .iter()
@@ -687,6 +688,19 @@ impl Overlay {
     }
 }
 
+/// The wishlist's status in a line for the game's item menu (`MH3U_NATIVE_TEXT`): `None` when the wishlist is empty.
+fn native_line(statuses: &[mh3u_mods::wishlist::Status]) -> Option<String> {
+    if statuses.is_empty() {
+        return None;
+    }
+    let ready = statuses.iter().filter(|s| s.craftable).count();
+    if ready > 0 {
+        return Some(format!("Wishlist: {ready} of {} ready", statuses.len()));
+    }
+    let missing: u32 = statuses.iter().flat_map(|s| s.materials.iter()).map(|n| n.missing()).sum();
+    Some(format!("Wishlist: need {missing} items"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -764,5 +778,25 @@ mod tests {
         frame(&mut o);
         assert!(!OVERLAY_OPEN.load(Relaxed));
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn the_native_line_says_how_many_are_ready_or_what_is_missing() {
+        use mh3u_mods::wishlist::{Need, Status};
+        let piece = |id| Piece { kind: 0, id };
+        let need = |need, have| Need { item: 1, need, have };
+        assert_eq!(native_line(&[]), None);
+        let short = Status {
+            piece: piece(1),
+            materials: vec![need(3, 1), need(2, 0)],
+            craftable: false,
+        };
+        assert_eq!(native_line(std::slice::from_ref(&short)).unwrap(), "Wishlist: need 4 items");
+        let done = Status {
+            piece: piece(2),
+            materials: vec![need(1, 1)],
+            craftable: true,
+        };
+        assert_eq!(native_line(&[short, done]).unwrap(), "Wishlist: 1 of 2 ready");
     }
 }

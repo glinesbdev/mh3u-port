@@ -479,6 +479,8 @@ const MEM2: (u32, u32) = (0x1080_0000, 0x4900_0000);
 const FOREGROUND: (u32, u32) = (0xe000_0000, 0x0300_0000);
 /// Where the runtime keeps the structures it makes for the game (the thread, the system information, heap headers).
 const OS_AREA: u32 = 0x0e00_0000;
+/// Where the runtime's structures end: the last MiB below `.rodata` (0x10000000) is the mods' own (`native_text::BUFFER`).
+const OS_AREA_END: u32 = crate::native_text::BUFFER;
 
 /// An expanding heap: blocks are taken from the low end, or from the high end for a negative alignment.
 pub struct ExpHeap {
@@ -722,6 +724,10 @@ impl Os {
     pub fn carve(&mut self, g: &Guest, size: u32) -> u32 {
         let at = self.next_os;
         self.next_os += size.div_ceil(0x40) * 0x40;
+        assert!(
+            self.next_os <= OS_AREA_END,
+            "the runtime's guest structures ran into the mods' area"
+        );
         g.fill(at, 0, size);
         at
     }

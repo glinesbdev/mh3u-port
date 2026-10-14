@@ -20,6 +20,7 @@ pub mod input;
 mod kernel;
 mod memory;
 pub mod mods;
+pub mod native_text;
 mod sync;
 
 pub use fs::Roots;

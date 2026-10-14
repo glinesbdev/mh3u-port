@@ -333,6 +333,12 @@ Send back `Desktop\session.log` with your notes (the order of the steps, and whi
   open and was ignored, as intended. **`menu_open`, `menu_page` and item use (`item_to_pouch` with a negative count) are
   confirmed.** The hooks' first list is complete.
 
+### Hooks that change a call
+
+A callback may change the registers before the function runs (`Hook::ctx`; the hook runs before the function loads them). The
+first one is `text_set` (`f_02aff91c`), which `MH3U_NATIVE_TEXT=1` uses to swap one text's pointer and length
+(`native-menu.md`). Such a callback must check its caller (`ctx.lr`) and leave every other call alone.
+
 ## Plan
 
 1. Write this doc. **(done)**

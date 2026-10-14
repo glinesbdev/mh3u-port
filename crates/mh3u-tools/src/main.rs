@@ -925,6 +925,8 @@ fn run_game(dump: &Dump, c_dir: &Path, max_imports: u64, save: PathBuf, window: 
             registry.log_all();
         }
         // the overlay's events (item gains, money, crafts, quest ends; docs/overlay.md)
+        // opt-in: the wishlist's status in the item menu's last empty slot (MH3U_NATIVE_TEXT=1; docs/native-menu.md)
+        mh3u_rt::native_text::register(&mut registry);
         let n = mh3u_gfx::events::register(&mut registry);
         if n > 0 {
             eprintln!("[overlay] {n} hooks feed the overlay; the live save is read on their events and every 2 s");

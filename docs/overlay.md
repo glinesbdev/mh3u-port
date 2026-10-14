@@ -119,3 +119,10 @@ When the build has the hooks from `mods/hooks.txt` (`docs/hooks.md`), the overla
 
 **Confirmed (user, after PR #16 was merged):** quest pickups are counted at once during the quest, and the counts are right and
 stay so after the quest ends (no double counting after the merge).
+
+## The wishlist in the game's item menu (opt-in)
+
+With `MH3U_NATIVE_TEXT=1` (`win-run.ps1 -NativeText`), the overlay's wishlist status also shows in the item menu, in the last
+empty pouch slot, drawn by the game (`Wishlist: 1 of 2 ready`, `Wishlist: need 4 items`). The line is worked out where the
+craftable notices are (`overlay.rs`, `native_line`), so it follows the same reads of the live save. `native-menu.md` has how
+it works.
