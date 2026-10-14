@@ -290,4 +290,19 @@ See the bottom of this file. It is updated with each commit of PR #13.
 
 - Status: run 37 confirmed exact counting works. F10 now matches slots partially and watches all copies; the call diff
   intersects windows. No item-use or menu hook yet (PR #17).
-- Next: one run with two open-the-menu windows and an in-quest F10 (steps in the PR #17 report).
+- Next: one run with two open-the-menu windows and an in-quest F10 (`dbd8002` or later; earlier builds watched only one copy):
+
+  ```powershell
+  git pull; git checkout mods/hook-points-3
+  Remove-Item Env:MH3U_WATCH_AT, Env:MH3U_WATCH_COPY -ErrorAction SilentlyContinue
+  .\scripts\win-build.ps1 -Watch -Translate -Out "$env:LOCALAPPDATA\mh3u\c-watch"
+  $env:MH3U_WATCH = 'live'; $env:MH3U_CALLDIFF = '1'
+  .\scripts\win-run.ps1 -Out "$env:LOCALAPPDATA\mh3u\c-watch" *>&1 | Out-File -Encoding utf8 "$env:USERPROFILE\Desktop\session.log"
+  Remove-Item Env:MH3U_WATCH, Env:MH3U_CALLDIFF
+  ```
+
+  1. The log shows `[gfx] build dbd8002` (or later) and `[calldiff] on, exact call counts`.
+  2. In the village, menu closed: F9. Open the item menu, F9 within 2 s. Close it, wait 5 s, F9. Open it again, F9 within
+     2 s. The log shows `[calldiff]   both f_…` lines.
+  3. Accept a quest and depart. In the field: F10, then `[watch-live] pouch copy N: 0x…` lines and `watching the pouches of
+     N copies at once`. Use a potion, then another item; end the quest. Send `Desktop\session.log`.
