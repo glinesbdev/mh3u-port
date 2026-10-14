@@ -749,8 +749,7 @@ impl Os {
 
     fn ticks(&self) -> u64 {
         // the console's clock starts at some time in the past; the game only compares differences
-        let elapsed = self.started.elapsed();
-        0x1_0000_0000 + elapsed.as_nanos() as u64 * TICKS_PER_SECOND / 1_000_000_000
+        ticks_after(self.started.elapsed())
     }
 
     fn heap(&mut self, handle: u32) -> Option<&mut ExpHeap> {
@@ -823,9 +822,20 @@ pub(crate) fn dma_copy(g: &Guest, dst: u32, src: u32, words: u32, endian: u32) {
     }
 }
 
+fn ticks_after(elapsed: std::time::Duration) -> u64 {
+    // nanoseconds * tick rate in u64 wraps after a few minutes
+    0x1_0000_0000 + (elapsed.as_nanos() * u128::from(TICKS_PER_SECOND) / 1_000_000_000) as u64
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn guest_clock_ticks_advance_correctly_after_fifty_minutes() {
+        let elapsed = std::time::Duration::from_secs(50 * 60);
+        assert_eq!(ticks_after(elapsed) - 0x1_0000_0000, 50 * 60 * TICKS_PER_SECOND);
+    }
 
     #[test]
     fn the_dma_engine_turns_the_bytes_around_as_asked() {

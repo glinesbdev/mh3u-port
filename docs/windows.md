@@ -125,13 +125,14 @@ powershell -ExecutionPolicy Bypass -File scripts\win-run.ps1 -DebugPs tex -PadLa
 **`win-run.ps1`:**
 - It first clears the debugging variables an earlier run may have left in the session: `MH3U_FPS`, `MH3U_GFX_TIMES`,
   `MH3U_GFX_REPORT`, `MH3U_GFX_LOG`, `MH3U_GFX_DUMP_*`, `MH3U_GFX_DEBUG_PS*`, `MH3U_GFX_SOLID`, `MH3U_GFX_DEPTH_BIAS`,
-  `MH3U_GFX_TEXDUMP`, `MH3U_GFX_SAVE*` and `MH3U_PAD_LAYOUT`.
+  `MH3U_GFX_TEXDUMP`, `MH3U_GFX_SAVE*`, `MH3U_PAD_LAYOUT` and `MH3U_GFX_RESOLUTION_SCALE`.
 - Then it sets the ones its switches ask for:
   - `-Fps`: `MH3U_FPS` and `MH3U_GFX_TIMES`;
   - `-Report`: `MH3U_GFX_REPORT`;
   - `-Dump <dir>`: `MH3U_GFX_DUMP_DIR`, with `-Frames` (2400 by default) as `MH3U_GFX_DUMP_FRAME`;
   - `-DebugPs <mode>`: `MH3U_GFX_DEBUG_PS`;
-  - `-PadLayout xbox|nintendo`: `MH3U_PAD_LAYOUT`.
+  - `-PadLayout xbox|nintendo`: `MH3U_PAD_LAYOUT`;
+  - `-Scale 1|2|3|4`: `MH3U_GFX_RESOLUTION_SCALE` (native size if omitted).
 
   It removes them again when the game ends.
 - It lists any other `MH3U_` variable still set (the cache and budget switches) as `also set:`.
@@ -142,7 +143,7 @@ powershell -ExecutionPolicy Bypass -File scripts\win-run.ps1 -DebugPs tex -PadLa
 - It returns the game's exit code.
 
 On Linux, `scripts/run.sh` does the same as `win-run.ps1` (`--fps`, `--report`, `--dump DIR --frames N`, `--debug-ps MODE`,
-`--pad-layout L`, `--log FILE`; `--games` and `--out`, or `MH3U_GAMES` and `MH3U_OUT`).
+`--pad-layout L`, `--scale N`, `--log FILE`; `--games` and `--out`, or `MH3U_GAMES` and `MH3U_OUT`).
 
 ## Comparing builds (frame rate)
 
@@ -156,6 +157,12 @@ $env:MH3U_FPS = '1'
 & $tools build-game $out --native           # also -march=native: only for this processor
 & $tools build-game $out --native --lto     # also -flto=thin: optimised across files at the link, which takes longer
 ```
+
+`MH3U_GFX_RESOLUTION_SCALE` renders GX2 color and depth targets at a multiple of their game-requested width and height. For example,
+`scripts\win-run.ps1 -Scale 2` (or `$env:MH3U_GFX_RESOLUTION_SCALE = '2'` before `mh3u-tools run`) renders at twice the dimensions
+(four times the pixels). Integer values from 1 to 4 are accepted; the adapter's texture-size limit may cap the scale for large
+targets. This is supersampling, not texture replacement, and increases GPU memory use and rendering cost. Leave it unset (or set
+it to `1`) for the original resolution. The run scripts do not turn it on by themselves.
 
 Where the time of a frame goes: `MH3U_GFX_TIMES` prints, every `MH3U_TIMES_WINDOW` seconds (10 by default), the graphics calls and
 the parts of a draw that took the most, as totals and per frame, and the cache hit and miss counts (`translator.md`, "What a draw

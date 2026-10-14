@@ -90,9 +90,25 @@ calls! {
 }
 
 const FRAME: Duration = Duration::from_nanos(16_683_333);
+const MAX_RESOLUTION_SCALE: u32 = 4;
 
 /// The console's TV scan target and its GamePad one.
 const TV: u32 = 1;
+
+fn resolution_scale(setting: Option<&str>) -> u32 {
+    setting
+        .and_then(|value| value.trim().parse::<u32>().ok())
+        .filter(|scale| (1..=MAX_RESOLUTION_SCALE).contains(scale))
+        .unwrap_or(1)
+}
+
+fn target_scale(width: u32, height: u32, requested: u32, max_dimension: u32) -> u32 {
+    let longest = width.max(height);
+    if longest == 0 {
+        return 1;
+    }
+    requested.min((max_dimension / longest).max(1))
+}
 
 pub(crate) struct Target {
     pub(crate) texture: wgpu::Texture,
@@ -128,6 +144,8 @@ pub struct Gx2 {
     real_draws: u64,
     pub(crate) log: bool,
     next_vsync: Instant,
+    pub(crate) render_scale: u32,
+    max_texture_dimension_2d: u32,
     pub(crate) caches: crate::draw::DrawCaches,
     pub(crate) last_tv_source: u32,
     save_every: u32,
@@ -196,6 +214,11 @@ impl Gx2 {
 
     pub fn new(d: Display) -> Gx2 {
         eprintln!("[gfx] build {}", crate::BUILD);
+        let render_scale = resolution_scale(std::env::var("MH3U_GFX_RESOLUTION_SCALE").ok().as_deref());
+        let max_texture_dimension_2d = d.adapter.limits().max_texture_dimension_2d;
+        if render_scale > 1 {
+            eprintln!("[gfx] requested internal resolution scale {render_scale}x (MH3U_GFX_RESOLUTION_SCALE)");
+        }
         let pipes = crate::pipelines::Pipelines::new(d.device.clone());
         let size = d
             .window
@@ -298,6 +321,8 @@ impl Gx2 {
             real_draws: 0,
             log: std::env::var_os("MH3U_GFX_LOG").is_some(),
             next_vsync: Instant::now(),
+            render_scale,
+            max_texture_dimension_2d,
             caches: crate::draw::DrawCaches {
                 // the tests translate as much as they ask for in a frame
                 budget: if cfg!(test) {
@@ -333,6 +358,8 @@ impl Gx2 {
         if width == 0 || height == 0 || width > 8192 || height > 8192 {
             return None;
         }
+        let scale = target_scale(width, height, self.render_scale, self.max_texture_dimension_2d);
+        let (width, height) = (width * scale, height * scale);
         let format = texture_format(format);
         let stale = self
             .targets
@@ -360,6 +387,10 @@ impl Gx2 {
             self.targets.insert(image, Target { texture, format, view });
         }
         Some(image)
+    }
+
+    pub(crate) fn render_scale_for(&self, width: u32, height: u32) -> u32 {
+        target_scale(width, height, self.render_scale, self.max_texture_dimension_2d)
     }
 
     /// `GX2CopySurface`: the contents of one surface into another (both are known to this backend as render targets or not at all).
@@ -1454,6 +1485,35 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn resolution_scale_is_validated_and_capped_per_target() {
+        assert_eq!(resolution_scale(None), 1);
+        assert_eq!(resolution_scale(Some("0")), 1);
+        assert_eq!(resolution_scale(Some("2x")), 1);
+        assert_eq!(resolution_scale(Some(" 4 ")), 4);
+        assert_eq!(target_scale(1280, 720, 2, 8192), 2);
+        assert_eq!(target_scale(4096, 2160, 4, 8192), 2);
+        assert_eq!(target_scale(8192, 1024, 4, 8192), 1);
+        assert_eq!(target_scale(0, 0, 4, 8192), 1);
+    }
+
+    #[test]
+    fn color_targets_use_the_configured_internal_resolution() {
+        let mut gx2 = Gx2::new(crate::Display::noop());
+        gx2.render_scale = 2;
+        let mut memory = vec![0; 0x1_0000];
+        let guest = Guest::new(memory.as_mut_ptr());
+        let color_buffer = 0x100;
+        guest.put_u32(color_buffer + 4, 1280);
+        guest.put_u32(color_buffer + 8, 720);
+        guest.put_u32(color_buffer + 0x14, 0x1);
+        guest.put_u32(color_buffer + 0x24, 0x4000);
+
+        assert_eq!(gx2.target(&guest, color_buffer), Some(0x4000));
+        let texture = &gx2.targets[&0x4000].texture;
+        assert_eq!((texture.width(), texture.height()), (2560, 1440));
+    }
 
     #[test]
     fn call_names_round_trip() {

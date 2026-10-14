@@ -1786,6 +1786,8 @@ impl Gx2 {
         if width == 0 || height == 0 || width > 8192 || height > 8192 {
             return None;
         }
+        let scale = self.render_scale_for(width, height);
+        let (width, height) = (width * scale, height * scale);
         let stale = self
             .caches
             .depth
@@ -2824,7 +2826,12 @@ impl Gx2 {
             self.batch.key = Some(key);
         }
         let Some(pass) = self.batch.pass.as_mut() else { return };
+        let guest_w = g.u32(st.colour_buffers[0] + 4);
+        // the target is the guest size times the scale; never 0, even if the two disagree
+        let scale = target_w.checked_div(guest_w).unwrap_or(1).max(1);
         let [vx, vy, vw, vh, near, far] = st.viewport;
+        let scale_f = scale as f32;
+        let (vx, vy, vw, vh) = (vx * scale_f, vy * scale_f, vw * scale_f, vh * scale_f);
         // the depth range, when the target API can have it (0 to 1, near not past far)
         let (near, far) = if (0.0..=1.0).contains(&near) && (0.0..=1.0).contains(&far) && near <= far && far > 0.0 {
             (near, far)
@@ -2845,7 +2852,7 @@ impl Gx2 {
         } else {
             pass.set_viewport(0.0, 0.0, target_w as f32, target_h as f32, near, far);
         }
-        let [sx, sy, sw, sh] = st.scissor;
+        let [sx, sy, sw, sh] = st.scissor.map(|coordinate| coordinate.saturating_mul(scale));
         if sw > 0 && sh > 0 && sx < target_w && sy < target_h {
             pass.set_scissor_rect(sx, sy, sw.min(target_w - sx), sh.min(target_h - sy));
         } else {
