@@ -380,7 +380,7 @@ impl Overlay {
         let guard = shared.lock().unwrap_or_else(|e| e.into_inner());
         let Some(Ok(data)) = guard.as_ref() else { return };
         let statuses = self.wishlist.status(
-            |p| data.making(p.kind, p.id).map(|m| m.materials),
+            |p| data.making_for(p.kind, p.id, |k, i| save.owns_equipment(k, i)).map(|m| m.materials),
             |i| save.item_count(i) + self.provisional.extra(i),
         );
         mh3u_rt::native_text::set(native_line(&statuses));
@@ -591,7 +591,10 @@ impl Overlay {
                 if !quest.is_empty() {
                     ui.label(format!("Counted, not in the save yet (+N this quest): {}", quest.join(", ")));
                 }
-                let statuses = self.wishlist.status(|p| data.making(p.kind, p.id).map(|m| m.materials), have);
+                let owns = |k: u8, i: u16| save.is_some_and(|s| s.owns_equipment(k, i));
+                let statuses = self
+                    .wishlist
+                    .status(|p| data.making_for(p.kind, p.id, owns).map(|m| m.materials), have);
                 if statuses.is_empty() {
                     ui.label("Nothing wished for yet: pick pieces above.");
                 }
@@ -611,11 +614,24 @@ impl Overlay {
                                 remove = Some(p);
                             }
                             egui::CollapsingHeader::new(head).id_salt(("wish", p.kind, p.id)).show(ui, |ui| {
-                                if let Some(m) = data.making(p.kind, p.id)
-                                    && !m.from.is_empty()
-                                {
-                                    let from: Vec<&str> = m.from.iter().filter_map(|&f| data.piece_name(p.kind, f)).collect();
-                                    ui.label(format!("upgraded from {}", from.join(" or ")));
+                                let (forge, upgrade) = data.routes(p.kind, p.id);
+                                let names = |from: &[u16]| {
+                                    from.iter()
+                                        .filter_map(|&f| data.piece_name(p.kind, f))
+                                        .collect::<Vec<_>>()
+                                        .join(" or ")
+                                };
+                                match (data.making_for(p.kind, p.id, owns), &forge, &upgrade) {
+                                    (Some(m), _, _) if !m.from.is_empty() => {
+                                        ui.label(format!("upgrade from {} (owned)", names(&m.from)));
+                                    }
+                                    (_, Some(_), Some(u)) => {
+                                        ui.label(format!("forge (or upgrade from {}, not owned)", names(&u.from)));
+                                    }
+                                    (_, None, Some(u)) => {
+                                        ui.label(format!("upgrade from {}", names(&u.from)));
+                                    }
+                                    _ => {}
                                 }
                                 egui::Grid::new(("materials", p.kind, p.id)).striped(true).show(ui, |ui| {
                                     for n in &s.materials {

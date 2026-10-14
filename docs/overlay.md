@@ -16,7 +16,7 @@ and a blacksmith wishlist built on the companion app's reverse engineering.
 - **The wishlist window:**
   1. Pick an equipment kind and type part of a name, then press `+` on a piece.
   2. Each wished piece shows what it is still missing. Open it for have/need per material (green when there is enough) and, for a
-     weapon that is upgraded rather than forged, what it is upgraded from.
+     the route the materials are for (see "Which recipe" below).
   3. The shopping list adds up everything on the list against the item box and pouch together. Two pieces that share a material can
      each be ready on their own and still be short together.
   4. `✖` takes a piece off the list.
@@ -127,3 +127,18 @@ empty pouch slot, drawn by the game (`Wishlist: 1 of 2 ready`, `Wishlist: need 4
 craftable notices are (`overlay.rs`, `native_line`), so it follows the same reads of the live save. `native-menu.md` has how
 it works. With `MH3U_NATIVE_MENU=1` (`-NativeMenu`), the same place also gives the native Mods page one line a piece
 (`page_lines`: `Name: ready` or `Name: need N`); hold Right Shift in the start menu and choose Mods.
+
+## Which recipe
+
+Most weapons can be made two ways, and the routes need different materials. The executable has a forging table (24-byte records:
+piece, four item/count slots) and an upgrade table (28-byte records, by weapon: its children, and the materials to upgrade into it
+from its parent). Cataclysm Sword (great sword 87) is forged with Spongy Hide x5, R.Ludroth Claw x3, R.Ludroth Crest x2 and Gobul
+Fin x4, but upgraded from great sword 86 with Spongy Hide x4, Claw x2, Crest x1 and Gobul Spike x4.
+
+`GameData::making_for(kind, id, owns)` picks what the blacksmith shows the hunter: the upgrade when the save owns a weapon it is
+upgraded from, else the forging recipe, else the upgrade. The overlay and the Mods page use it; the wishlist window says which
+route it chose ("upgrade from X (owned)", or "forge (or upgrade from X, not owned)"). Without a save it falls back to forging.
+
+Before this, forging always won. Of the 592 weapons with a forging recipe, 457 can also be upgraded, and all 457 need different
+materials by upgrade, so any of them was wrong for a hunter on the upgrade path. Armour has only forging. The update's tables are
+byte-for-byte the base game's, so reading the base is not a cause.
