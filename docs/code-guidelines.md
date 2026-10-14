@@ -11,4 +11,4 @@ Short, because the project is new. When a rule here stops being true, change it 
 4. **Tests that need the game skip themselves without it** (`MH3U_GAME_DIR`), so the checks run on a machine with no game.
 5. **Say what is known and what is guessed.** A finding goes in `docs/spikes.md` with how it was checked.
 6. **Linux and Windows both.** Platform code goes behind `cfg` and a crate that is Linux only (`mh3u-cemu`) is empty elsewhere.
-7. `scripts/check.sh` before every commit: fmt, clippy `-D warnings`, tests, `cargo audit`. There is no CI (private repository, Actions off), so this is the only check. One purpose per commit. Windows is not built by anything automatic: build it by hand now and then (`cargo build` on a Windows machine) until a runner is worth paying for.
+7. `scripts/check.sh` (on Windows PowerShell, `scripts\check.ps1`) before every commit: fmt, clippy `-D warnings`, tests, `cargo audit`. There is no CI (private repository, Actions off), so this is the only check. One purpose per commit. Windows is not built by anything automatic: build it by hand now and then (`cargo build` on a Windows machine) until a runner is worth paying for.

@@ -409,8 +409,8 @@ pub fn cluster(copies: &[u32], span: u32) -> Option<(u32, u32)> {
 }
 
 /// `MH3U_WATCH=live`: the save the overlay found may be only the save image (written when saving), so this looks for other copies
-/// of its `len` bytes at `at` (the pouch) in `ranges`, in the background, logs them, and watches the copy `MH3U_WATCH_COPY` (0, the
-/// first, by default) as `lo..hi` around it; `label` names a watched address by its distance from the copy.
+/// of its `len` bytes at `at` (the pouch) in `ranges`, in the background, logs them, and watches the pouches of
+/// all copies in the largest group within 32 MiB (or only copy `MH3U_WATCH_COPY`, as `lo..hi` around it); `label` names a watched address by its distance from the copy.
 pub fn watch_copies(at: u32, len: u32, ranges: Vec<(u32, u32)>, around: (i64, i64), label: Arc<dyn Fn(i64) -> String + Send + Sync>) {
     if WATCH_FNS.get().is_none() {
         return;
@@ -453,23 +453,50 @@ pub fn watch_copies(at: u32, len: u32, ranges: Vec<(u32, u32)>, around: (i64, i6
             eprintln!("[watch-live] the pouch is in no other place than the save at {at:#x}; still watching the save");
             return;
         }
-        let list: Vec<String> = found.iter().take(16).map(|c| format!("{c:#x}")).collect();
+        for (n, c) in found.iter().enumerate().take(64) {
+            eprintln!("[watch-live] pouch copy {n}: {c:#x}");
+        }
         eprintln!(
-            "[watch-live] the pouch is also at {} (MH3U_WATCH_COPY=n picks one, 0 = the first)",
-            list.join(", ")
+            "[watch-live] the pouch is also at {} place(s) (MH3U_WATCH_COPY=n watches only copy n)",
+            found.len()
         );
-        let pick = std::env::var("MH3U_WATCH_COPY")
-            .ok()
-            .and_then(|v| v.trim().parse::<usize>().ok())
-            .unwrap_or(0);
-        let Some(&copy) = found.get(pick).or(found.first()) else { return };
-        let lo = (i64::from(copy) + around.0).max(0) as u32;
-        let hi = (i64::from(copy) + around.1).min(i64::from(u32::MAX)) as u32;
-        let label = label.clone();
+        let pick = std::env::var("MH3U_WATCH_COPY").ok().and_then(|v| v.trim().parse::<usize>().ok());
+        if let Some(pick) = pick {
+            let Some(&copy) = found.get(pick).or(found.first()) else { return };
+            let lo = (i64::from(copy) + around.0).max(0) as u32;
+            let hi = (i64::from(copy) + around.1).min(i64::from(u32::MAX)) as u32;
+            let label = label.clone();
+            watch_writes(
+                lo,
+                hi,
+                Box::new(move |a| format!("copy {copy:#x}: {}", label(i64::from(a) - i64::from(copy)))),
+            );
+            return;
+        }
+        // all the copies in the largest group within 32 MiB at once, reporting only writes into one of their pouches
+        let Some((first, last)) = cluster(&found, 32 << 20) else { return };
+        let group: Vec<(usize, u32)> = found
+            .iter()
+            .copied()
+            .enumerate()
+            .filter(|&(_, c)| c >= first && c <= last)
+            .collect();
+        eprintln!(
+            "[watch-live] watching the pouches of {} copies at once ({first:#x}..={last:#x})",
+            group.len()
+        );
+        let lo = first;
+        let hi = last.saturating_add(len);
         watch_writes(
             lo,
             hi,
-            Box::new(move |a| format!("copy {copy:#x}: {}", label(i64::from(a) - i64::from(copy)))),
+            Box::new(move |a| {
+                group
+                    .iter()
+                    .find(|&&(_, c)| a >= c && a - c < len)
+                    .map(|&(n, c)| format!("copy {n} {c:#x}: {}", label(i64::from(a) - i64::from(c))))
+                    .unwrap_or_default()
+            }),
         );
     });
 }
