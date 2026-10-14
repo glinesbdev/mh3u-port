@@ -54,6 +54,8 @@ Shift L3 and R3, and the arrows the right stick. The file replaces it.
   `ArrowUp`...), so they do not move with the keyboard layout. Mouse buttons are `MouseLeft`, `MouseRight`, `MouseMiddle`,
   `MouseBack` and `MouseForward`.
 - **Right Shift** is left unbound by default: it is the opt-in native Mods entry's key (`MH3U_NATIVE_MENU`, `native-menu.md`).
+  On a gamepad, **ZL** held does the same. With that opt-in on, ZL is kept from the game while the start menu or the Mods page
+  is up, so it cannot trigger anything there. It works as usual everywhere else.
 - **The left stick:** a diagonal goes as far as a straight push (it is normalised), and the walk key scales it by `walk_scale`.
 - **The right stick** follows the mouse's speed, from raw motion (unaffected by the pointer's acceleration or the window's edges):
   - `mouse_sensitivity` is stick units per pixel a second. The default reaches full deflection at about 670 pixels a second.

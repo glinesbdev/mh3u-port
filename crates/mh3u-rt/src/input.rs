@@ -263,7 +263,16 @@ impl Input {
         }
         let s = self.sticks();
         let all = self.keyboard.load(Relaxed) | self.pad.load(Relaxed) | stick_buttons(s[0], s[1], true) | stick_buttons(s[2], s[3], false);
-        all & !SWALLOWED.load(Relaxed)
+        // ZL is the native Mods entry's modifier while the start menu is up (`native_menu::swallowed`; 0 with the opt-in off)
+        all & !SWALLOWED.load(Relaxed) & !crate::native_menu::swallowed()
+    }
+
+    /// The gamepads' buttons only (not the keyboard's).
+    pub fn pad_buttons(&self) -> u32 {
+        if OVERLAY_OPEN.load(Relaxed) {
+            return 0;
+        }
+        self.pad.load(Relaxed)
     }
 
     pub fn touch(&self) -> Option<(f32, f32)> {

@@ -342,7 +342,8 @@ Send back `Desktop\session.log` with your notes (the order of the steps, and whi
 (`MH3U_NATIVE_MENU=1`, `native-menu.md`): while the mod key is held, the Gestures row's label is swapped and A on it is kept from
 the game. Builds translated before this need `win-build.ps1 -Translate` for `menu_rows`. `combo_update` (`f_02234218`, the Combo
 List page's update) and `text_set` carry the Mods page (PR #22): the page's buttons are cut to up, down and B, and its rows show
-the wishlist.
+the wishlist. `combo_panel` (`f_0265bfac`) and `help_set` (`f_02144d18`) let the page set its side panel, title, counter and
+help line (PR #23).
 
 ### Hooks that change a call
 
