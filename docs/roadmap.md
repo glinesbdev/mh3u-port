@@ -13,8 +13,9 @@ settings remap correctly. It is a bit awkward only because the game is built for
 
 **First milestone done in PR #11** (merged in fab2efe; confirmed in run 27, see `overlay.md`): the overlay (F1 or Back + RB),
 read-only memory through frame snapshots and a search thread, the blacksmith wishlist over the live save (have/need, a shopping
-list, notices), and borderless fullscreen. Still to do: hooks patched in at translation time (so mods hear of events instead of
-reading memory), more overlay features from the companion (drops, hunt plans), and native in-game menus.
+list, notices), and borderless fullscreen. **Hooks done in PRs #13 to #17** (`hooks.md`): translation-time hooks
+on item gains and uses, pouch and box moves, money, crafting, quests and menu opens (all confirmed in game, the last in run 42)
+feed the overlay's events. Still to do: more overlay features from the companion (drops, hunt plans), and native in-game menus.
 
 A layer for mods that read the game without changing it:
 
@@ -22,7 +23,7 @@ A layer for mods that read the game without changing it:
 - **An overlay**: `egui` drawn on top of the game in the `wgpu` backend, with its own input focus (a key to show and hide it).
 - **Hooks patched in at translation time**: the translator (`mh3u-tools translate`) emits a call into the runtime at chosen guest
   addresses (function entries, for example when an item moves or a menu opens), so that mods are told about events instead of
-  polling memory each frame.
+  polling memory each frame. **(done)**
 
 **First target: a blacksmith wishlist.** Pick armour pieces or weapons, track the materials they need against the item box (and
 pouch), and show a notification when everything for a piece is ready.
