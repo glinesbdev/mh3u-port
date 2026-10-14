@@ -1,9 +1,10 @@
 //! The blacksmith wishlist: pieces of armour and weapons the player wants, what each needs against what the item box and pouch hold,
-//! a shopping list of everything together, and the pieces that just became craftable (for a notice). Kept in a JSON file.
+//! a shopping list of everything together, and the pieces that just became craftable (for a notice). Each hunter has a list of their
+//! own, kept in `wishlists/<hunter>.json` (see `for_hunter`).
 
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// A piece: the equipment kind (the save's kind byte) and its id.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -109,6 +110,63 @@ impl Wishlist {
     }
 }
 
+/// The file of a hunter's wishlist in `dir`: `wishlists/<name>.json`, the name with anything but ASCII letters, digits, `-` and `_`
+/// written as `~` and its UTF-8 bytes in hex (so two names never share a file, and any name is a file name on Windows).
+pub fn path_for(dir: &Path, hunter: &str) -> PathBuf {
+    let mut key = String::new();
+    for c in hunter.chars() {
+        if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+            key.push(c);
+        } else {
+            let mut buf = [0; 4];
+            for b in c.encode_utf8(&mut buf).bytes() {
+                key.push_str(&format!("~{b:02x}"));
+            }
+        }
+    }
+    if key.is_empty() {
+        key.push('~');
+    }
+    dir.join("wishlists").join(format!("{key}.json"))
+}
+
+/// The one list of before there was a list per hunter.
+pub fn legacy_path(dir: &Path) -> PathBuf {
+    dir.join("wishlist.json")
+}
+
+/// A hunter's wishlist and its file. A hunter with no file yet takes over the old shared `wishlist.json` (the first hunter loaded
+/// after the update gets it; it is renamed `wishlist.json.migrated` so no other hunter does).
+pub fn for_hunter(dir: &Path, hunter: &str) -> (Wishlist, PathBuf) {
+    let path = path_for(dir, hunter);
+    if path.exists() {
+        return (Wishlist::load(&path), path);
+    }
+    let legacy = legacy_path(dir);
+    if legacy.exists() {
+        let list = Wishlist::load(&legacy);
+        if list.save(&path).is_ok() {
+            let _ = std::fs::rename(&legacy, legacy.with_extension("json.migrated"));
+            return (list, path);
+        }
+    }
+    (Wishlist::default(), path)
+}
+
+/// Whether any hunter has a non-empty wishlist kept (or the old shared one is still there): then the live save is looked for even
+/// with the overlay closed, for the notices and the native pages.
+pub fn any_kept(dir: &Path) -> bool {
+    let legacy = legacy_path(dir);
+    if legacy.exists() && !Wishlist::load(&legacy).pieces.is_empty() {
+        return true;
+    }
+    std::fs::read_dir(dir.join("wishlists")).is_ok_and(|entries| {
+        entries
+            .flatten()
+            .any(|e| e.path().extension().is_some_and(|x| x == "json") && !Wishlist::load(&e.path()).pieces.is_empty())
+    })
+}
+
 /// Which pieces are craftable, to tell which just became so. The first look (and the first after the save went away) only takes note.
 #[derive(Default)]
 pub struct Craftable {
@@ -140,6 +198,41 @@ impl Craftable {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn each_hunter_has_a_list_and_the_old_one_goes_to_the_first() {
+        let dir = std::env::temp_dir().join(format!("mh3u-wish-hunters-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(!any_kept(&dir));
+        let old = Wishlist {
+            pieces: vec![Piece { kind: 5, id: 87 }],
+        };
+        old.save(&legacy_path(&dir)).unwrap();
+        assert!(any_kept(&dir));
+        let (bobby, path) = for_hunter(&dir, "Bobby");
+        assert_eq!(bobby, old, "the first hunter loaded takes the old list");
+        assert!(!legacy_path(&dir).exists() && dir.join("wishlist.json.migrated").exists());
+        assert!(any_kept(&dir));
+        let (ann, ann_path) = for_hunter(&dir, "Ann");
+        assert_eq!(ann, Wishlist::default(), "another hunter never sees it");
+        assert_ne!(path, ann_path);
+        let mut ann = ann;
+        ann.add(Piece { kind: 1, id: 2 });
+        ann.save(&ann_path).unwrap();
+        assert_eq!(for_hunter(&dir, "Bobby").0, old);
+        assert_eq!(for_hunter(&dir, "Ann").0, ann);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn hunter_names_make_distinct_safe_file_names() {
+        let d = Path::new("x");
+        assert_eq!(path_for(d, "Bobby"), d.join("wishlists/Bobby.json"));
+        assert_eq!(path_for(d, "A/B"), d.join("wishlists/A~2fB.json"));
+        assert_ne!(path_for(d, "A B"), path_for(d, "A_B"));
+        assert_ne!(path_for(d, "ハンター"), path_for(d, "ハンタ"));
+        assert_eq!(path_for(d, ""), d.join("wishlists/~.json"));
+    }
 
     const HOOD: Piece = Piece { kind: 5, id: 10 };
     const SWORD: Piece = Piece { kind: 7, id: 3 };

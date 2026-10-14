@@ -1,6 +1,6 @@
 //! The mod overlay: `egui` drawn over the game's picture, opened and closed with F1 or a gamepad's Back + right shoulder button. While
 //! open it takes all input (the game gets none; see `mh3u_rt::input`). Closed, it costs one atomic load a frame, plus a look at the
-//! live save four times a second while the wishlist has something on it (for the notices).
+//! live save four times a second while some hunter's wishlist has something on it (for the notices).
 //!
 //! The window's events reach egui on the window's thread (`egui-winit`), which hands the input it makes to the game thread through
 //! `INPUT`; the game thread runs egui and draws it at the end of the present pass (`egui-wgpu`).
@@ -10,7 +10,7 @@
 
 use mh3u_mods::data::{GameData, KINDS};
 use mh3u_mods::live;
-use mh3u_mods::wishlist::{Craftable, Piece, Wishlist};
+use mh3u_mods::wishlist::{self, Craftable, Piece, Wishlist};
 use mh3u_rt::input::{OVERLAY_ENABLED, OVERLAY_OPEN, OVERLAY_PRESSES, OVERLAY_TOGGLE, button};
 use mh3u_rt::mods::{self, Searching};
 use std::path::PathBuf;
@@ -97,8 +97,12 @@ pub struct Overlay {
     renderer: Option<egui_wgpu::Renderer>,
     open: bool,
     data: Arc<Mutex<Option<Result<GameData, String>>>>,
+    /// The loaded hunter's wishlist (empty with no hunter), the hunter and the list's file, and the folder the lists are kept in.
     wishlist: Wishlist,
-    path: PathBuf,
+    hunter: Option<(String, PathBuf)>,
+    dir: PathBuf,
+    /// Some hunter has a wishlist kept: the live save is looked for now and then even with the overlay closed.
+    kept: bool,
     save: Save,
     save_dir: PathBuf,
     failures: usize,
@@ -143,19 +147,19 @@ impl Overlay {
             }
             *slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(loaded);
         });
-        let path = dir.join("wishlist.json");
-        let wishlist = Wishlist::load(&path);
+        let kept = wishlist::any_kept(&dir);
         eprintln!(
-            "[overlay] F1 or Back + RB opens it; wishlist {} ({} pieces)",
-            path.display(),
-            wishlist.pieces.len()
+            "[overlay] F1 or Back + RB opens it; wishlists in {} (one per hunter, read when the hunter is loaded)",
+            dir.join("wishlists").display()
         );
         Overlay {
             renderer: None,
             open: false,
             data,
-            wishlist,
-            path,
+            wishlist: Wishlist::default(),
+            hunter: None,
+            dir,
+            kept,
             save: Save::Waiting {
                 until: Instant::now(),
                 reason: String::new(),
@@ -195,7 +199,7 @@ impl Overlay {
         self.frame += 1;
         // the save is followed while the overlay is open, now and then for a wishlist, and always for the live watch (PR #17 run:
         // with an empty wishlist and the overlay never opened, F10 found no save to search from)
-        if self.open || mods::watching_live() || (!self.wishlist.pieces.is_empty() && self.frame.is_multiple_of(LOOK_EVERY)) {
+        if self.open || mods::watching_live() || (self.kept && self.frame.is_multiple_of(LOOK_EVERY)) {
             self.follow_save();
         }
         self.notices.retain(|(_, t)| t.elapsed() < NOTICE);
@@ -344,8 +348,18 @@ impl Overlay {
                 let Some(bytes) = snap.bytes(at, live::LEN as usize) else { return };
                 match live::parse(bytes, at, Some(name)) {
                     Some(parsed) => {
+                        // another hunter in the same block (a slot loaded without the old one going away first): their own list
+                        if parsed.hunter_name != *name {
+                            *name = parsed.hunter_name.clone();
+                        }
+                        let hunter = parsed.hunter_name.clone();
+                        if self.hunter.as_ref().is_none_or(|h| h.0 != hunter) {
+                            self.enter(hunter);
+                        }
                         self.provisional.observe(|i| parsed.item_count(i));
-                        *save = Some(Box::new(parsed));
+                        if let Save::At(_, _, save) = &mut self.save {
+                            *save = Some(Box::new(parsed));
+                        }
                         self.check_craftable();
                     }
                     None => {
@@ -361,6 +375,7 @@ impl Overlay {
 
     /// No live save for now: says why (once per reason) and waits longer each time before searching again.
     fn wait(&mut self, reason: String) {
+        self.leave();
         let secs = BACKOFF[self.failures.min(BACKOFF.len() - 1)];
         self.failures += 1;
         if reason != self.logged {
@@ -373,9 +388,37 @@ impl Overlay {
         };
     }
 
+    /// A hunter is loaded (or another one replaced the last): their own wishlist, and nothing carried over from the last one.
+    fn enter(&mut self, hunter: String) {
+        self.leave();
+        let (list, path) = wishlist::for_hunter(&self.dir, &hunter);
+        eprintln!(
+            "[overlay] hunter {hunter}: wishlist {} ({} pieces)",
+            path.display(),
+            list.pieces.len()
+        );
+        self.wishlist = list;
+        self.hunter = Some((hunter, path));
+    }
+
+    /// No hunter (unloaded, back at the title, or not found yet): no wishlist, and the game's pages say so.
+    fn leave(&mut self) {
+        if let Some((hunter, _)) = self.hunter.take() {
+            eprintln!("[overlay] hunter {hunter} is gone: no wishlist until a hunter is loaded");
+        }
+        self.wishlist = Wishlist::default();
+        self.craftable.forget();
+        self.provisional.clear();
+        mh3u_rt::native_text::set(None);
+        mh3u_rt::native_menu::set_entries(None);
+    }
+
     /// Notices for the pieces that just became craftable.
     fn check_craftable(&mut self) {
         let Save::At(_, _, Some(save)) = &self.save else { return };
+        if self.hunter.is_none() {
+            return;
+        }
         let shared = self.data.clone();
         let guard = shared.lock().unwrap_or_else(|e| e.into_inner());
         let Some(Ok(data)) = guard.as_ref() else { return };
@@ -548,6 +591,14 @@ impl Overlay {
                         None
                     }
                 };
+                let (Some(save), Some((hunter, _))) = (save, &self.hunter) else {
+                    ui.separator();
+                    ui.label(egui::RichText::new("No hunter loaded").strong());
+                    ui.label("Each hunter has a wishlist of their own; it shows here once a save slot is loaded.");
+                    return;
+                };
+                ui.label(format!("Wishlist of {hunter}"));
+                let save = Some(save);
                 let provisional = &self.provisional;
                 let have = |item: u16| save.map_or(0, |s| s.item_count(item)) + provisional.extra(item);
                 ui.separator();
@@ -703,8 +754,11 @@ impl Overlay {
                 });
                 ui.label("F1: this overlay. F11 or Alt+Enter: fullscreen.");
             });
-        if changed && let Err(e) = self.wishlist.save(&self.path) {
-            eprintln!("[overlay] could not save the wishlist to {}: {e}", self.path.display());
+        if changed && let Some((_, path)) = &self.hunter {
+            self.kept |= !self.wishlist.pieces.is_empty();
+            if let Err(e) = self.wishlist.save(path) {
+                eprintln!("[overlay] could not save the wishlist to {}: {e}", path.display());
+            }
         }
     }
 }

@@ -20,7 +20,8 @@ and a blacksmith wishlist built on the companion app's reverse engineering.
   3. The shopping list adds up everything on the list against the item box and pouch together. Two pieces that share a material can
      each be ready on their own and still be short together.
   4. `✖` takes a piece off the list.
-- **The list is kept in `<build dir>/mods/wishlist.json`**: next to the translated C (`$Out` in `win-run.ps1`, `--out` in `run.sh`).
+- **Each hunter has a list of their own**, kept in `<build dir>/mods/wishlists/<hunter name>.json` (next to the translated C:
+  `$Out` in `win-run.ps1`, `--out` in `run.sh`). See "Whose wishlist" below.
 - **When a wished piece becomes craftable**, a notice shows at the top right for six seconds, whether the overlay is open or not, and
   `[overlay] craftable now: …` is logged.
 
@@ -142,3 +143,21 @@ route it chose ("upgrade from X (owned)", or "forge (or upgrade from X, not owne
 Before this, forging always won. Of the 592 weapons with a forging recipe, 457 can also be upgraded, and all 457 need different
 materials by upgrade, so any of them was wrong for a hunter on the upgrade path. Armour has only forging. The update's tables are
 byte-for-byte the base game's, so reading the base is not a cause.
+
+## Whose wishlist
+
+The live save holds no slot number, so a list belongs to the hunter's name (the name read from the live save, the one the search
+found it by). The file name is the name with anything but ASCII letters, digits, `-` and `_` written as `~` and hex bytes.
+
+- **Before a hunter is loaded** (title screen, slot select, or while the search is still running): the overlay says "No hunter
+  loaded" and offers no picker or list. The native Mods page and the item-menu line say "No hunter loaded" too. No list is read.
+- **A hunter is loaded:** once the live save is found and parsed, that hunter's list is read and everything works out from it.
+- **The hunter goes away** (back to the title, or the block no longer parses as a save): the list is dropped. The craftable notices,
+  the quest's not-yet-saved gains and the native pages are all reset, and the search starts again.
+- **Another hunter in the same block** (a slot loaded without the old one going away first): the name changes, so the old list
+  is dropped and the new hunter's is read.
+- **Upgrading from one shared list:** before this, `mods/wishlist.json` was one list for every hunter, read at start and shown
+  before any hunter was loaded. The first hunter loaded after the update takes it over, and it is renamed
+  `wishlist.json.migrated` so no other hunter gets it.
+- **Known limit:** two save slots with the same hunter name share a list.
+- **Searching with the overlay closed:** the overlay looks for the live save now and then while any hunter's list is non-empty.
