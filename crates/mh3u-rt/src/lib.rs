@@ -21,6 +21,7 @@ mod kernel;
 mod memory;
 pub mod menu_probe;
 pub mod mods;
+pub mod native_menu;
 pub mod native_text;
 mod sync;
 

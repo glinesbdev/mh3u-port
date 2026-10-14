@@ -30,4 +30,5 @@ in:0x0219b080 item_to_pouch      # f_0219aeac(save, item, count): count -1 = an 
 0x02153480 menu_open          # r5 = -1 (lr 0x21546fc) once per menu open, item or main (run 41: 3 opens, 3 calls; confirmed run 42); other r5 values are not opens
 0x02aff91c text_set           # f_02aff91c(pane, text, length): the layout sets a text box (Ghidra); MH3U_NATIVE_TEXT swaps the item menu empty-slot call (lr 0x2660e68)
 0x02152c48 menu_start         # f_02152c48(menu, open, kind): the start menu's open path (Ghidra); S = menu + 0x34. MH3U_MENU_PROBE logs S
-0x02154abc menu_update        # f_02154abc(menu, S): the start menu's update while it is up (Ghidra). MH3U_MENU_PROBE logs S on change
+0x02154abc menu_update        # f_02154abc(menu, S): the start menu's update while it is up (Ghidra). MH3U_MENU_PROBE logs S on change; MH3U_NATIVE_MENU keeps A from Gestures while the mod key is held
+0x02152874 menu_rows          # f_02152874(menu, S, cursor): marks the selected row, right after f_0215249c refills the rows (Ghidra). MH3U_NATIVE_MENU sets the Gestures label here

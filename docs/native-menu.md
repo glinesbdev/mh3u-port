@@ -191,6 +191,34 @@ and left. No tab switch, second-level list, close or second open is in it.
 3. A short probe run to finish the picture: switch to the Info tab, step its rows, enter Quit Game's list and back out with B,
    close, then open and close again.
 
+### The Mods entry (`MH3U_NATIVE_MENU=1`, PR #21): Gestures while a key is held
+
+Quit Game turned out to be a plain Yes/No box (run 44), not a list with room for an entry, so option 1 above was built. Off by
+default; `win-run.ps1 -NativeMenu` (`run.sh --native-menu`) turns it on. It needs a build translated with the current
+`mods/hooks.txt` (`win-build.ps1 -Translate`), for the new `menu_rows` hook. Code: `mh3u-rt/src/native_menu.rs`.
+
+- **The mod key:** **Right Shift** by default (unbound in the default keyboard controls, `input.md`). `MH3U_NATIVE_MENU_KEY`
+  (`-NativeMenuKey`, `--native-menu-key`) takes another key, named as winit names keys (`AltLeft`, `KeyM`, `F2`...). A key that
+  is also bound to a GamePad button still presses that button. The window sets the key's state with the other keys; it is let
+  go when the window loses the focus. Gamepad-only players need a keyboard for it for now.
+- **While the key is held, the Hunter tab up (`S+0x25` = 0, `S+0x1f` = 0) and at least 5 rows:**
+  - **Label:** row 4's label pointer (`S+0xb0 + 4*0x18 + 8`) points at "Mods" in the runtime's buffer (`0x0ff00100`, past the
+    native text's 64 bytes). `f_0215249c` refills the labels every frame, so the pointer is set on `menu_rows`, the entry of
+    `f_02152874(menu, S, cursor)`, which the update calls right after the refill. `f_02152874` has about 60 callers (other menus
+    share it), so only its 3 calls from `f_02154abc` count (return addresses `0x02154b20`, `0x02155010` and `0x0215504c`). The
+    row draw (`f_026615a8`) reads the pointer each frame (`text_set` from `0x026625a0`).
+  - **A on row 4:** on `menu_update`'s entry, with A (`0x10`) in `S+4`, the bit is cleared for that frame, so the game's if/else
+    chain never reaches Gestures (`f_0222bdd8`). The menu stays up, no sound plays, and the log says `[native-menu] Mods selected`
+    (once per press). The next PR opens a mod list here.
+- **When the key is let go** (or another tab, the second-level list or a close comes up), the game's own pointer is written back
+  at once (`[native-menu] Gestures label restored`); the game would also refill it on its next frame. Gestures works as usual.
+- **Log:** `[native-menu] on (MH3U_NATIVE_MENU): hold ShiftRight ...` at startup (or a line saying the build lacks the hooks),
+  `[native-menu] Gestures row reads "Mods" (was 0x… "Gestures")` when the label is swapped.
+- **The only writes:** the label text in the runtime's buffer, row 4's label pointer, and the A bit of that frame's buttons.
+- **Risks:** if `S+4` is a held mask rather than a press, letting go of the key while A is still down would open Gestures (the
+  check is every frame, so holding both keeps it off). The addresses are for the update `.rpx` (`ghidra.md`). A mode with 5 rows
+  (`S+0x20` = 5) has no row 4 to take, so nothing changes there.
+
 ### Proposed PRs
 
 1. **Read-only probe (small):** hooks on `f_02154abc` and `f_0215249c` that log `S+0x20`/`0x24`/`0x25`/`0x28`/`0x1f` on
