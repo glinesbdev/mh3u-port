@@ -298,6 +298,23 @@ impl<F: FnOnce(Display) + Send + 'static> ApplicationHandler for App<F> {
         }
         // the cursor follows the focus, fullscreen and the overlay (which the gamepad can open too, so this looks at every event)
         self.update_cursor();
+        // F9 / F10: the hook-finding tools' keys (docs/hooks.md); they also reach the game, which does not use them
+        if let WindowEvent::KeyboardInput { event: k, .. } = &event
+            && let PhysicalKey::Code(code) = k.physical_key
+            && k.state == ElementState::Pressed
+            && !k.repeat
+        {
+            use winit::keyboard::KeyCode;
+            let key = match code {
+                KeyCode::F9 => Some(&mh3u_rt::mods::KEY_F9),
+                KeyCode::F10 => Some(&mh3u_rt::mods::KEY_F10),
+                _ => None,
+            };
+            if let Some(key) = key {
+                let n = key.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                eprintln!("[keys] {code:?} pressed ({n})");
+            }
+        }
         if let WindowEvent::KeyboardInput { event: k, .. } = &event
             && let PhysicalKey::Code(code) = k.physical_key
             && is_fullscreen_toggle(code, self.alt)

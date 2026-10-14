@@ -18,6 +18,8 @@ param(
     [string]$Games = (Join-Path $env:USERPROFILE 'Downloads\wiiu')
 )
 $ErrorActionPreference = 'Stop'
+# PowerShell 7.3+: a native command's exit code is checked here, not turned into an error
+$PSNativeCommandUseErrorActionPreference = $false
 $repo = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot '..')).Path
 # full paths, from where the script was started (they need not exist yet)
 $Games = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($Games)
@@ -25,7 +27,10 @@ $Out = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($
 
 function Step([string]$Command, [string[]]$Arguments) {
     Write-Host "> $Command $($Arguments -join ' ')"
-    & $Command @Arguments
+    # native stderr (cargo's progress) is not an error: PowerShell 5 raises it as one under 'Stop' when redirected
+    $ErrorActionPreference = 'Continue'
+    & $Command @Arguments 2>&1 | ForEach-Object { if ($_ -is [System.Management.Automation.ErrorRecord]) { "$_" } else { $_ } }
+    $ErrorActionPreference = 'Stop'
     if ($LASTEXITCODE -ne 0) {
         throw "failed: $Command $($Arguments -join ' ') (exit code $LASTEXITCODE)"
     }

@@ -278,6 +278,38 @@ mod tests {
     }
 }
 
+/// F9 and F10 presses (the window counts them): F9 closes a call-diff window (`MH3U_CALLDIFF`), F10 searches for copies of the
+/// pouch again (`MH3U_WATCH=live`; on a quest, the quest pouch). See `docs/hooks.md`.
+pub static KEY_F9: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+pub static KEY_F10: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// The functions sampled far more often in window `b` than in window `a` (counts of the most recently entered function, `na` and
+/// `nb` samples): (function, count in a, count in b), most first. A function needs 5 samples in `b` and 4 times its rate in `a`.
+pub fn call_diff(a: &std::collections::HashMap<u32, u32>, b: &std::collections::HashMap<u32, u32>) -> Vec<(u32, u32, u32)> {
+    call_diff_min(a, b, 5)
+}
+
+/// As `call_diff`, with the fewest calls in `b` given (1 for exact counts: a function called once, only in `b`, is kept).
+pub fn call_diff_min(a: &std::collections::HashMap<u32, u32>, b: &std::collections::HashMap<u32, u32>, min: u32) -> Vec<(u32, u32, u32)> {
+    let (na, nb) = (a.values().sum::<u32>().max(1) as f64, b.values().sum::<u32>().max(1) as f64);
+    let mut out: Vec<(u32, u32, u32, f64)> = b
+        .iter()
+        .filter(|&(_, &n)| n >= min)
+        .filter_map(|(&f, &n)| {
+            let before = a.get(&f).copied().unwrap_or(0);
+            let ratio = (f64::from(n) / nb) / (f64::from(before).max(0.5) / na);
+            (ratio >= 4.0).then_some((f, before, n, ratio))
+        })
+        .collect();
+    out.sort_by(|x, y| y.3.total_cmp(&x.3).then(y.2.cmp(&x.2)));
+    out.into_iter().map(|(f, a, b, _)| (f, a, b)).collect()
+}
+
+/// Whether this is an `MH3U_WATCH=live` run of a watch build (the overlay then looks for the live save even while closed).
+pub fn watching_live() -> bool {
+    WATCH_FNS.get().is_some()
+}
+
 /// `MH3U_WATCH=live` (a `--watch` build, `docs/hooks.md`): stores into a range found at run time (the live save) are logged with
 /// what they write (a label from `label`), the function most recently entered and the link register, so the functions that
 /// change items, equipment and money can be found and hooked.
@@ -321,6 +353,10 @@ pub(crate) fn report_write(address: u32, value: u64, size: u32, lr: u32) -> bool
     // SAFETY: a plain read of a global of the watch build
     let function = unsafe { last() };
     let label = (w.label)(address);
+    if label.is_empty() {
+        // outside what is watched in a wide range (all the pouch copies at once): not reported
+        return true;
+    }
     let kind = label.split(' ').filter(|p| p.parse::<u32>().is_err()).collect::<Vec<_>>().join(" ");
     let count = {
         let mut seen = w.seen.lock().unwrap_or_else(|e| e.into_inner());
@@ -343,19 +379,38 @@ pub(crate) fn report_write(address: u32, value: u64, size: u32, lr: u32) -> bool
 
 /// Where `pattern` occurs (word-aligned) in `piece`, which starts at guest address `base`.
 pub fn copies_in(piece: &[u8], base: u32, pattern: &[u8], out: &mut Vec<u32>) {
+    copies_in_masked(piece, base, pattern, &vec![true; pattern.len()], out);
+}
+
+/// As `copies_in`, comparing only the bytes `mask` marks (a pouch's filled slots: on a quest, the empty ones may hold supplies).
+pub fn copies_in_masked(piece: &[u8], base: u32, pattern: &[u8], mask: &[bool], out: &mut Vec<u32>) {
     if pattern.is_empty() || piece.len() < pattern.len() {
         return;
     }
+    let first = mask.iter().position(|&m| m).unwrap_or(0);
     for i in (0..=piece.len() - pattern.len()).step_by(4) {
-        if piece[i..i + pattern.len()] == *pattern {
+        if piece[i + first] == pattern[first] && (0..pattern.len()).all(|k| !mask[k] || piece[i + k] == pattern[k]) {
             out.push(base + i as u32);
         }
     }
 }
 
+/// The copies to watch at once: the largest group within `span` bytes (sorted input), as (first, last).
+pub fn cluster(copies: &[u32], span: u32) -> Option<(u32, u32)> {
+    let mut best: Option<(usize, u32, u32)> = None;
+    for (i, &a) in copies.iter().enumerate() {
+        let n = copies[i..].iter().take_while(|&&c| c >= a && c - a <= span).count();
+        let last = copies[i + n - 1];
+        if best.is_none_or(|b| n > b.0) {
+            best = Some((n, a, last));
+        }
+    }
+    best.map(|b| (b.1, b.2))
+}
+
 /// `MH3U_WATCH=live`: the save the overlay found may be only the save image (written when saving), so this looks for other copies
-/// of its `len` bytes at `at` (the pouch) in `ranges`, in the background, logs them, and watches the copy `MH3U_WATCH_COPY` (0, the
-/// first, by default) as `lo..hi` around it; `label` names a watched address by its distance from the copy.
+/// of its `len` bytes at `at` (the pouch) in `ranges`, in the background, logs them, and watches the pouches of
+/// all copies in the largest group within 32 MiB (or only copy `MH3U_WATCH_COPY`, as `lo..hi` around it); `label` names a watched address by its distance from the copy.
 pub fn watch_copies(at: u32, len: u32, ranges: Vec<(u32, u32)>, around: (i64, i64), label: Arc<dyn Fn(i64) -> String + Send + Sync>) {
     if WATCH_FNS.get().is_none() {
         return;
@@ -369,6 +424,8 @@ pub fn watch_copies(at: u32, len: u32, ranges: Vec<(u32, u32)>, around: (i64, i6
         };
         let mut pattern = vec![0u8; len as usize];
         read_tolerant(base, at, &mut pattern);
+        // only the filled slots are compared (on a quest the empty ones may have been given supplies)
+        let mask: Vec<bool> = pattern.as_chunks::<4>().0.iter().flat_map(|s| [s[..2] != [0, 0]; 4]).collect();
         let filled = pattern.as_chunks::<4>().0.iter().filter(|s| s[..2] != [0, 0]).count();
         if filled < 3 {
             eprintln!("[watch-live] the pouch has {filled} items; put at least 3 in it and run again so its copies can be found");
@@ -384,7 +441,7 @@ pub fn watch_copies(at: u32, len: u32, ranges: Vec<(u32, u32)>, around: (i64, i6
                 let m = piece.min(to - p);
                 let slice = &mut buf[..(m + len).min(to - p) as usize];
                 read_tolerant(base, p, slice);
-                copies_in(slice, p, &pattern, &mut found);
+                copies_in_masked(slice, p, &pattern, &mask, &mut found);
                 p = p.saturating_add(m);
                 std::thread::sleep(std::time::Duration::from_micros(200));
             }
@@ -396,29 +453,73 @@ pub fn watch_copies(at: u32, len: u32, ranges: Vec<(u32, u32)>, around: (i64, i6
             eprintln!("[watch-live] the pouch is in no other place than the save at {at:#x}; still watching the save");
             return;
         }
-        let list: Vec<String> = found.iter().take(16).map(|c| format!("{c:#x}")).collect();
+        for (n, c) in found.iter().enumerate().take(64) {
+            eprintln!("[watch-live] pouch copy {n}: {c:#x}");
+        }
         eprintln!(
-            "[watch-live] the pouch is also at {} (MH3U_WATCH_COPY=n picks one, 0 = the first)",
-            list.join(", ")
+            "[watch-live] the pouch is also at {} place(s) (MH3U_WATCH_COPY=n watches only copy n)",
+            found.len()
         );
-        let pick = std::env::var("MH3U_WATCH_COPY")
-            .ok()
-            .and_then(|v| v.trim().parse::<usize>().ok())
-            .unwrap_or(0);
-        let Some(&copy) = found.get(pick).or(found.first()) else { return };
-        let lo = (i64::from(copy) + around.0).max(0) as u32;
-        let hi = (i64::from(copy) + around.1).min(i64::from(u32::MAX)) as u32;
-        let label = label.clone();
+        let pick = std::env::var("MH3U_WATCH_COPY").ok().and_then(|v| v.trim().parse::<usize>().ok());
+        if let Some(pick) = pick {
+            let Some(&copy) = found.get(pick).or(found.first()) else { return };
+            let lo = (i64::from(copy) + around.0).max(0) as u32;
+            let hi = (i64::from(copy) + around.1).min(i64::from(u32::MAX)) as u32;
+            let label = label.clone();
+            watch_writes(
+                lo,
+                hi,
+                Box::new(move |a| format!("copy {copy:#x}: {}", label(i64::from(a) - i64::from(copy)))),
+            );
+            return;
+        }
+        // all the copies in the largest group within 32 MiB at once, reporting only writes into one of their pouches
+        let Some((first, last)) = cluster(&found, 32 << 20) else { return };
+        let group: Vec<(usize, u32)> = found
+            .iter()
+            .copied()
+            .enumerate()
+            .filter(|&(_, c)| c >= first && c <= last)
+            .collect();
+        eprintln!(
+            "[watch-live] watching the pouches of {} copies at once ({first:#x}..={last:#x})",
+            group.len()
+        );
+        let lo = first;
+        let hi = last.saturating_add(len);
         watch_writes(
             lo,
             hi,
-            Box::new(move |a| format!("copy {copy:#x}: {}", label(i64::from(a) - i64::from(copy)))),
+            Box::new(move |a| {
+                group
+                    .iter()
+                    .find(|&&(_, c)| a >= c && a - c < len)
+                    .map(|&(n, c)| format!("copy {n} {c:#x}: {}", label(i64::from(a) - i64::from(c))))
+                    .unwrap_or_default()
+            }),
         );
     });
 }
 
 #[cfg(test)]
 mod write_watch_tests {
+    #[test]
+    fn the_call_diff_keeps_the_functions_that_only_run_in_the_second_window() {
+        let a: std::collections::HashMap<u32, u32> = [(1, 500), (2, 500)].into();
+        let b: std::collections::HashMap<u32, u32> = [(1, 450), (2, 400), (3, 100), (4, 3), (5, 50)].into();
+        let mut a2 = a.clone();
+        a2.insert(5, 40);
+        let d = super::call_diff(&a2, &b);
+        assert_eq!(
+            d.iter().map(|x| x.0).collect::<Vec<_>>(),
+            vec![3],
+            "5 ran before too, 4 too rarely, 1 and 2 always"
+        );
+        assert_eq!(d[0], (3, 0, 100));
+        // exact counts: a function called once, only in the second window, is kept
+        let b: std::collections::HashMap<u32, u32> = [(1, 450), (9, 1)].into();
+        assert_eq!(super::call_diff_min(&a, &b, 1), vec![(9, 0, 1)]);
+    }
     #[test]
     fn copies_of_the_pouch_are_found_word_aligned() {
         let pat = [1u8, 2, 3, 4, 5, 6, 7, 8];
@@ -428,6 +529,15 @@ mod write_watch_tests {
         let mut out = Vec::new();
         super::copies_in(&piece, 0x1000, &pat, &mut out);
         assert_eq!(out, vec![0x1008]);
+        // masked: a changed byte outside the mask still matches
+        let mut piece2 = piece.clone();
+        piece2[12] = 99;
+        let mut mask = vec![true; 8];
+        mask[4] = false;
+        let mut out = Vec::new();
+        super::copies_in_masked(&piece2, 0x1000, &pat, &mask, &mut out);
+        assert_eq!(out, vec![0x1008]);
+        assert_eq!(super::cluster(&[0x100, 0x200, 0x300, 0x5000_0000], 0x1000), Some((0x100, 0x300)));
     }
 
     #[test]

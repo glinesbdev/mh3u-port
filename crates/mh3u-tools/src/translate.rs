@@ -159,6 +159,8 @@ pub fn dispatch_c(starts: &[u32], targets: &BTreeMap<u32, u32>) -> String {
          uint32_t g_enter_lr = 1;\n\
          volatile uint32_t g_last_fn = 0;\n\
          GAME_API uint32_t game_last_function(void) { return g_last_fn; }\n\
+         uint32_t g_calls[CALLS_N];\n\
+         GAME_API const uint32_t *game_calls(uint32_t *n, uint32_t *base) { *n = CALLS_N; *base = CALLS_BASE; return g_calls; }\n\
          void rt_enter(Ctx *c, uint32_t f) { host.enter(c, f); }\n\
          GAME_API void game_set_watch(uint32_t lo, uint32_t hi) { g_watch_lo = lo; g_watch_hi = hi; }\n\
          void rt_watch(Ctx *c, uint32_t a, uint64_t v, uint32_t n) { host.watch(c, a, v, n); }\n\

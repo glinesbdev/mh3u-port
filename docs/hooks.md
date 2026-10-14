@@ -23,7 +23,7 @@ Mods so far only read memory (`overlay.md`). Hooks let a mod run native code whe
 - **Exits (later):** at a hook's entry, the runtime will save the link register and point it at a small host trampoline, so
   the callback also runs on return (`r3` is then the result). This is not built yet.
 - **Example:** the `log` callback prints the hook's name and `r3`–`r5`. It logs the first 20 calls of each hook, then every
-  1000th. `MH3U_HOOK_LOG=1` puts it on every hook in the list.
+  1000th. `MH3U_HOOK_LOG=1` puts it on every hook in the list, and prints at startup where each one landed (`[hooks] menu_open is f_…`; the build also prints `[hooks] in:0x… name is in f_…`).
 
 ## Candidate hook points
 
@@ -186,20 +186,169 @@ abandoned; `quest_fee_back` and `quest_reward` mean completed.
 The confidence is medium; a callback can switch on `h.ctx.lr`. `mods/hooks.txt` now hooks the callers as `item_to_pouch`
 (`in:0x219b080`) and `item_to_box` (`in:0x219950c`). They are not confirmed yet; if they fire on other frames, they are shared.
 
+### Item use and menu open: tools (PR #17)
+
+- **The quest pouch (F10):** with `MH3U_WATCH=live`, F10 searches guest memory for copies of the pouch as the save has it
+  now, and watches the first one (`MH3U_WATCH_COPY=n` picks another). Press it right after leaving for a quest, before any
+  item is used, while the quest pouch still equals the save's. Using an item then logs
+  `[watch-live] copy 0x…: pouch N count <- … by f_…, lr …`: the writer of the use.
+- **The call diff (F9, `MH3U_CALLDIFF=1`):** a thread samples the most recently entered function every millisecond. Each F9
+  closes a window and compares it with the one before. The log lists the functions at least 4 times as frequent (and seen at
+  least 5 times) in the new window: `[calldiff]   f_XXXXXXXX  before -> after`. Press F9 with the menu closed, open the
+  menu and wait 3 s, press F9 again: the list is what the menu runs (drawing included). The callers of the top ones are the
+  menu-open candidates.
+
+Both need a watch build. Each press logs `[keys] F9 pressed (n)`. F9 and F10 also reach the game, which does not use them.
+
+#### Test session (PowerShell)
+
+```powershell
+git pull; git checkout mods/hook-points-3
+.\scripts\win-build.ps1 -Watch -Out "$env:LOCALAPPDATA\mh3u\c-watch"
+$env:MH3U_WATCH = 'live'; $env:MH3U_CALLDIFF = '1'; $env:MH3U_HOOK_LOG = '1'
+.\scripts\win-run.ps1 -Out "$env:LOCALAPPDATA\mh3u\c-watch" *>&1 | Out-File -Encoding utf8 "$env:USERPROFILE\Desktop\session.log"
+Remove-Item Env:MH3U_WATCH, Env:MH3U_CALLDIFF, Env:MH3U_HOOK_LOG
+```
+
+In the village, with at least 3 items and a potion in the pouch, write down each step as you do it:
+1. Use a potion (out of a quest).
+2. Eat or drink something.
+3. Menu diff: press F9, wait 3 s, open the item menu, wait 3 s, press F9, close it. Then the same for the main menu:
+   press F9, wait 3 s, open it, wait 3 s, press F9, close it.
+4. Accept a quest and depart. As soon as you are in the field, press **F10**, then wait for `[watch-live] the pouch is also
+   at …` in the log.
+5. Use a potion on the quest, then another item. Abandon or finish the quest.
+
+Send back `Desktop\session.log` with your notes (the order of the steps, and which menu each F9 pair was).
+
+#### Run 34 (user): the first session
+
+- **F9 worked:** 6 windows. Item menu open versus closed: only `f_02aeeca8` (5 -> 6 samples, weak). Main menu: `f_0211a388`
+  and `f_02d31904` (1 -> 5, weak). The quest window against the menu window gave many functions (field code). The counts are
+  low, so these are weak leads, not hooks yet.
+- **F10 did nothing:** the live save was never found. The overlay only looked for it while open or with a non-empty wishlist,
+  and the watch build's folder has its own empty wishlist. Fixed: an `MH3U_WATCH=live` run always looks for it. F10 before
+  that says why, and every F9/F10 press is logged.
+
+#### Run 35 (user): the retest
+
+- **The quest's working save:** the log has no `pouch` write on the watched copy (`0x2e68e7ec`); only a memset and other
+  writes past the pouch. The quest's pouch lives somewhere else: when the quest starts, the runtime copies the whole save
+  (`[watch-host] copy: 31232 bytes at 0x2e66bd44`) into a block at **`0x2e66bd1c`** (pouch at `0x2e66bdec`, the first copy the
+  village F10 found; the quest-load code at lr `0x2165f18` clears it first). By the in-quest F10, its pouch no longer matched
+  the save's, so another copy was watched. The fix: `MH3U_WATCH_AT=0x2e66bd1c` watches that block with the save's labels from
+  the start. No F10 needed; the address was the same in every run so far.
+- **Menus:** the 10 s windows still gave only 2 -> 6 samples, which is noise. Sampling spreads over thousands of functions.
+  Watch builds now count every call exactly (a table indexed by function, `game_calls`). The call diff uses the exact deltas
+  between F9 presses and lists, first, the functions called 1–3 times **only** in the new window
+  (`once-like f_… called N times, only now`): menu-open candidates.
+- **Logs:** no `[hook]` lines (the watch build's folder was translated without them; harmless). The end of this log is
+  UTF-16; `*>` in PowerShell mixes encodings. Use `| Out-File -Encoding utf8` in the steps instead.
+
+#### Run 36 (user): the confirmation run
+
+- **Old build:** it ran `3cf9b05`, not `01bf289`, so neither the exact counts nor `MH3U_WATCH_AT` were in it (the log says
+  `[calldiff] on: press F9`, the sampling mode). Also, the exact counts need `win-build.ps1 -Watch -Translate`: the counting
+  is in the translated `dispatch.c` and `ppc.h`.
+- **The quest's working save is not where items are used:** the village F10 watched the block at `0x2e66bd1c` (pouch
+  `0x2e66bdec`) through the whole quest. The only writes were the quest-load memset and two runtime copies of the whole save
+  (31232 bytes at `0x2e66bd44`), at quest start and at quest end. The game made no stores to it, so using items on a quest
+  does not write it.
+- **Next lead:** `0x30297908`, the other copy the in-quest F10 found in run 35. It is next to the quest data `quest_accept`
+  passes (`0x30297390`). Press F10 on the quest with `MH3U_WATCH_COPY=1`.
+
+#### Run 37 (user)
+
+- **Build and counting:** build `67e121d`, with exact counting on. The item-menu window gave 190 functions called only while
+  it was open (for example the groups `f_02142f84`–`f_021451a8` and `f_02152830`–`f_02153480`). Too many to pick a hook from
+  one window. The call diff now intersects each window's "only now" functions with those of the window two before
+  (`[calldiff]   both f_…`), so two open-the-menu windows narrow it down.
+- **F10 in the field found only the village-era copies** (`0x2e66bdec`, `0x2e67387c`, `0x2e6eda44`). No write reached the
+  pouch of the copy it watched. The quest's pouch had already changed (supplies added), so an exact match of all 96 bytes
+  could not find it.
+- **F10 now:**
+  - compares only the slots that are filled in the save;
+  - logs every copy (`pouch copy N: 0x…`);
+  - by default watches **all** copies in the largest group within 32 MiB at once, reporting only writes into one of the
+    pouches (`copy N 0x…: pouch 3 count <- …`). `MH3U_WATCH_COPY=n` still watches just one.
+- **Leftover settings:** `MH3U_WATCH_AT` and `MH3U_WATCH_COPY` from earlier sessions were still set (and the startup copy
+  `0x3001cc1c` was reused heap). Clear them before a run.
+
+### Run 38 (build `1ccafa3`)
+
+- **Tools:** exact call counts on; F10 found 4 pouch copies (`0x2e66bdec`, `0x2e67387c`, `0x2e6eda44`, `0x3001e418`) and
+  watched all of them at once.
+- **Menu open:** 85 functions ran only with the item menu open in both open-the-menu windows (window 4 and window 2). The
+  ones called only a few times on the second open, the likeliest to be the open itself rather than per-frame drawing, are
+  `f_02037600` (2 calls) and `f_02153480` (3; next to the run 37 group `f_02152830`–`f_02153480`). Without the translated
+  C here their callers could not be followed, so both are in `hooks.txt` as log-only probes (`menu_probe_a`, `menu_probe_b`);
+  the hook log's `lr` gives the caller. Not wired to the overlay yet. Confidence: low to medium.
+- **Item use:** the only write to any pouch copy on the quest was a pickup (`copy 3 0x3001e418: pouch 0 count <- 0x9` by
+  `f_0219acec`, lr `0x219af28`, under `item_to_pouch` / `item_gain`). So `0x3001e418` is the quest's live pouch, but using a
+  potion and another item wrote nothing to it from guest code. The count goes down some other way (a store the watch does not
+  see, or a pouch kept elsewhere during use). Not found; the next run narrows it with the call diff instead.
+- **Noise:** `[watch-host] copy: 16 bytes at 0x3001b9f0` about 2,500 times (a host copy each frame into the wide watched
+  range, outside every pouch).
+- **Next run:** a normal `-Watch -Translate` build with `MH3U_HOOK_LOG=1` and `MH3U_CALLDIFF=1`. Open the item menu twice
+  (the probes' `lr` show their callers). On a quest: F9, use a potion, F9 within 2 s, wait 5 s, F9, use a potion, F9 within
+  2 s: the `both f_` lines are what using an item runs.
+
+### Run 39 (build `07ed040`)
+
+- **Complete:** the log is short because no write watch was on; it ends with `exit code 0`. No crash, no hook error.
+- **Item use (confident):** each potion used called `item_to_pouch` (`f_0219aeac`) with r4 = 9 (the item) and r5 = -1
+  (the count), from lr `0x285edac` in `f_0285ecd4`; both are in the call diff's `both` list for the two use windows. Using an
+  item is adding -1 to the pouch, which is why no separate writer showed in run 38. That call goes on to `item_gain` at the
+  pouch lr (`0x219b080`), so before this the overlay showed a use as a gain (`+ Potion -> pouch`) and counted it as a quest
+  pickup. Now `item_to_pouch` with a negative count is an `ItemUse` event (`- Potion used` in the feed), and the
+  `item_gain` call it makes is skipped.
+- **Menu open (not yet):** both probes fire several times per open (`menu_probe_a` 3 times, lr `0x2661768` and `0x2662a74`;
+  `menu_probe_b` 5 times, lr `0x21546fc` and `0x21b78b8`), so neither is the open itself. Their callers `f_02661…` and
+  `f_021546…` are the next probes.
+
+### Run 40 (build `7bf9a05`)
+
+- **Item use: confirmed.** The Events window showed `- Potion used`, and the log agrees: `item_to_pouch` r4 = 9, r5 = -1,
+  lr `0x285edac`, then its `item_gain` (skipped). The Map from the supply box was `item_to_pouch` r4 = 0x3f2, r5 = +1, from
+  the same lr, shown as `+ Map -> pouch`. So `f_0285ecd4` adds to and takes from the pouch on a quest, and the count's sign
+  tells which.
+- **Menu open, next:** `in:` probes on the functions containing the run 39 callers (`menu_probe_c` to `menu_probe_f`, lr
+  `0x2661768`, `0x2662a74`, `0x21546fc`, `0x21b78b8`). The translator prints the function each one landed in
+  (`[hooks] in:0x… name is in f_…`). Whichever fires once per open is `menu_open`.
+
+### Run 41 (build `c213607`; item menu opened and closed twice, then the main menu once)
+
+- **Probes c to f** (`f_026615a8`, `f_0266298c`, `f_02154484`, `f_021b77e0`) run every frame (e and f all the time, c and d while
+  a menu is up), so they are not opens. Removed.
+- **`menu_open` (`f_02153480`, confirmed in run 42):** the call with r5 = -1 from lr `0x21546fc` came exactly 3 times, once at the
+  start of each open (item, item, main); its other calls (r5 = `0x2e63c660` or `0x30296550`) follow every menu change.
+- **`menu_page` (`f_02037600`, confirmed in run 42):** r4 = 3 (lr `0x2662a74`) came exactly twice, once in each item-menu open
+  and not for the main menu; r4 = 0 follows every change.
+- Wired as the overlay events `menu opened` and `item menu opened`. Confirmed in run 42.
+
+### Run 42 (build `1b14c48`): menu hooks confirmed
+
+- The item menu gave `menu_open` (r5 = -1, lr `0x21546fc`) and `menu_page` r4 = 3; the main menu gave only `menu_open`; the
+  Events window showed `menu opened`, `item menu opened` and `- Potion used`. A later `menu_open` call with r5 = 0 was not an
+  open and was ignored, as intended. **`menu_open`, `menu_page` and item use (`item_to_pouch` with a negative count) are
+  confirmed.** The hooks' first list is complete.
+
 ## Plan
 
 1. Write this doc. **(done)**
 2. Translator: the hooks list parser, and `rt_hook` emitted at the listed entries; tests for both. **(done)**
 3. ABI: `host.hook` in `ppc.h`, the dispatch file and `game.rs`; the list copied to the build. **(done)**
 4. Runtime: `hooks.rs` (registry, `Hook` view, the `log` example, `MH3U_HOOK_LOG`); tests. **(done)**
-5. Find the first real addresses (item add, quest start) with watch builds, and list them in `mods/hooks.txt`.
+5. Find the first real addresses (item add, quest start) with watch builds, and list them in `mods/hooks.txt`. **(done)**
 6. Exit hooks through a return trampoline.
-7. An overlay feature that uses a hook, e.g. a "craftable now" toast fired by the item-add hook instead of polling.
+7. An overlay feature that uses a hook, e.g. a "craftable now" toast fired by the item-add hook instead of polling. **(done)**
 
 ## Status / next step
 
-See the bottom of this file. It is updated with each commit of PR #13.
-
-- Status: PR #16 wires `item_gain`, `pouch_remove_slot`, `money_add`, the craft hooks and `quest_end` into the overlay
-  (events, feed, read on events plus every 2 s; `overlay.md`). `item_to_box` and `item_to_pouch` are not confirmed yet.
-- Next: item use (consume), menu open, and confirming the caller hooks (see the steps above).
+- Status: done (PR #17). Every hook in `mods/hooks.txt` with an overlay event is confirmed in game: `item_gain`, `item_to_pouch`
+  (gains and, with a negative count, item use), `pouch_remove_slot`, `money_add`, `craft_equipment`, `craft_jewel`,
+  `quest_end`, `menu_open` and `menu_page` (runs 32 to 42). `quest_accept`, `quest_reward`, `item_to_box` and `equip_records`
+  are logged only.
+- The watch tools (`MH3U_WATCH=live`, F10, `MH3U_CALLDIFF` with F9; `-Watch -Translate` builds) stay for finding the next
+  hooks: two windows of the same action, then `both f_…`, then `in:` probes on the callers with `MH3U_HOOK_LOG=1`.
+- Next, if wanted: exit hooks (plan step 6), and hooks for the overlay's later features (drops, hunt plans; `roadmap.md`).

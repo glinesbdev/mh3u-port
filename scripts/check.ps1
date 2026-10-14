@@ -1,11 +1,16 @@
 # The checks to run before every commit, stopping at the first failure: the same as scripts/check.sh, for Windows PowerShell.
 # Run it from anywhere:  powershell -ExecutionPolicy Bypass -File scripts\check.ps1
 $ErrorActionPreference = 'Stop'
+# PowerShell 7.3+: a native command's exit code is checked here, not turned into an error
+$PSNativeCommandUseErrorActionPreference = $false
 Set-Location -LiteralPath (Join-Path $PSScriptRoot '..')
 
 function Step([string]$Command, [string[]]$Arguments) {
     Write-Host "> $Command $($Arguments -join ' ')"
-    & $Command @Arguments
+    # native stderr (cargo's progress) is not an error: PowerShell 5 raises it as one under 'Stop' when redirected
+    $ErrorActionPreference = 'Continue'
+    & $Command @Arguments 2>&1 | ForEach-Object { if ($_ -is [System.Management.Automation.ErrorRecord]) { "$_" } else { $_ } }
+    $ErrorActionPreference = 'Stop'
     if ($LASTEXITCODE -ne 0) {
         $code = $LASTEXITCODE
         [Console]::Error.WriteLine("failed: $Command $($Arguments -join ' ') (exit code $code)")

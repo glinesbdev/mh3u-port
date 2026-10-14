@@ -672,6 +672,133 @@ pub fn run(library: &Path, pieces: &[Piece], options: Options) -> Result<Report>
             Err(_) => eprintln!("MH3U_ENTER is set but the library was not built with --watch"),
         }
     }
+    if std::env::var("MH3U_CALLDIFF").is_ok_and(|v| v.trim() == "1") {
+        // the call diff (docs/hooks.md): samples the most recently entered function every millisecond; each F9 closes a window and
+        // the last two are compared (needs a --watch build)
+        // SAFETY: the symbol exists only in a library built with the watch, with this signature
+        match unsafe { lib.get::<unsafe extern "C" fn() -> u32>(b"game_last_function\0") } {
+            Ok(f) => {
+                let f = *f;
+                // SAFETY: the symbol exists only in a watch build made since PR #17, with this signature
+                let exact = unsafe { lib.get::<unsafe extern "C" fn(*mut u32, *mut u32) -> *const u32>(b"game_calls\0") }
+                    .ok()
+                    .map(|g| {
+                        let (mut n, mut base) = (0u32, 0u32);
+                        // SAFETY: the library's own table, alive as long as the library (which is never unloaded)
+                        let p = unsafe { g(&mut n, &mut base) } as usize;
+                        (p, n as usize, base)
+                    });
+                if let Some((p, n, base)) = exact {
+                    eprintln!("[calldiff] on, exact call counts: press F9 to close a window (e.g. menu closed), do the thing, F9 again");
+                    std::thread::spawn(move || {
+                        use std::sync::atomic::Ordering::Relaxed;
+                        let read = || -> Vec<u32> {
+                            // SAFETY: a racy read of counters is fine for a diff; the table has `n` words
+                            (0..n)
+                                .map(|i| unsafe { std::ptr::read_volatile((p as *const u32).add(i)) })
+                                .collect()
+                        };
+                        let mut last = read();
+                        let mut prev: Option<std::collections::HashMap<u32, u32>> = None;
+                        // the functions only called in each window (to intersect two menu-open windows)
+                        let mut only_sets: Vec<std::collections::BTreeSet<u32>> = Vec::new();
+                        let mut seen = crate::mods::KEY_F9.load(Relaxed);
+                        let mut window = 0;
+                        loop {
+                            std::thread::sleep(std::time::Duration::from_millis(20));
+                            let k = crate::mods::KEY_F9.load(Relaxed);
+                            if k == seen {
+                                continue;
+                            }
+                            seen = k;
+                            window += 1;
+                            let now = read();
+                            let done: std::collections::HashMap<u32, u32> = now
+                                .iter()
+                                .zip(&last)
+                                .enumerate()
+                                .filter(|(_, (a, b))| a != b)
+                                .map(|(i, (a, b))| (base + 4 * i as u32, a.wrapping_sub(*b)))
+                                .collect();
+                            last = now;
+                            if prev.is_none() {
+                                only_sets.push(Default::default());
+                            }
+                            eprintln!("[calldiff] window {window} closed ({} functions called)", done.len());
+                            if let Some(pw) = &prev {
+                                let d = crate::mods::call_diff_min(pw, &done, 1);
+                                let only: Vec<_> = d.iter().filter(|x| x.1 == 0).collect();
+                                let set: std::collections::BTreeSet<u32> = only.iter().map(|x| x.0).collect();
+                                if only_sets.len() >= 2 {
+                                    let earlier = &only_sets[only_sets.len() - 2];
+                                    let both: Vec<_> = set.intersection(earlier).collect();
+                                    eprintln!(
+                                        "[calldiff] only-now in both window {window} and window {}: {} functions",
+                                        window - 2,
+                                        both.len()
+                                    );
+                                    for f in both.iter().take(40) {
+                                        eprintln!("[calldiff]   both f_{f:08x}");
+                                    }
+                                }
+                                only_sets.push(set);
+                                eprintln!(
+                                    "[calldiff] window {window} vs {}: {} far more often, {} only now",
+                                    window - 1,
+                                    d.len(),
+                                    only.len()
+                                );
+                                let mut few: Vec<_> = only.iter().filter(|x| x.2 <= 3).collect();
+                                few.sort_by_key(|x| x.0);
+                                for (func, _, b) in few.iter().take(40) {
+                                    eprintln!("[calldiff]   once-like f_{func:08x}  called {b} times, only now");
+                                }
+                                for (func, a, b) in d.iter().take(25) {
+                                    eprintln!("[calldiff]   f_{func:08x}  {a} -> {b}");
+                                }
+                            }
+                            prev = Some(done);
+                        }
+                    });
+                } else {
+                    eprintln!("[calldiff] on: press F9 to close a window (e.g. menu closed), do the thing, F9 again");
+                    std::thread::spawn(move || {
+                        use std::sync::atomic::Ordering::Relaxed;
+                        let mut cur: std::collections::HashMap<u32, u32> = Default::default();
+                        let mut prev: Option<std::collections::HashMap<u32, u32>> = None;
+                        let mut seen = crate::mods::KEY_F9.load(Relaxed);
+                        let mut window = 0;
+                        loop {
+                            std::thread::sleep(std::time::Duration::from_millis(1));
+                            // SAFETY: a plain read of a global
+                            *cur.entry(unsafe { f() }).or_default() += 1;
+                            let k = crate::mods::KEY_F9.load(Relaxed);
+                            if k == seen {
+                                continue;
+                            }
+                            seen = k;
+                            window += 1;
+                            let done = std::mem::take(&mut cur);
+                            eprintln!("[calldiff] window {window} closed ({} samples)", done.values().sum::<u32>());
+                            if let Some(p) = &prev {
+                                let d = crate::mods::call_diff(p, &done);
+                                eprintln!(
+                                    "[calldiff] window {window} vs {}: {} functions far more frequent",
+                                    window - 1,
+                                    d.len()
+                                );
+                                for (func, a, b) in d.iter().take(25) {
+                                    eprintln!("[calldiff]   f_{func:08x}  {a} -> {b}");
+                                }
+                            }
+                            prev = Some(done);
+                        }
+                    });
+                }
+            }
+            Err(_) => eprintln!("MH3U_CALLDIFF is set but the library was not built with --watch"),
+        }
+    }
     if let Some(secs) = std::env::var("MH3U_PROFILE").ok().and_then(|v| v.parse::<u64>().ok()) {
         // a sampling profile of the translated code: the function most recently entered, every millisecond (needs a --watch build)
         // SAFETY: the symbol exists only in a library built with the watch, with this signature
