@@ -272,6 +272,64 @@ sets `S+0` = 1 and opens UI screen (1, 5) through `ui->vtable + 0x13c`. While th
   - Writes are limited to the page's display state in `S`, which the game rebuilds when the page opens, plus the runtime's
     own buffer.
 
+### The Mods page's panes, pages and modifier (PR #23)
+
+Run 45 (PR #22) showed the Combo List's own panes around the Mods rows: the title "Combo List", the page counter "1/22",
+"Default Order", and a side panel with "??????", "Insufficient materials.", "Output ???" and two materials. The help line read
+"Select from the list." Where each comes from (Ghidra) and what the Mods page now puts there:
+
+| What | Set by | On the Mods page |
+|---|---|---|
+| Title | `f_0265f010(widget, 3)` at page setup: message 3/`0xcc` via `text_set` (returns to `0x0265fa48`, or `0x0265fa98` for kind 0xc) | "Wishlist" |
+| Page counter | the row draw `f_026611b8(.., S+0x1e8 + 1, S+0x1e9, ..)` | the Mods page's own page / pages, 8 rows each |
+| "Default Order" | `f_026636d4`: message 3/`0x21a` (`0x21b`, `0x219`) via `text_set` (returns `0x0266390c`, `0x02663974`, `0x026639d4`) | "Left/Right: page" |
+| Help line | `f_026636d4` -> `f_02144d18(ui, message 3/0x180, 0)` (returns to `0x02663c50`) | "Wishlist (Left/Right: page, B: back)" |
+| Side panel | `f_0265bfac(panel, S)` -> `f_0265b2f0` (output and status) and `f_0265bb24` (materials), from `S+0x230` | the hovered piece |
+
+**The side panel** (`panel` = `f_0265bfac`'s `r3`, the new `combo_panel` hook keeps it; its panes are pointers in it):
+
+- **No-combo path:** with `S+0x230` = 0 and `S+0x245` = 0, `f_0265b2f0` sets:
+  - `+0x2b4`, the output name (message `0x177`);
+  - `+0x2d0` (message `0x176`);
+  - with `(char)S+0x244 < 0`, `+0x2cc` (message `0x175`) and `+0x2d4` (message `0x172`, through `f_0228f57c`).
+
+  The Mods page sets `S+0x244` = `0xff` so all four are set each frame. `text_set` then replaces each pane, matched by
+  pointer:
+  - `+0x2b4`: the piece's name;
+  - `+0x2d0`: "Ready to craft" or "Need N more";
+  - `+0x2cc`: "Materials: have/need", or "+N more materials (F1)" for pieces with more than two materials;
+  - `+0x2d4`: blank.
+- **Materials:** `f_0265bb24` reads two item ids at `S+0x234`/`S+0x236`. It returns early if either is 0. It draws each
+  item's name (`+0x2bc`, `+0x2c4`) and icon (`+0x2ac`, `+0x2b0`) itself, and a count (`+0x2c0`, `+0x2c8`) from the pouch
+  (`f_02233684`, read only).
+  - The Mods page writes the hovered piece's first two material ids there, so the game draws their names and icons.
+  - The two counts are replaced with `have/need` from the overlay's wishlist status.
+  - A piece with one material gets it twice, with the second name and count blanked; its icon still shows twice.
+- **Rows with no piece** (an empty wishlist, or blank rows past the end): the ids are 0, so the materials function returns
+  early and its panes keep the last piece's text and icons. The panel's name reads "Wishlist", with "N of M ready" or a
+  note.
+
+**Pages:** `S+0x1e8` (page) and `S+0x1e9` (pages) are the row draw's counter. The Mods page writes them every frame from its own
+page number (in the runtime). Left and right (`0xc` in `S+4`/`S+0xc`: `0x4` left, `0x8` right, as in `f_0223a0e0`) turn that
+page, wrapping, and are then cleared, so the game's own paging (`f_022338e8`) never runs. The cursor row (`S+0x1ea`) plus page × 8
+gives the hovered piece.
+
+**ZL as the modifier:** holding ZL on a gamepad acts as the mod key (OR'd with Right Shift / `MH3U_NATIVE_MENU_KEY`).
+- **What ZL could do in the start menu:** the start menu's only shortcuts are the game's `0x80` and `0x10000` (`f_021548cc`,
+  in a mode with `S+0x19` = 1, online). They are game codes from the pad manager (`DAT_10312bb0`), and which pad button they
+  come from is not mapped yet.
+- **So, to be safe:** with the opt-in on, ZL is kept from the game while the start menu or the Mods page has run in the last
+  200 ms (`native_menu::swallowed`, applied in `Input::hold`, the game's `VPADRead`). The modifier reads the gamepads' state
+  directly (`Input::pad_buttons`).
+- **Elsewhere,** ZL reaches the game as usual. Without the opt-in, nothing is kept.
+
+**Writes:** still only the page's display state in `S` (rebuilt when the page opens), the start menu cursor, the frame's buttons
+and the runtime's buffer (text slots of 64 bytes from `0x0ff00200`: rows 0-7, title, order label, help, 7 panes). No save or pouch
+data.
+
+**Hooks:** two new ones in `mods/hooks.txt`, `combo_panel` (`f_0265bfac`) and `help_set` (`f_02144d18`). They need
+`win-build.ps1 -Translate`. Without them, the rows still work, and the panel and help line stay the Combo List's.
+
 ### Proposed PRs
 
 1. **Read-only probe (small):** hooks on `f_02154abc` and `f_0215249c` that log `S+0x20`/`0x24`/`0x25`/`0x28`/`0x1f` on

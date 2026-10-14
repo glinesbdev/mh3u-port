@@ -139,7 +139,7 @@ fails on its exit code only.
   - `-Scale 1|2|3|4`: `MH3U_GFX_RESOLUTION_SCALE` (native size if omitted);
   - `-NativeText`: `MH3U_NATIVE_TEXT=1` (the wishlist in the item menu, `native-menu.md`);
   - `-MenuProbe`: `MH3U_MENU_PROBE=1` (logs the start menu's state, read-only, `native-menu.md`);
-  - `-NativeMenu`: `MH3U_NATIVE_MENU=1` (hold Right Shift in the start menu: Gestures reads "Mods", `native-menu.md`), and
+  - `-NativeMenu`: `MH3U_NATIVE_MENU=1` (hold Right Shift or ZL in the start menu: Gestures reads "Mods" and opens the Mods page, `native-menu.md`), and
     `-NativeMenuKey K` (`MH3U_NATIVE_MENU_KEY`) for another key.
 
   It removes them again when the game ends.
