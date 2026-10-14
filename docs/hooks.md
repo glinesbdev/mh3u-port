@@ -23,7 +23,7 @@ Mods so far only read memory (`overlay.md`). Hooks let a mod run native code whe
 - **Exits (later):** at a hook's entry, the runtime will save the link register and point it at a small host trampoline, so
   the callback also runs on return (`r3` is then the result). This is not built yet.
 - **Example:** the `log` callback prints the hook's name and `r3`–`r5`. It logs the first 20 calls of each hook, then every
-  1000th. `MH3U_HOOK_LOG=1` puts it on every hook in the list.
+  1000th. `MH3U_HOOK_LOG=1` puts it on every hook in the list, and prints at startup where each one landed (`[hooks] menu_probe_c is f_…`; the build also prints `[hooks] in:0x… name is in f_…`).
 
 ## Candidate hook points
 

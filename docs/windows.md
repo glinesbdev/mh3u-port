@@ -122,6 +122,10 @@ powershell -ExecutionPolicy Bypass -File scripts\win-run.ps1 -DebugPs tex -PadLa
   `build-game`, then puts both back. Changing `RUSTFLAGS` rebuilds every crate once, both when turning it on and when turning it
   off.
 
+`win-build.ps1` and `check.ps1` pass cargo's and the compiler's stderr through as plain lines, so their output can be redirected
+or piped (`*>&1 | Tee-Object build.log`) on PowerShell 5 and 7 without the first `Compiling` line stopping the script; a step
+fails on its exit code only.
+
 **`win-run.ps1`:**
 - It first clears the debugging variables an earlier run may have left in the session: `MH3U_FPS`, `MH3U_GFX_TIMES`,
   `MH3U_GFX_REPORT`, `MH3U_GFX_LOG`, `MH3U_GFX_DUMP_*`, `MH3U_GFX_DEBUG_PS*`, `MH3U_GFX_SOLID`, `MH3U_GFX_DEPTH_BIAS`,

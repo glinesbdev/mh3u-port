@@ -918,6 +918,10 @@ fn run_game(dump: &Dump, c_dir: &Path, max_imports: u64, save: PathBuf, window: 
     {
         let mut registry = mh3u_rt::hooks::Registry::new(&list);
         if std::env::var("MH3U_HOOK_LOG").is_ok_and(|v| v.trim() == "1") {
+            // where each hook landed (an `in:` entry is on the function containing its address)
+            for (a, n) in &list {
+                eprintln!("[hooks] {n} is f_{a:08x}");
+            }
             registry.log_all();
         }
         // the overlay's events (item gains, money, crafts, quest ends; docs/overlay.md)
