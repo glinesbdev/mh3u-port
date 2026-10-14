@@ -75,6 +75,38 @@ mod windows {
         base: *mut u8,
         slot: usize,
         handler: *mut core::ffi::c_void,
+        #[cfg(test)]
+        _turn: SlotTurn,
+    }
+
+    /// Tests run in parallel and each makes its own guest memory, but only `RANGES.len()` can exist at once: a test waits here
+    /// for one of the places instead of failing (the game itself makes one).
+    #[cfg(test)]
+    static IN_USE: (std::sync::Mutex<usize>, std::sync::Condvar) = (std::sync::Mutex::new(0), std::sync::Condvar::new());
+
+    #[cfg(test)]
+    struct SlotTurn;
+
+    #[cfg(test)]
+    impl SlotTurn {
+        fn wait() -> SlotTurn {
+            let (lock, freed) = &IN_USE;
+            let mut n = lock.lock().unwrap_or_else(|e| e.into_inner());
+            while *n >= RANGES.len() {
+                n = freed.wait(n).unwrap_or_else(|e| e.into_inner());
+            }
+            *n += 1;
+            SlotTurn
+        }
+    }
+
+    #[cfg(test)]
+    impl Drop for SlotTurn {
+        fn drop(&mut self) {
+            let (lock, freed) = &IN_USE;
+            *lock.lock().unwrap_or_else(|e| e.into_inner()) -= 1;
+            freed.notify_one();
+        }
     }
 
     // SAFETY: the reservation is plain memory; who may touch it when is the kernel's baton's business, as on Linux
@@ -106,6 +138,8 @@ mod windows {
 
     impl GuestMemory {
         pub fn reserve() -> Result<GuestMemory> {
+            #[cfg(test)]
+            let turn = SlotTurn::wait();
             // SAFETY: a fresh reservation anywhere the system likes
             let base = unsafe { VirtualAlloc(std::ptr::null(), SIZE, MEM_RESERVE, PAGE_NOACCESS) } as *mut u8;
             if base.is_null() {
@@ -130,7 +164,13 @@ mod windows {
                 unsafe { VirtualFree(base.cast(), 0, MEM_RELEASE) };
                 bail!("installing the handler that commits guest memory failed");
             }
-            Ok(GuestMemory { base, slot, handler })
+            Ok(GuestMemory {
+                base,
+                slot,
+                handler,
+                #[cfg(test)]
+                _turn: turn,
+            })
         }
 
         pub fn as_mut_ptr(&mut self) -> *mut u8 {
