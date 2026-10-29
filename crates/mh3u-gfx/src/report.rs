@@ -8,10 +8,11 @@
 //!   `mh3u-frames` by default): `draws.txt` with every draw's state, `shaders/` with each shader's listing and WGSL, `textures/` with
 //!   each texture the frame reads as a PNG, and the TV picture as `tv.png`. Small enough to zip and send.
 
+use crate::fxmap::{HashMap, HashSet};
 use crate::state::State;
 use crate::texture::{Header, Support, format_support};
 use mh3u_rt::Guest;
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::path::PathBuf;
 use std::sync::Mutex;

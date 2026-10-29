@@ -5,6 +5,7 @@ mod draw;
 #[cfg(test)]
 mod draw_bench;
 pub mod events;
+mod fxmap;
 mod geometry;
 mod gx2;
 pub mod icon;

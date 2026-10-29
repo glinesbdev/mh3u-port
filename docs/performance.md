@@ -299,3 +299,9 @@ move the village on its own.
 
 - Gamepad thread suspected of spinning: it was not; that profile was mislabelled baton time.
 - Textures re-decoded after every overlapping `GX2Invalidate` (~15k a second): now re-hashed and only decoded if changed.
+- Renderer maps hashed with std's SipHash (Windows 11, Ryzen 5 9600X, NVIDIA RTX 4070, Vulkan, Oct 2026): in a profile of the
+  game's thread in Tanzia Port, `SipHasher::write` was the top item of the exe's own code (17 of 197 samples in
+  `mh3u-tools.exe`, out of 600). The per-draw maps of `draw.rs`, `gx2.rs` and `report.rs` now use a small FxHasher (`fxmap.rs`,
+  no new dependency): about 985 to 1004 frames per 10 s (`[gfx frames]`, +2 %), and the exe's share of the thread went from 33 %
+  to 28 % of the samples. The maps elsewhere in the crate (`kbm`, `pipelines`, `texture`, `shader_cache`) still use std's; they
+  were 5 samples in a later profile. Measured on this one machine.

@@ -1,6 +1,7 @@
 //! What a draw call becomes: the game's shaders translated to WGSL, its vertex data decoded on the CPU, and a render pipeline made from
 //! the recorded state, cached by what makes it different.
 
+use crate::fxmap::{HashMap, HashSet};
 use crate::gx2::Gx2;
 use crate::shader_cache::{FrontCache, Lookup, Ranges};
 use crate::state::State;
@@ -9,7 +10,6 @@ use mh3u_latte::translate::{
     Context, IDENTITY_SELECT, Interface, PixelInputs, TexKind, VertexAttribute, VertexInputs, translate_pixel, translate_vertex,
 };
 use mh3u_rt::Guest;
-use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 use std::time::Instant;
