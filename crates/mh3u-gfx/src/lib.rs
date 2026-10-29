@@ -12,6 +12,7 @@ pub mod kbm;
 pub mod overlay;
 mod perf;
 mod pipelines;
+mod queue;
 mod report;
 mod shader_cache;
 mod state;
@@ -40,7 +41,7 @@ pub struct Display {
     pub instance: wgpu::Instance,
     pub adapter: wgpu::Adapter,
     pub device: wgpu::Device,
-    pub queue: wgpu::Queue,
+    pub queue: queue::OrderedQueue,
     pub surface: Option<wgpu::Surface<'static>>,
 }
 
@@ -72,7 +73,7 @@ impl Display {
             instance,
             adapter,
             device,
-            queue,
+            queue: queue::OrderedQueue::new(queue, true),
             surface: Some(surface),
         })
     }
@@ -104,7 +105,7 @@ impl Display {
             instance,
             adapter,
             device,
-            queue,
+            queue: queue::OrderedQueue::new(queue, false),
             surface: None,
         }
     }

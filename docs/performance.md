@@ -38,6 +38,22 @@ uniform banks read by index no longer read, hashed and uploaded as a whole 64 KB
 shader lookups; display lists replayed without copies or string matching. The register/flags/dispatch work in #1 did not
 move the village on its own.
 
+### GPU queue on its own thread (Windows 11, Ryzen 5 9600X, NVIDIA RTX 4070, Vulkan, Oct 2026)
+
+`flush_draws` hands each batch's encoders to a thread (`mh3u gpu queue`, `queue.rs`) that finishes and submits them, and presents,
+in the order the game's thread made them; `MH3U_GFX_THREAD=off` goes back to doing it on the game's thread. Moga Woods, area 1,
+`[gfx frames]` windows of 10 s:
+
+| | frames per 10 s | slowest frame |
+|---|---|---|
+| on the game's thread | 1016–1083 | 14–21 ms |
+| on the queue thread | 1590–1680 | 7.6–13.3 ms |
+
+Sampling the game's thread (600 samples of its instruction pointer): NVIDIA's Vulkan driver fell from 104 to 8 samples, and the
+queue thread ran at about 54 % of a core. What is left on the game's thread is mostly `game.dll` (41 % of its samples). *Guess:* the
+gain is larger on a CPU that is the limit, since wgpu and the driver were about 29 % of the game's thread here; not measured.
+Measured on this one machine, with Vulkan.
+
 ## Open concerns
 
 1. **Untimed time inside `GX2DirectCallDisplayList`.** In areas and fights it takes 16–19 ms per frame, but the timed draw
@@ -45,7 +61,8 @@ move the village on its own.
    the end of the list. Run 12 showed that most of this untimed part is wgpu's own bookkeeping, and that it grows with the
    number of GPU buffers (concern 3). `[draw times]` now has `render pass end` (wgpu checks and records a whole pass when it
    ends; the count is the number of passes), `arena uploads`, `command encoding (finish)` (where wgpu 30 really does that
-   work; see concern 7, run 18) and `submit`.
+   work; see concern 7, run 18) and `submit` (with the GPU queue thread, below, these two are one step, `command encoding and
+   submit (handed over)`, and the work itself runs on the `mh3u gpu queue` thread).
 2. **Pipeline creation when entering an area.** "pipeline" reached ~4 ms per frame in the first window after a load (0.2 ms
    otherwise). Run 11 (500c143): about 3.5 s of window 1 and 2.4 s of window 2 (village load, leaving for the field) went to
    it, against 0.1 ms a frame once the field was set up: the hitching the user feels on an area change. Texture decoding (at
@@ -297,5 +314,7 @@ move the village on its own.
 - Gamepad face buttons: run 15's log showed `[gamepad] East is the GamePad's A` with the new default layout, so an Xbox pad's A is
   the game's A (7b89bb8; `MH3U_PAD_LAYOUT=nintendo` gives the earlier mapping).
 
+- Game thread paying for wgpu's `finish` and the driver's submit and present (about 29 % of its time in Moga Woods): they now run
+  on the `mh3u gpu queue` thread (`queue.rs`; see "GPU queue on its own thread" above).
 - Gamepad thread suspected of spinning: it was not; that profile was mislabelled baton time.
 - Textures re-decoded after every overlapping `GX2Invalidate` (~15k a second): now re-hashed and only decoded if changed.

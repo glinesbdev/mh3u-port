@@ -200,8 +200,8 @@ at the start). `$env:MH3U_GFX_SHADER_CACHE = 'off'` leaves them out, and `$env:M
 may take in one frame (5 ms by default, `0` for no limit). The `[gfx] area change` lines show where an area entry's time went:
 translating, making shader modules, decoding textures, and the game. `[gfx slow frame]` lines break down any frame of 25 ms or more
 (`$env:MH3U_GFX_SLOW_MS` changes that) by its longest steps. `$env:MH3U_GFX_TIMES = 'calls'` times only the calls and frames,
-which adds the least to what is measured. `[draw times]` also has `render pass end`, `arena uploads`, `command encoding (finish)` and `submit` (wgpu's own work, which used to be the untimed part of
-`GX2DirectCallDisplayList`). `[gfx caches]` shows `vertex streams N (X MB)`, which should stay roughly flat while standing still.
+which adds the least to what is measured. `[draw times]` also has `render pass end`, `arena uploads` and `command encoding and submit (handed over)` (wgpu's own work, which used to be the untimed part of
+`GX2DirectCallDisplayList`; it runs on the GPU queue thread unless `$env:MH3U_GFX_THREAD = 'off'`). `[gfx caches]` shows `vertex streams N (X MB)`, which should stay roughly flat while standing still.
 First-seen textures, vertex streams and geometry pipelines past `$env:MH3U_GFX_DECODE_BUDGET_MS` a frame (2 ms by default; big
 textures always) are decoded on worker threads. Their draws wait a frame or two ("… decoded in a later frame" in the skipped
 draws), so a new area's objects can pop in slightly late. `$env:MH3U_GFX_ASYNC_DECODE = 'off'` decodes them with the draw waiting,

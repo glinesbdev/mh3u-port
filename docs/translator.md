@@ -330,7 +330,10 @@ with their text and the cloth background, upright, in the right places (the hunt
   - `bind group made (in groups)`;
   - `arena uploads`: the batch's arena writes;
   - `command encoding (finish)`: wgpu 30 checks a batch's passes, tracks their resources and makes the Vulkan or D3D12 commands
-    only when the command buffer is finished, so this is most of what the draws cost on the CPU outside this code.
+    only when the command buffer is finished, so this is most of what the draws cost on the CPU outside this code. The batch's
+    encoders are finished and submitted on the `mh3u gpu queue` thread (`queue.rs`), so this step and `submit` are one,
+    `command encoding and submit (handed over)`; with `MH3U_GFX_THREAD=off` the same step covers the whole work, done on the
+    game's thread.
 
   `[draw counts]` adds `vertex stream bytes made`, `vertex streams given buffers`, `vertex streams aged out`, `bind groups aged
   out`, `arena uploads` and `arena bytes uploaded`. `MH3U_GFX_TIMES=calls` leaves out the draw steps and counts (about 25 clock
