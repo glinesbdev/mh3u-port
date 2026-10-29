@@ -33,6 +33,12 @@ With the work in PRs #1–#3 (`perf/regs-flags-dispatch` → `windows-build` →
 | Village, standing | 13–17 FPS | ~73 FPS (~450 draws/frame) |
 | Other areas and fights | not measured | 32–43 FPS |
 
+### Release profile (Windows 11, Ryzen 5 9600X, NVIDIA RTX 4070, Vulkan, Oct 2026)
+
+`[profile.release]` was not set, so `mh3u-tools` was built with the defaults. With `lto = "fat"` and `codegen-units = 1`, Tanzia
+Port went from about 912 to about 985 frames per 10 s (`[gfx frames]`, +8 %) and `mh3u-tools.exe` from 22.3 MB to 17.4 MB. *Guess:*
+the gain is inlining between the runtime and the renderer; which functions gained was not profiled. Measured on this one machine.
+
 The village gains came, in order of size, from: one baton wake-up per handoff instead of waking every finished guest thread;
 uniform banks read by index no longer read, hashed and uploaded as a whole 64 KB per draw; cached bind groups, views and
 shader lookups; display lists replayed without copies or string matching. The register/flags/dispatch work in #1 did not
