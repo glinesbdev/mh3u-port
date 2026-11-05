@@ -2,9 +2,9 @@
 //! console's frame pacing. Draws, shaders and textures are the next part.
 
 use crate::Display;
+use crate::fxmap::HashMap;
 use crate::state::{State, arg, farg};
 use mh3u_rt::{Ctx, Guest, Gx2Backend};
-use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 /// The calls this backend handles, as a compact number: recorded display lists keep this, and calls are dispatched by it, not by name.
@@ -307,13 +307,13 @@ impl Gx2 {
             blit,
             layout,
             sampler,
-            targets: HashMap::new(),
+            targets: HashMap::default(),
             tv: None,
             swaps: 0,
             interval: 1,
-            contexts: HashMap::new(),
+            contexts: HashMap::default(),
             current: 0,
-            lists: HashMap::new(),
+            lists: HashMap::default(),
             recording: None,
             draws: 0,
             dumped: Default::default(),
@@ -340,8 +340,8 @@ impl Gx2 {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(120),
-            fetch_shaders: HashMap::new(),
-            fetch_interned: HashMap::new(),
+            fetch_shaders: HashMap::default(),
+            fetch_interned: HashMap::default(),
             fps: std::env::var_os("MH3U_FPS").map(|_| (Instant::now(), 0)),
             diag: crate::report::Diagnostics::from_env(),
             pipes,
