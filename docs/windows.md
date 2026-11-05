@@ -78,6 +78,10 @@ cargo build --release -p mh3u-tools
 $tools = (Resolve-Path '.\target\release\mh3u-tools.exe').Path
 ```
 
+The release profile in `Cargo.toml` is fat LTO with one codegen unit: the build is slower (2 min 17 s for this command on a
+Ryzen 5 9600X) and `mh3u-tools.exe` is smaller and faster. It does not set `target-cpu=native`, so the executable runs on any x86-64
+CPU (the game library's `--native` is a separate build, made on the machine that runs it).
+
 The tools take the folder that holds your dumps (or the base game's own folder); they find the base game (`... [Game]
 [0005000010118300]`) and the update beside it (`... [Update] [0005000e10118300]`). The executable comes from the update and the content
 from the update first, then the base game, so both should be there. The translated C is made from your game and must go to a folder
