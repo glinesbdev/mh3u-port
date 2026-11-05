@@ -14,6 +14,7 @@ emulator is involved at run time.
 ## Status
 
 Listed on [recomp.fyi](https://recomp.fyi/) (the listing comes from [`.recomp.json`](.recomp.json); edit that file to change it).
+[![Listed on PlayPorted](https://playported.com/badge.svg)](https://playported.com/ports/919-monster-hunter-3-ultimate/)
 
 
 Work in progress, and playable in parts:
