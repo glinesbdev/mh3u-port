@@ -68,12 +68,16 @@ impl Display {
         .context("opening the graphics device")?;
         // a validation error in one draw is reported, and the game goes on
         device.on_uncaptured_error(Arc::new(|e| eprintln!("[gfx] {e}")));
+        let threaded = queue::thread_wanted(std::env::var("MH3U_GFX_THREAD").ok().as_deref(), adapter.get_info().vendor);
+        if !threaded {
+            eprintln!("[gfx] GPU queue on the game's thread (MH3U_GFX_THREAD=on gives it a thread of its own)");
+        }
         Ok(Display {
             window: Some(window),
             instance,
             adapter,
             device,
-            queue: queue::OrderedQueue::new(queue, true),
+            queue: queue::OrderedQueue::new(queue, threaded),
             surface: Some(surface),
         })
     }

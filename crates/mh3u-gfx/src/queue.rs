@@ -6,7 +6,8 @@
 //! does them in that order. Whatever the queue does not wrap (`write_texture` into a texture just made, say) reaches the real queue at
 //! once through `Deref`; those writes are into resources no earlier batch uses.
 //!
-//! `MH3U_GFX_THREAD=off` does everything on the calling thread, as before.
+//! `MH3U_GFX_THREAD=off` does everything on the calling thread, as before. Without it only NVIDIA cards get the thread (see
+//! [`thread_wanted`]); `MH3U_GFX_THREAD=on` gives it to any card.
 
 use std::ops::Deref;
 use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
@@ -37,10 +38,26 @@ impl Deref for OrderedQueue {
     }
 }
 
+/// NVIDIA's PCI vendor id.
+const NVIDIA: u32 = 0x10DE;
+
+/// Whether the queue gets a thread of its own. `MH3U_GFX_THREAD=on` or `off` decides; without it only NVIDIA cards get one.
+///
+/// On AMD cards (a Radeon RX 6600, and the Radeon inside a Ryzen, with Vulkan and with DX12) finishing the batches on another
+/// thread than the one that recorded them made the driver hold on to gigabytes of memory, over a second or two, in screens with
+/// many draws (the item box), until the device was lost for lack of memory. Cards that share the system's memory (Intel's) are
+/// kept on the game's thread too until they are tried.
+pub fn thread_wanted(setting: Option<&str>, vendor: u32) -> bool {
+    match setting.map(|s| s.trim().to_ascii_lowercase()).as_deref() {
+        Some("on" | "1" | "true") => true,
+        Some("off" | "0" | "false") => false,
+        _ => vendor == NVIDIA,
+    }
+}
+
 impl OrderedQueue {
     pub fn new(raw: wgpu::Queue, threaded: bool) -> OrderedQueue {
         let presents: Presents = Arc::new((Mutex::new(0), Condvar::new()));
-        let threaded = threaded && std::env::var("MH3U_GFX_THREAD").map_or(true, |v| v != "off");
         let tx = threaded.then(|| {
             // a few batches' worth: the game's thread waits here if the queue's thread is far behind
             let (tx, rx) = sync_channel(256);
@@ -138,5 +155,31 @@ fn run(raw: wgpu::Queue, rx: Receiver<Op>, presents: Presents) {
                 let _ = reply.send(());
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_nvidia_gets_the_thread_unless_it_is_asked_for() {
+        assert!(thread_wanted(None, NVIDIA));
+        assert!(!thread_wanted(None, 0x1002), "AMD");
+        assert!(!thread_wanted(None, 0x8086), "Intel");
+        assert!(!thread_wanted(None, 0), "unknown");
+    }
+
+    #[test]
+    fn the_setting_decides_for_every_card() {
+        for vendor in [NVIDIA, 0x1002, 0x8086, 0] {
+            assert!(thread_wanted(Some("on"), vendor));
+            assert!(thread_wanted(Some(" ON "), vendor));
+            assert!(!thread_wanted(Some("off"), vendor));
+            assert!(!thread_wanted(Some("0"), vendor));
+        }
+        // anything else leaves the choice to the card
+        assert!(thread_wanted(Some("auto"), NVIDIA));
+        assert!(!thread_wanted(Some(""), 0x1002));
     }
 }
