@@ -47,8 +47,20 @@ move the village on its own.
 ### GPU queue on its own thread (Windows 11, Ryzen 5 9600X, NVIDIA RTX 4070, Vulkan, Oct 2026)
 
 `flush_draws` hands each batch's encoders to a thread (`mh3u gpu queue`, `queue.rs`) that finishes and submits them, and presents,
-in the order the game's thread made them; `MH3U_GFX_THREAD=off` goes back to doing it on the game's thread. Moga Woods, area 1,
-`[gfx frames]` windows of 10 s:
+in the order the game's thread made them. The thread is on by default only for NVIDIA (PCI vendor `0x10DE`). AMD, Intel, and any
+other or unknown vendor (including a vendor id of 0) stay on the game's thread. `MH3U_GFX_THREAD` decides for every card: `on`,
+`1` or `true` forces the thread on, and `off`, `0` or `false` forces it off. The value is trimmed and capitals are ignored.
+Anything else, including an empty value, `yes` or `no`, leaves the vendor default. The startup log says which thread is in use.
+
+Forcing the thread on for an AMD card can bring the memory growth back. Finishing a batch on a different thread from the one that
+recorded it made the driver hold on to gigabytes, over a second or two, in screens with many draws (the item box, Manage
+equipment), until the device was lost. Seen on a Radeon RX 6600 with Vulkan and with DX12, and on the Radeon in a Ryzen 5 9600X
+with Vulkan. On another AMD card the same screen sat around 2 GB with the thread off and climbed past 5 GB with it on. Keeping
+those cards on the game's thread avoids that. The vendor default is a workaround. It does not limit how many frames are in flight
+ahead of the GPU.
+
+The table is that NVIDIA machine with the thread on, against the same machine with the work on the game's thread. It is the
+history of that run, not the default on AMD or Intel. Moga Woods, area 1, `[gfx frames]` windows of 10 s:
 
 | | frames per 10 s | slowest frame |
 |---|---|---|
@@ -67,8 +79,9 @@ Measured on this one machine, with Vulkan.
    the end of the list. Run 12 showed that most of this untimed part is wgpu's own bookkeeping, and that it grows with the
    number of GPU buffers (concern 3). `[draw times]` now has `render pass end` (wgpu checks and records a whole pass when it
    ends; the count is the number of passes), `arena uploads`, `command encoding (finish)` (where wgpu 30 really does that
-   work; see concern 7, run 18) and `submit` (with the GPU queue thread, below, these two are one step, `command encoding and
-   submit (handed over)`, and the work itself runs on the `mh3u gpu queue` thread).
+   work; see concern 7, run 18) and `submit` (these two are one step, `command encoding and submit (handed over)`). When the queue
+   thread is on (NVIDIA by default, or when `MH3U_GFX_THREAD` forces it on), that work runs on the `mh3u gpu queue` thread. When it
+   is off, the same step is the whole finish and submit on the game's thread. See "GPU queue on its own thread" above.
 2. **Pipeline creation when entering an area.** "pipeline" reached ~4 ms per frame in the first window after a load (0.2 ms
    otherwise). Run 11 (500c143): about 3.5 s of window 1 and 2.4 s of window 2 (village load, leaving for the field) went to
    it, against 0.1 ms a frame once the field was set up: the hitching the user feels on an area change. Texture decoding (at
@@ -320,8 +333,10 @@ Measured on this one machine, with Vulkan.
 - Gamepad face buttons: run 15's log showed `[gamepad] East is the GamePad's A` with the new default layout, so an Xbox pad's A is
   the game's A (7b89bb8; `MH3U_PAD_LAYOUT=nintendo` gives the earlier mapping).
 
-- Game thread paying for wgpu's `finish` and the driver's submit and present (about 29 % of its time in Moga Woods): they now run
-  on the `mh3u gpu queue` thread (`queue.rs`; see "GPU queue on its own thread" above).
+- Game thread paying for wgpu's `finish` and the driver's submit and present (about 29 % of its time in Moga Woods on an NVIDIA
+  RTX 4070): on NVIDIA they run on the `mh3u gpu queue` thread (`queue.rs`; see "GPU queue on its own thread" above). AMD, Intel
+  and any other or unknown vendor stay on the game's thread. That default is a workaround for the AMD memory growth, not a
+  frames-in-flight cap. `MH3U_GFX_THREAD=on` (also `1` or `true`) forces the thread on any card and can bring the growth back on AMD.
 - Gamepad thread suspected of spinning: it was not; that profile was mislabelled baton time.
 - Textures re-decoded after every overlapping `GX2Invalidate` (~15k a second): now re-hashed and only decoded if changed.
 - Renderer maps hashed with std's SipHash (Windows 11, Ryzen 5 9600X, NVIDIA RTX 4070, Vulkan, Oct 2026): in a profile of the

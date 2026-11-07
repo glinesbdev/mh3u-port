@@ -330,10 +330,14 @@ with their text and the cloth background, upright, in the right places (the hunt
   - `bind group made (in groups)`;
   - `arena uploads`: the batch's arena writes;
   - `command encoding (finish)`: wgpu 30 checks a batch's passes, tracks their resources and makes the Vulkan or D3D12 commands
-    only when the command buffer is finished, so this is most of what the draws cost on the CPU outside this code. The batch's
-    encoders are finished and submitted on the `mh3u gpu queue` thread (`queue.rs`), so this step and `submit` are one,
-    `command encoding and submit (handed over)`; with `MH3U_GFX_THREAD=off` the same step covers the whole work, done on the
-    game's thread.
+    only when the command buffer is finished, so this is most of what the draws cost on the CPU outside this code. When the
+    `mh3u gpu queue` thread is on (`queue.rs`), the batch's encoders are finished and submitted there, so this step and `submit`
+    are one, `command encoding and submit (handed over)`. The thread is on by default only for NVIDIA (PCI vendor `0x10DE`).
+    AMD, Intel, and any other or unknown vendor (including a vendor id of 0) do this step on the game's thread, and the step
+    keeps that name. `MH3U_GFX_THREAD` overrides the vendor for every card: `on`, `1` or `true` forces the thread on, and `off`,
+    `0` or `false` forces it off, after trimming and ignoring capitals. Any other value leaves the vendor default. Forcing the
+    thread on for an AMD card can bring back the memory growth in screens with many draws. The vendor default is a workaround,
+    not a cap on frames in flight. With the thread off, the step covers the whole finish and submit on the game's thread.
 
   `[draw counts]` adds `vertex stream bytes made`, `vertex streams given buffers`, `vertex streams aged out`, `bind groups aged
   out`, `arena uploads` and `arena bytes uploaded`. `MH3U_GFX_TIMES=calls` leaves out the draw steps and counts (about 25 clock

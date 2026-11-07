@@ -205,7 +205,14 @@ may take in one frame (5 ms by default, `0` for no limit). The `[gfx] area chang
 translating, making shader modules, decoding textures, and the game. `[gfx slow frame]` lines break down any frame of 25 ms or more
 (`$env:MH3U_GFX_SLOW_MS` changes that) by its longest steps. `$env:MH3U_GFX_TIMES = 'calls'` times only the calls and frames,
 which adds the least to what is measured. `[draw times]` also has `render pass end`, `arena uploads` and `command encoding and submit (handed over)` (wgpu's own work, which used to be the untimed part of
-`GX2DirectCallDisplayList`; it runs on the GPU queue thread unless `$env:MH3U_GFX_THREAD = 'off'`). `[gfx caches]` shows `vertex streams N (X MB)`, which should stay roughly flat while standing still.
+`GX2DirectCallDisplayList`). Finish and submit run on the `mh3u gpu queue` thread by default only on NVIDIA (PCI vendor `0x10DE`).
+AMD, Intel, and any other or unknown vendor (including a vendor id of 0) stay on the game's thread. `$env:MH3U_GFX_THREAD` overrides
+that for every card: `on`, `1` or `true` forces the thread on, and `off`, `0` or `false` forces it off. The value is trimmed and
+capitals are ignored. Anything else, including an empty value, `yes` or `no`, leaves the vendor default. The startup log says which
+thread is in use. Forcing the thread on for an AMD card can bring back the memory growth in screens with many draws (the item box,
+Manage equipment): the driver has held on to gigabytes until the device was lost. Leaving non-NVIDIA cards on the game's thread
+avoids that. The vendor default is a workaround, not a cap on how many frames are in flight ahead of the GPU. `[gfx caches]` shows
+`vertex streams N (X MB)`, which should stay roughly flat while standing still.
 First-seen textures, vertex streams and geometry pipelines past `$env:MH3U_GFX_DECODE_BUDGET_MS` a frame (2 ms by default; big
 textures always) are decoded on worker threads. Their draws wait a frame or two ("… decoded in a later frame" in the skipped
 draws), so a new area's objects can pop in slightly late. `$env:MH3U_GFX_ASYNC_DECODE = 'off'` decodes them with the draw waiting,
