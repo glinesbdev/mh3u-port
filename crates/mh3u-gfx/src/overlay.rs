@@ -199,7 +199,7 @@ impl Overlay {
     pub fn frame(
         &mut self,
         device: &wgpu::Device,
-        queue: &wgpu::Queue,
+        queue: &crate::queue::OrderedQueue,
         enc: &mut wgpu::CommandEncoder,
         view: &wgpu::TextureView,
         format: wgpu::TextureFormat,
@@ -490,7 +490,7 @@ impl Overlay {
     fn draw(
         &mut self,
         device: &wgpu::Device,
-        queue: &wgpu::Queue,
+        queue: &crate::queue::OrderedQueue,
         enc: &mut wgpu::CommandEncoder,
         view: &wgpu::TextureView,
         format: wgpu::TextureFormat,

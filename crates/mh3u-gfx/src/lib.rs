@@ -13,6 +13,7 @@ pub mod kbm;
 pub mod overlay;
 mod perf;
 mod pipelines;
+mod queue;
 mod report;
 mod shader_cache;
 mod state;
@@ -41,7 +42,7 @@ pub struct Display {
     pub instance: wgpu::Instance,
     pub adapter: wgpu::Adapter,
     pub device: wgpu::Device,
-    pub queue: wgpu::Queue,
+    pub queue: queue::OrderedQueue,
     pub surface: Option<wgpu::Surface<'static>>,
 }
 
@@ -68,12 +69,16 @@ impl Display {
         .context("opening the graphics device")?;
         // a validation error in one draw is reported, and the game goes on
         device.on_uncaptured_error(Arc::new(|e| eprintln!("[gfx] {e}")));
+        let threaded = queue::thread_wanted(std::env::var("MH3U_GFX_THREAD").ok().as_deref(), adapter.get_info().vendor);
+        if !threaded {
+            eprintln!("[gfx] GPU queue on the game's thread (MH3U_GFX_THREAD=on gives it a thread of its own)");
+        }
         Ok(Display {
             window: Some(window),
             instance,
             adapter,
             device,
-            queue,
+            queue: queue::OrderedQueue::new(queue, threaded),
             surface: Some(surface),
         })
     }
@@ -105,7 +110,7 @@ impl Display {
             instance,
             adapter,
             device,
-            queue,
+            queue: queue::OrderedQueue::new(queue, false),
             surface: None,
         }
     }
