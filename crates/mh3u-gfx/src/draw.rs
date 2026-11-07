@@ -2987,18 +2987,18 @@ impl Gx2 {
         self.batch.slots_used = 0;
         lap.mark("arena uploads");
         // wgpu 30 records a pass's commands when the pass ends but checks them, tracks the resources and makes the backend's (Vulkan's
-        // or D3D12's) commands only here, in `finish`: the batch's draws cost most of their GPU-side CPU time at this point
+        // or D3D12's) commands only in `finish`: the batch's draws cost most of their GPU-side CPU time there, so the queue's thread does
+        // the finishing and the submit, after the writes above
         let mut work = Vec::new();
         if let Some(pre) = self.batch.pre.take() {
-            work.push(pre.finish());
+            work.push(pre);
         }
         if let Some(enc) = self.batch.enc.take() {
-            work.push(enc.finish());
+            work.push(enc);
         }
-        lap.mark("command encoding (finish)");
         if !work.is_empty() {
-            self.d.queue.submit(work);
-            lap.mark("submit");
+            self.d.queue.encode_and_submit(work);
+            lap.mark("command encoding and submit (handed over)");
         }
         for a in self.batch.arenas.iter_mut().flatten() {
             a.used = 0;

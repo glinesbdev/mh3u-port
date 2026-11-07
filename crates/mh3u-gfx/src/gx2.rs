@@ -573,6 +573,7 @@ impl Gx2 {
         self.d.queue.submit([enc.finish()]);
         let slice = buffer.slice(..);
         slice.map_async(wgpu::MapMode::Read, |_| {});
+        self.d.queue.flush();
         let _ = self.d.device.poll(wgpu::PollType::wait_indefinitely());
         let data = slice.get_mapped_range().ok()?;
         let mut rgba = Vec::with_capacity((w * h * 4) as usize);
@@ -596,8 +597,11 @@ impl Gx2 {
         if size.width != self.config.width || size.height != self.config.height {
             self.config.width = size.width;
             self.config.height = size.height;
+            self.d.queue.flush();
             surface.configure(&self.d.device, &self.config);
         }
+        // the surface gives out its next texture only after the last one was presented
+        self.d.queue.wait_presented();
         let frame = match surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(f) | wgpu::CurrentSurfaceTexture::Suboptimal(f) => f,
             wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
