@@ -97,7 +97,8 @@ fn arc_with(name: &str, content: &[u8]) -> Vec<u8> {
     d[12..12 + name.len()].copy_from_slice(name.as_bytes());
     d[12 + 64..12 + 68].copy_from_slice(&0x1234u32.to_be_bytes());
     d[12 + 68..12 + 72].copy_from_slice(&(packed.len() as u32).to_be_bytes());
-    d[12 + 72..12 + 76].copy_from_slice(&(content.len() as u32).to_be_bytes());
+    // decompressed length is bits 28..3; the low 3 bits are flags/quality (MH3U stores 2)
+    d[12 + 72..12 + 76].copy_from_slice(&((content.len() as u32) << 3 | 2).to_be_bytes());
     d[12 + 76..12 + 80].copy_from_slice(&92u32.to_be_bytes());
     d.extend(packed);
     d
@@ -179,8 +180,8 @@ fn a_scrambled_archive_is_an_error_not_a_panic() {
 #[test]
 fn an_archive_entry_that_unpacks_to_more_than_it_says_is_refused() {
     let mut d = arc_with("big", &vec![0u8; 8 << 20]);
-    // it says 100 bytes
-    d[12 + 72..12 + 76].copy_from_slice(&100u32.to_be_bytes());
+    // it says 100 bytes (length in bits 28..3, quality 2 in the low 3 bits)
+    d[12 + 72..12 + 76].copy_from_slice(&((100u32 << 3) | 2).to_be_bytes());
     let arc = Arc::parse(&d).unwrap();
     let err = format!("{:#}", arc.read(&arc.entries[0]).unwrap_err());
     assert!(err.contains("more than the 100 bytes"), "{err}");
