@@ -2,7 +2,8 @@
 //!
 //! A file can say any size it likes for what it holds, so the size is not trusted: memory is not set aside for more than [`MAX_INFLATED`],
 //! and decompressing stops when the data grows past the size the file declared. (A tiny stream that unpacks to gigabytes would otherwise
-//! use up the memory.)
+//! use up the memory.) A stream that unpacks to less than it says is still returned, because callers already rely on that, but the
+//! mismatch is printed: a length that was read wrong must not pass in silence.
 
 use anyhow::{Result, bail};
 use flate2::read::ZlibDecoder;
@@ -26,6 +27,12 @@ fn inflate_within(compressed: &[u8], declared: usize, max: usize) -> Result<Vec<
     if out.len() > declared {
         bail!("it unpacks to more than the {declared} bytes it says");
     }
+    if out.len() != declared {
+        // Shorter than declared stays a success: the executable reader, and the test below, rely on it.
+        // Printing it is what stops a bad length (an ARC size read 8× too big) from hiding.
+        let got = out.len();
+        eprintln!("it unpacks to {got} bytes, not the {declared} it says");
+    }
     Ok(out)
 }
 
@@ -45,7 +52,7 @@ mod tests {
     fn data_unpacks_to_the_size_it_says() {
         let data: Vec<u8> = (0..5000u32).map(|i| (i % 251) as u8).collect();
         assert_eq!(inflate(&zlib(&data), data.len()).unwrap(), data);
-        // a stream that unpacks to less than it says is let through as it always was
+        // a stream that unpacks to less than it says is still returned, as it always was, and a warning is printed
         assert_eq!(inflate(&zlib(&data), data.len() + 10).unwrap(), data);
     }
 

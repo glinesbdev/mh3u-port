@@ -4,6 +4,7 @@
 //!
 //! Its crate is not a dependency because it does not build for Windows (its `/proc` reader is Unix only, and not optional). Changes
 //! here: the test modules and `Save::reached_rank` (which needs its drop tables) removed, paths made relative to this module.
+//! The ARC decompressed-size word is decoded as bits 28..3 (`field >> 3`, high flags cleared), matching `mh3u-formats`.
 
 pub mod arc;
 pub mod gmd;
