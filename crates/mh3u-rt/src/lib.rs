@@ -1,8 +1,9 @@
 //! The runtime: the guest's memory, the translated game as a library, and the system functions the game calls.
 //!
-//! This is the one crate that uses `unsafe`, and only for two things: the guest's address space (a reserved 4 GiB range the translated
-//! code indexes with 32-bit guest addresses) and the calls into the translated library. Everything the game is made of comes from the
-//! owner's own files at run time; nothing of it is in this repository.
+//! This is the one crate that uses `unsafe`, and only for three things: the guest's address space (a reserved 4 GiB range the translated
+//! code indexes with 32-bit guest addresses), the calls into the translated library, and [`set_startup_env`] (one environment variable,
+//! on the main thread, before any other thread exists). Everything the game is made of comes from the owner's own files at run time;
+//! nothing of it is in this repository.
 
 mod axfx;
 mod cafe;
@@ -15,6 +16,17 @@ pub mod hooks;
 /// A zeroed context with no guest memory, for tests of hook callbacks elsewhere.
 pub fn new_test_ctx() -> Ctx {
     game::new_ctx(std::ptr::null_mut())
+}
+
+/// Sets one environment variable before any other thread exists.
+///
+/// `mh3u-tools run` uses this for the switches RecompLauncher passes on the command line. The game
+/// already reads those as `MH3U_` variables, which is how `scripts/run.sh` turns the same switches on.
+/// Do not call this once a thread is running.
+pub fn set_startup_env(key: &str, value: &str) {
+    // SAFETY: the only call is on the main thread in `mh3u-tools run`, before `start_gamepads` and before
+    // the game thread. No other thread is in `env::var`, which is what makes `set_var` undefined if one is.
+    unsafe { std::env::set_var(key, value) }
 }
 pub mod input;
 mod kernel;

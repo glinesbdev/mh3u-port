@@ -140,9 +140,25 @@ struct App<F: FnOnce(Display) + Send + 'static> {
     background_keys: bool,
 }
 
-/// Whether fullscreen is asked for: `--fullscreen`, or `MH3U_FULLSCREEN=1`.
-pub fn fullscreen_wanted(flag: bool, env: Option<&str>) -> bool {
-    flag || matches!(env.map(str::trim), Some("1" | "on" | "true"))
+/// Whether the window starts fullscreen.
+///
+/// `--windowed` wins. Otherwise [`fullscreen_wanted`]: `--fullscreen`, `MH3U_FULLSCREEN` of `1`, `on` or `true`, or
+/// RecompLauncher Big Picture (`RECOMPLAUNCHER_MODE=bigpicture`). Big Picture stays windowed when `MH3U_FULLSCREEN` is `0`,
+/// `off`, `false` or `no`.
+pub fn start_fullscreen(windowed: bool, flag: bool, env: Option<&str>, mode: Option<&str>) -> bool {
+    !windowed && fullscreen_wanted(flag, env, mode)
+}
+
+/// Whether fullscreen is asked for, ignoring `--windowed` (see [`start_fullscreen`]).
+pub fn fullscreen_wanted(flag: bool, env: Option<&str>, mode: Option<&str>) -> bool {
+    if flag {
+        return true;
+    }
+    match env.map(str::trim) {
+        Some("1" | "on" | "true") => true,
+        Some("0" | "off" | "false" | "no") => false,
+        _ => matches!(mode.map(str::trim), Some("bigpicture")),
+    }
 }
 
 /// Whether a key press toggles fullscreen: F11, or Enter with Alt held (not F1, the overlay's key). Such presses never reach the game.
@@ -551,10 +567,19 @@ mod window_tests {
 
     #[test]
     fn fullscreen_is_asked_for_by_the_flag_or_the_variable_and_toggled_by_f11_or_alt_enter() {
-        assert!(fullscreen_wanted(true, None));
-        assert!(fullscreen_wanted(false, Some("1")));
-        assert!(!fullscreen_wanted(false, Some("0")));
-        assert!(!fullscreen_wanted(false, None));
+        assert!(fullscreen_wanted(true, None, None));
+        assert!(fullscreen_wanted(false, Some("1"), None));
+        assert!(!fullscreen_wanted(false, Some("0"), None));
+        assert!(!fullscreen_wanted(false, None, None));
+        assert!(fullscreen_wanted(false, None, Some("bigpicture")));
+        assert!(!fullscreen_wanted(false, Some("0"), Some("bigpicture")));
+        assert!(!fullscreen_wanted(false, Some("false"), Some("bigpicture")));
+        assert!(!fullscreen_wanted(false, None, Some("desktop")));
+        assert!(fullscreen_wanted(true, Some("0"), None), "the flag wins over MH3U_FULLSCREEN=0");
+        assert!(!start_fullscreen(true, true, Some("1"), Some("bigpicture")), "--windowed wins");
+        assert!(start_fullscreen(false, false, None, Some("bigpicture")));
+        assert!(!start_fullscreen(false, false, None, Some("desktop")));
+        assert!(!start_fullscreen(false, false, None, None));
         assert!(is_fullscreen_toggle(KeyCode::F11, false));
         assert!(is_fullscreen_toggle(KeyCode::Enter, true));
         assert!(is_fullscreen_toggle(KeyCode::NumpadEnter, true));

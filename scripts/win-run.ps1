@@ -13,6 +13,8 @@ param(
     [switch]$Fps,
     # Borderless fullscreen on the window's monitor (--fullscreen); F11 or Alt+Enter toggles it while playing.
     [switch]$Fullscreen,
+    # Stay in a window (--windowed). Wins over RECOMPLAUNCHER_MODE=bigpicture and over MH3U_FULLSCREEN.
+    [switch]$Windowed,
     # Print the graphics report at the end (MH3U_GFX_REPORT).
     [switch]$Report,
     # Write frames (draws, shaders, textures, the picture) to this folder (MH3U_GFX_DUMP_DIR); which ones is -Frames.
@@ -39,8 +41,11 @@ param(
     # The mod key for -NativeMenu, as winit names keys (ShiftRight, AltLeft, KeyM...; MH3U_NATIVE_MENU_KEY). Default ShiftRight.
     [string]$NativeMenuKey,
     # Gamepads keep playing while the window is in the background (on by default; issue #33): this turns that off
-    # (MH3U_BACKGROUND_GAMEPAD=0; docs/input.md).
+    # (MH3U_BACKGROUND_GAMEPAD=0; docs/input.md). RECOMPLAUNCHER=1 also defaults it to off.
     [switch]$NoBackgroundGamepad,
+    # Gamepads play in the background (MH3U_BACKGROUND_GAMEPAD=1). This is the standalone default; under RECOMPLAUNCHER=1
+    # it is how you turn background input back on (docs/input.md).
+    [switch]$BackgroundGamepad,
     # Opt-in: keyboard and mouse game controls (WASD, the mouse as the camera, the cursor grabbed; MH3U_KEYBOARD_CONTROLS=1;
     # docs/input.md). Off by default; F1, F11, Alt+Enter and the overlay work without it.
     [switch]$KeyboardControls,
@@ -49,6 +54,12 @@ param(
     [switch]$BackgroundKeyboard
 )
 $ErrorActionPreference = 'Stop'
+if ($Fullscreen -and $Windowed) {
+    throw 'pass only one of -Fullscreen and -Windowed'
+}
+if ($BackgroundGamepad -and $NoBackgroundGamepad) {
+    throw 'pass only one of -BackgroundGamepad and -NoBackgroundGamepad'
+}
 $repo = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot '..')).Path
 # full paths, from where the script was started (they need not exist yet)
 if (-not $Games) {
@@ -113,6 +124,9 @@ if ($NativeMenu) {
 if ($NativeMenuKey) {
     $set['MH3U_NATIVE_MENU_KEY'] = $NativeMenuKey
 }
+if ($BackgroundGamepad) {
+    $set['MH3U_BACKGROUND_GAMEPAD'] = '1'
+}
 if ($NoBackgroundGamepad) {
     $set['MH3U_BACKGROUND_GAMEPAD'] = '0'
 }
@@ -128,6 +142,7 @@ if ($BackgroundKeyboard) {
 
 $runArgs = @('run', $Games, $Out, '--window', '--max-imports', '1000000000000')
 if ($Fullscreen) { $runArgs += '--fullscreen' }
+if ($Windowed) { $runArgs += '--windowed' }
 $savedEncoding = [Console]::OutputEncoding
 $writer = $null
 try {
