@@ -141,9 +141,10 @@ pub const OVERLAY_COMBO: u32 = button::MINUS | button::R;
 
 /// Whether the game's window has the focus (the window sets it on each focus change).
 pub static FOCUSED: AtomicBool = AtomicBool::new(true);
-/// Whether gamepads still reach the game while the window does not have the focus: on by default, `MH3U_BACKGROUND_GAMEPAD=0`
-/// turns it off (issue #33; `start_gamepads` reads the setting). The keyboard's counterpart, `MH3U_BACKGROUND_KEYBOARD`, is off by
-/// default and lives in the window (`mh3u-gfx`).
+/// Whether gamepads still reach the game while the window does not have the focus. [`start_gamepads`] sets the real value:
+/// on by default, off when `MH3U_BACKGROUND_GAMEPAD` is off, and off when `RECOMPLAUNCHER=1` unless that variable is on
+/// (issue #33; the launcher's overlay uses the controller too). This `true` is only the placeholder until then. The keyboard's
+/// counterpart, `MH3U_BACKGROUND_KEYBOARD`, is off by default and lives in the window (`mh3u-gfx`).
 pub static BACKGROUND_PADS: AtomicBool = AtomicBool::new(true);
 
 /// An on/off setting: `1`, `on`, `true` or `yes` is on, `0`, `off`, `false` or `no` is off, and anything else (or nothing) is
@@ -153,6 +154,27 @@ pub fn switch_setting(value: Option<&str>, default: bool) -> bool {
         Some("1" | "on" | "true" | "yes") => true,
         Some("0" | "off" | "false" | "no") => false,
         _ => default,
+    }
+}
+
+/// Whether gamepads play while the window is in the background.
+///
+/// Standalone, with `setting` unset, they do. RecompLauncher sets `RECOMPLAUNCHER` to `1` and its overlay also reads the
+/// controller, so the default is then off unless the player turned the setting on (`1`, `on`, `true` or `yes`). Any other
+/// launcher value leaves the standalone default.
+pub fn background_gamepad_on(setting: Option<&str>, recomp_launcher: Option<&str>) -> bool {
+    let launcher = matches!(recomp_launcher.map(str::trim), Some("1"));
+    switch_setting(setting, !launcher)
+}
+
+/// The startup line for [`background_gamepad_on`]. `setting_was_set` is whether `MH3U_BACKGROUND_GAMEPAD` was in the environment.
+pub fn background_gamepad_message(on: bool, setting_was_set: bool, launcher: bool) -> &'static str {
+    if on {
+        "gamepads also work while the window is in the background (MH3U_BACKGROUND_GAMEPAD=0 turns that off)"
+    } else if launcher && !setting_was_set {
+        "gamepads only work while the window has the focus (RECOMPLAUNCHER=1; MH3U_BACKGROUND_GAMEPAD=1 turns that on)"
+    } else {
+        "gamepads only work while the window has the focus (MH3U_BACKGROUND_GAMEPAD=0)"
     }
 }
 
@@ -394,16 +416,12 @@ pub fn start_gamepads() {
         eprintln!("gamepads off (MH3U_GAMEPADS=0)");
         return;
     }
-    let background = switch_setting(std::env::var("MH3U_BACKGROUND_GAMEPAD").ok().as_deref(), true);
+    let setting = std::env::var("MH3U_BACKGROUND_GAMEPAD").ok();
+    let launcher_var = std::env::var("RECOMPLAUNCHER").ok();
+    let launcher = matches!(launcher_var.as_deref().map(str::trim), Some("1"));
+    let background = background_gamepad_on(setting.as_deref(), launcher_var.as_deref());
     BACKGROUND_PADS.store(background, Relaxed);
-    eprintln!(
-        "{}",
-        if background {
-            "gamepads also work while the window is in the background (MH3U_BACKGROUND_GAMEPAD=0 turns that off)"
-        } else {
-            "gamepads only work while the window has the focus (MH3U_BACKGROUND_GAMEPAD=0)"
-        }
-    );
+    eprintln!("{}", background_gamepad_message(background, setting.is_some(), launcher));
     let _ = std::thread::Builder::new().name("gamepads".into()).spawn(|| {
         let mut gilrs = match gilrs::Gilrs::new() {
             Ok(g) => g,
@@ -637,6 +655,30 @@ mod tests {
         assert!(pads_reach_game(true, false), "with the focus, always");
         assert!(pads_reach_game(false, true));
         assert!(!pads_reach_game(false, false), "MH3U_BACKGROUND_GAMEPAD=0 without the focus");
+    }
+
+    #[test]
+    fn recomp_launcher_defaults_background_gamepads_off_unless_the_player_turned_them_on() {
+        assert!(background_gamepad_on(None, None), "standalone default stays on");
+        assert!(background_gamepad_on(None, Some("0")));
+        assert!(background_gamepad_on(None, Some("")));
+        assert!(!background_gamepad_on(None, Some("1")));
+        assert!(!background_gamepad_on(None, Some(" 1 ")));
+        assert!(background_gamepad_on(Some("1"), Some("1")), "an explicit on wins");
+        assert!(background_gamepad_on(Some("on"), Some("1")));
+        assert!(background_gamepad_on(Some(" yes "), Some("1")));
+        assert!(!background_gamepad_on(Some("0"), Some("1")));
+        assert!(!background_gamepad_on(Some("off"), None));
+        assert!(
+            background_gamepad_on(None, Some("desktop")),
+            "only RECOMPLAUNCHER=1 changes the default"
+        );
+        assert_eq!(
+            background_gamepad_message(false, false, true),
+            "gamepads only work while the window has the focus (RECOMPLAUNCHER=1; MH3U_BACKGROUND_GAMEPAD=1 turns that on)"
+        );
+        assert!(background_gamepad_message(true, true, true).contains("MH3U_BACKGROUND_GAMEPAD=0"));
+        assert!(background_gamepad_message(false, true, true).contains("MH3U_BACKGROUND_GAMEPAD=0"));
     }
 
     #[test]

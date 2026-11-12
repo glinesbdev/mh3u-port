@@ -22,6 +22,17 @@ function Step([string]$Command, [string[]]$Arguments) {
 Step cargo @('fmt', '--all', '--check')
 Step cargo @('clippy', '--all-targets', '--', '-D', 'warnings')
 Step cargo @('test', '--all')
+$py = @('python3', 'python', 'py') | Where-Object { Get-Command $_ -ErrorAction SilentlyContinue } | Select-Object -First 1
+if (-not $py) {
+    throw 'python is not installed, so the release-archive check could not run'
+}
+Step $py @('scripts/package-release.py', 'self-check')
+& $py -c 'import jsonschema' 2>$null
+if ($LASTEXITCODE -eq 0) {
+    Step $py @('scripts/check-recomplauncher.py')
+} else {
+    Write-Warning 'jsonschema is not installed, so recomplauncher.json was not validated here'
+}
 # known vulnerabilities in the dependencies (https://rustsec.org); this runs when cargo-audit is installed (cargo install cargo-audit --locked)
 if (Get-Command cargo-audit -ErrorAction SilentlyContinue) {
     Step cargo @('audit')

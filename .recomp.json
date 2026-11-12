@@ -11,5 +11,5 @@
   "approach": "Static recompilation of the Wii U executable to native C, with a Rust runtime (wgpu graphics, cpal audio)",
   "maintainers": [{ "name": "glinesbdev", "link": "https://github.com/glinesbdev" }],
   "notes": "Playable native PC recomp. Opt-in wishlist overlay and in-game Mods menu. Some graphics glitches remain. No online play.",
-  "help": ["Graphics glitches", "Dump integrity check", "CI"]
+  "help": ["Graphics glitches", "Dump integrity check"]
 }

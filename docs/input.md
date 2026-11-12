@@ -96,7 +96,7 @@ Two separate settings, so a pad can keep playing while someone else uses the PC:
 
 | Setting | Default | What it does |
 |---|---|---|
-| `MH3U_BACKGROUND_GAMEPAD` (`win-run.ps1 -NoBackgroundGamepad`, `run.sh --no-background-gamepad` set it to `0`) | **on** | Gamepads keep playing when the window does not have the focus. `0` (or `off`) keeps them to the focused window. |
+| `MH3U_BACKGROUND_GAMEPAD` (`win-run.ps1 -NoBackgroundGamepad` / `-BackgroundGamepad`, `run.sh --no-background-gamepad` / `--background-gamepad`) | **on**, and **off** when `RECOMPLAUNCHER=1` unless the variable is on | Gamepads keep playing when the window does not have the focus. `0` (or `off`) keeps them to the focused window. RecompLauncher sets `RECOMPLAUNCHER=1`; its overlay uses the controller, so background input stays off until you turn it on. |
 | `MH3U_BACKGROUND_KEYBOARD` (`-BackgroundKeyboard`, `--background-keyboard` set it to `1`) | off | With keyboard controls on (`MH3U_KEYBOARD_CONTROLS=1`), the keyboard's bindings also play without the focus. Opt-in, so typing elsewhere does not move the hunter. Without keyboard controls it does nothing (the log says so). |
 
 - **The mouse** never plays in the background: it is only the right stick while the cursor is grabbed, which needs the focus.

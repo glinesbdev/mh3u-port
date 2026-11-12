@@ -105,7 +105,11 @@ swapped, `$env:MH3U_PAD_LAYOUT = 'nintendo'` swaps A with B and X with Y (the lo
 face button was taken as). The pad keeps playing while the window is in the background (read with XInput then, so Xbox-style pads
 only); `$env:MH3U_BACKGROUND_GAMEPAD = '0'` (`win-run.ps1 -NoBackgroundGamepad`) turns that off, and
 `$env:MH3U_BACKGROUND_KEYBOARD = '1'` (`-BackgroundKeyboard`, with `-KeyboardControls`) lets the keyboard play in the background too
-(`input.md`).
+(`input.md`). `RECOMPLAUNCHER=1` (set when [RecompLauncher](https://recomplauncher.com/) starts the game) defaults background
+pads to off; `$env:MH3U_BACKGROUND_GAMEPAD = '1'` or `-BackgroundGamepad` turns them back on. `RECOMPLAUNCHER_MODE=bigpicture`
+starts fullscreen; `-Windowed` or `--windowed` stays in a window. The same switches exist on `mh3u-tools run` itself
+(`--fullscreen`, `--windowed`, `--scale`, `--pad-layout`, `--keyboard-controls`, `--no-keyboard-controls`,
+`--background-gamepad`, `--no-background-gamepad`, `--native-menu`, `--native-text`), which is what a release starts.
 
 The window and the taskbar show the game's icon from your dump (`meta/iconTex.tga`, read at start and kept only in memory).
 `[icon] the game's icon from …` in the log says it was found. Without it, Windows shows the default icon.
@@ -149,6 +153,9 @@ fails on its exit code only.
   - `-DebugPs <mode>`: `MH3U_GFX_DEBUG_PS`;
   - `-PadLayout xbox|nintendo`: `MH3U_PAD_LAYOUT`;
   - `-Scale 1|2|3|4`: `MH3U_GFX_RESOLUTION_SCALE` (native size if omitted);
+  - `-Windowed`: pass `--windowed` (stay in a window even in RecompLauncher Big Picture);
+  - `-BackgroundGamepad`: `MH3U_BACKGROUND_GAMEPAD=1` (the explicit on, for `RECOMPLAUNCHER=1`);
+  - `-NoBackgroundGamepad`: `MH3U_BACKGROUND_GAMEPAD=0`;
   - `-NativeText`: `MH3U_NATIVE_TEXT=1` (the wishlist in the item menu, `native-menu.md`);
   - `-MenuProbe`: `MH3U_MENU_PROBE=1` (logs the start menu's state, read-only, `native-menu.md`);
   - `-NativeMenu`: `MH3U_NATIVE_MENU=1` (hold Right Shift or ZL in the start menu: Gestures reads "Mods" and opens the Mods page, `native-menu.md`), and
@@ -163,7 +170,7 @@ fails on its exit code only.
 - It returns the game's exit code.
 
 On Linux, `scripts/run.sh` does the same as `win-run.ps1` (`--fps`, `--report`, `--dump DIR --frames N`, `--debug-ps MODE`,
-`--pad-layout L`, `--scale N`, `--native-text`, `--menu-probe`, `--native-menu`, `--native-menu-key K`, `--log FILE`; `--games` and `--out`, or `MH3U_GAMES` and `MH3U_OUT`).
+`--pad-layout L`, `--scale N`, `--windowed`, `--background-gamepad`, `--no-background-gamepad`, `--native-text`, `--menu-probe`, `--native-menu`, `--native-menu-key K`, `--log FILE`; `--games` and `--out`, or `MH3U_GAMES` and `MH3U_OUT`).
 
 ## Comparing builds (frame rate)
 

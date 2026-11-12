@@ -12,6 +12,7 @@ usage: scripts/run.sh [options]
   --games DIR        the folder with the [Game] and [Update] dumps (or $MH3U_GAMES; required)
   --out DIR          the translated C and libgame.so ($MH3U_OUT, else ~/.local/share/mh3u/c)
   --fullscreen       borderless fullscreen on the window's monitor (F11 or Alt+Enter toggles it while playing)
+  --windowed         stay in a window (wins over RECOMPLAUNCHER_MODE=bigpicture and MH3U_FULLSCREEN)
   --fps              print the FPS and the graphics timings (MH3U_FPS, MH3U_GFX_TIMES)
   --report           print the graphics report at the end (MH3U_GFX_REPORT)
   --dump DIR         write frames to DIR (MH3U_GFX_DUMP_DIR); which ones is --frames
@@ -22,7 +23,8 @@ usage: scripts/run.sh [options]
   --native-menu      hold the mod key (Right Shift) in the start menu: Gestures reads "Mods" (MH3U_NATIVE_MENU; opt-in)
   --native-menu-key K  the mod key, as winit names it (MH3U_NATIVE_MENU_KEY; default ShiftRight)
   --native-text      the wishlist's status in the item menu's last empty slot (MH3U_NATIVE_TEXT; opt-in)
-  --no-background-gamepad  gamepads only play while the window has the focus (MH3U_BACKGROUND_GAMEPAD=0; on by default)
+  --no-background-gamepad  gamepads only play while the window has the focus (MH3U_BACKGROUND_GAMEPAD=0)
+  --background-gamepad     gamepads also play in the background (MH3U_BACKGROUND_GAMEPAD=1). The default is on, except when RECOMPLAUNCHER=1, which leaves them off until this is passed
   --keyboard-controls      keyboard and mouse game controls: WASD, the mouse as the camera (MH3U_KEYBOARD_CONTROLS=1; opt-in)
   --background-keyboard    with --keyboard-controls: the keyboard also plays in the background (MH3U_BACKGROUND_KEYBOARD=1; X11, not Wayland)
   --scale N          internal resolution 1, 2, 3 or 4 (MH3U_GFX_RESOLUTION_SCALE); omit for the game's own size
@@ -33,12 +35,13 @@ USAGE
 repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 games="${MH3U_GAMES:-}"
 out="${MH3U_OUT:-$HOME/.local/share/mh3u/c}"
-fullscreen=0 fps=0 report=0 dump="" frames="2400" debug_ps="" pad_layout="" scale="" native_text=0 menu_probe=0 native_menu=0 native_menu_key="" background_gamepad=1 background_keyboard=0 keyboard_controls=0 log=""
+fullscreen=0 windowed=0 fps=0 report=0 dump="" frames="2400" debug_ps="" pad_layout="" scale="" native_text=0 menu_probe=0 native_menu=0 native_menu_key="" background_gamepad="" background_keyboard=0 keyboard_controls=0 log=""
 while [ $# -gt 0 ]; do
     case "$1" in
         --games) games="$2"; shift 2 ;;
         --out) out="$2"; shift 2 ;;
         --fullscreen) fullscreen=1; shift ;;
+        --windowed) windowed=1; shift ;;
         --fps) fps=1; shift ;;
         --report) report=1; shift ;;
         --dump) dump="$2"; shift 2 ;;
@@ -51,7 +54,12 @@ while [ $# -gt 0 ]; do
             case "$2" in 1|2|3|4) scale="$2" ;; *) echo "--scale is 1, 2, 3 or 4" >&2; exit 2 ;; esac
             shift 2 ;;
         --native-text) native_text=1; shift ;;
-        --no-background-gamepad) background_gamepad=0; shift ;;
+        --no-background-gamepad)
+            if [ "$background_gamepad" = 1 ]; then echo "pass only one of --background-gamepad and --no-background-gamepad" >&2; exit 2; fi
+            background_gamepad=0; shift ;;
+        --background-gamepad)
+            if [ "$background_gamepad" = 0 ]; then echo "pass only one of --background-gamepad and --no-background-gamepad" >&2; exit 2; fi
+            background_gamepad=1; shift ;;
         --background-keyboard) background_keyboard=1; shift ;;
         --keyboard-controls) keyboard_controls=1; shift ;;
         --menu-probe) menu_probe=1; shift ;;
@@ -63,6 +71,10 @@ while [ $# -gt 0 ]; do
     esac
 done
 
+if [ "$fullscreen" = 1 ] && [ "$windowed" = 1 ]; then
+    echo "pass only one of --fullscreen and --windowed" >&2
+    exit 2
+fi
 if [ -z "$games" ]; then
     echo "no games folder: pass --games DIR (the folder with the [Game] and [Update] dumps) or set MH3U_GAMES" >&2
     exit 2
@@ -95,7 +107,7 @@ if [ "$native_text" = 1 ]; then export MH3U_NATIVE_TEXT=1; fi
 if [ "$menu_probe" = 1 ]; then export MH3U_MENU_PROBE=1; fi
 if [ "$native_menu" = 1 ]; then export MH3U_NATIVE_MENU=1; fi
 if [ -n "$native_menu_key" ]; then export MH3U_NATIVE_MENU_KEY="$native_menu_key"; fi
-if [ "$background_gamepad" = 0 ]; then export MH3U_BACKGROUND_GAMEPAD=0; fi
+if [ -n "$background_gamepad" ]; then export MH3U_BACKGROUND_GAMEPAD="$background_gamepad"; fi
 if [ "$keyboard_controls" = 1 ]; then export MH3U_KEYBOARD_CONTROLS=1; fi
 if [ "$background_keyboard" = 1 ]; then
     [ "$keyboard_controls" = 1 ] || echo "note: --background-keyboard does nothing without --keyboard-controls"
@@ -113,6 +125,7 @@ if [ -z "$log" ]; then
 fi
 extra=()
 [ "$fullscreen" = 1 ] && extra+=(--fullscreen)
+[ "$windowed" = 1 ] && extra+=(--windowed)
 echo "> $tools run $games $out --window --max-imports 1000000000000 ${extra[*]}"
 echo "log: $log"
 code=0

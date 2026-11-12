@@ -18,7 +18,8 @@ before every commit. Tests must use data made in the test, not files from a dump
 ## Build and check
 
 Set up as the [README](README.md) says, with your own dump. Before every commit, run the checks: format, clippy with warnings as
-errors, the tests, and `cargo audit` when it is installed. There is no CI yet, so this is the check.
+errors, the tests, the release-archive layout, `recomplauncher.json` when Python's `jsonschema` is installed, and `cargo audit`
+when it is installed. GitHub Actions runs those checks on pull requests.
 
 ```sh
 scripts/check.sh                                            # Linux

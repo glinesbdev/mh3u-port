@@ -1,0 +1,65 @@
+name: Release
+
+# A published GitHub release gets two assets, named the way RecompLauncher picks a build:
+#   mh3u-port-vX.Y.Z-Windows-x64.zip
+#   mh3u-port-vX.Y.Z-Linux-x64.tar.gz
+# Each has mh3u-tools, recomplauncher.json and LICENSE at the top. The translated game
+# (game.dll / libgame.so) is not included: it is derived from the player's dump and is
+# built on their machine. No settings file is included, so an update does not replace theirs.
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag to attach assets to (vX.Y.Z)
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.release.tag_name || inputs.tag }}
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: System libraries
+        run: sudo apt-get update && sudo apt-get install -y pkg-config libasound2-dev libxkbcommon-dev libwayland-dev libudev-dev
+      - name: Build mh3u-tools
+        run: cargo build --release -p mh3u-tools
+      - name: Package
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name || inputs.tag }}
+        run: |
+          python3 scripts/package-release.py linux target/release/mh3u-tools "${RELEASE_TAG#v}" dist
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.release.tag_name || inputs.tag }}
+          files: dist/mh3u-port-*-Linux-x64.tar.gz
+
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.release.tag_name || inputs.tag }}
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build mh3u-tools
+        run: cargo build --release -p mh3u-tools
+      - name: Package
+        shell: pwsh
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name || inputs.tag }}
+        run: |
+          $ver = $env:RELEASE_TAG -replace '^v', ''
+          python scripts/package-release.py windows target/release/mh3u-tools.exe $ver dist
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.release.tag_name || inputs.tag }}
+          files: dist/mh3u-port-*-Windows-x64.zip

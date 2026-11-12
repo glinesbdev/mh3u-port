@@ -1,0 +1,131 @@
+{
+  "$schema": "https://recomplauncher.com/schema/recomplauncher.json",
+  "format": 1,
+  "name": "Monster Hunter 3 Ultimate (mh3u-port)",
+  "repo": "glinesbdev/mh3u-port",
+  "min": "0.90.0-beta.27",
+  "requires": [
+    "start",
+    "exit_codes",
+    "files.folder",
+    "files.flag",
+    "files.contains",
+    "settings.args",
+    "settings.choices",
+    "settings.groups"
+  ],
+  "game": {
+    "kind": "folder",
+    "label": "mh3u-port: your decrypted USA folder of Monster Hunter 3 Ultimate (Wii U), title id 0005000010118300. It must contain code, content and meta. Keep the v32 update folder (title id 0005000e10118300) next to it, in the same parent folder.",
+    "check": { "file": "meta/meta.xml" }
+  },
+  "start": {
+    "program": ["mh3u-tools.exe", "mh3u-tools"],
+    "args": ["run", "{game}", "{local}/mh3u/c", "--window", "--max-imports", "1000000000000"]
+  },
+  "saves": [
+    "{local}/mh3u/c/save",
+    "{local}/mh3u/c/input/bindings.json",
+    "{local}/mh3u/c/mods/wishlists"
+  ],
+  "folders": {
+    "saves": [{ "path": "{local}/mh3u/c/save" }]
+  },
+  "exit_codes": {
+    "0": "ok",
+    "2": "The game stopped. The last lines say why (it called exit, or a check such as too many system calls failed)."
+  },
+  "groups": [{ "id": "Mods", "advanced": true }],
+  "settings": [
+    {
+      "id": "window",
+      "label": "Window",
+      "group": "Picture",
+      "in": "args",
+      "help": "A window, or borderless fullscreen. Big Picture starts fullscreen until you pick Windowed.",
+      "choices": [
+        { "label": "Game's choice", "args": [] },
+        { "label": "Windowed", "args": ["--windowed"] },
+        { "label": "Fullscreen", "args": ["--fullscreen"] }
+      ]
+    },
+    {
+      "id": "scale",
+      "label": "Internal resolution",
+      "group": "Picture",
+      "in": "args",
+      "help": "1x is the Wii U's own size. Higher is sharper and costs more.",
+      "choices": [
+        { "label": "1x", "args": [] },
+        { "label": "2x", "args": ["--scale", "2"] },
+        { "label": "3x", "args": ["--scale", "3"] },
+        { "label": "4x", "args": ["--scale", "4"] }
+      ]
+    },
+    {
+      "id": "keyboard",
+      "label": "Keyboard and mouse",
+      "group": "Controls",
+      "in": "args",
+      "help": "WASD and the mouse as the camera. Off leaves the mouse as the GamePad's touch screen.",
+      "choices": [
+        { "label": "Off", "args": ["--no-keyboard-controls"] },
+        { "label": "On", "args": ["--keyboard-controls"] }
+      ]
+    },
+    {
+      "id": "pad_layout",
+      "label": "Face buttons",
+      "group": "Controls",
+      "in": "args",
+      "help": "Xbox keeps the pad's A as the game's A. Nintendo swaps A with B and X with Y.",
+      "choices": [
+        { "label": "Xbox", "args": [] },
+        { "label": "Nintendo", "args": ["--pad-layout", "nintendo"] }
+      ]
+    },
+    {
+      "id": "background_gamepad",
+      "label": "Controller in background",
+      "group": "Controls",
+      "in": "args",
+      "help": "Off when RecompLauncher starts the game, so its overlay can use the controller. On keeps the pad working while this window is in the background.",
+      "choices": [
+        { "label": "Off", "args": ["--no-background-gamepad"] },
+        { "label": "On", "args": ["--background-gamepad"] }
+      ]
+    },
+    {
+      "id": "native_text",
+      "label": "Wishlist in the item menu",
+      "group": "Mods",
+      "advanced": true,
+      "in": "args",
+      "help": "Shows the wishlist's status in the game's item menu. Needs a build translated with the current hooks.",
+      "choices": [
+        { "label": "Off", "args": [] },
+        { "label": "On", "args": ["--native-text"] }
+      ]
+    },
+    {
+      "id": "native_menu",
+      "label": "Mods row in the start menu",
+      "group": "Mods",
+      "advanced": true,
+      "in": "args",
+      "help": "Hold Right Shift or ZL in the start menu and Gestures becomes Mods. Needs a build translated with the current hooks.",
+      "choices": [
+        { "label": "Off", "args": [] },
+        { "label": "On", "args": ["--native-menu"] }
+      ]
+    }
+  ],
+  "actions": [
+    {
+      "id": "saves",
+      "label": "Saves",
+      "help": "The game's save folder, next to the translated build.",
+      "open": "saves"
+    }
+  ]
+}

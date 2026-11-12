@@ -7,6 +7,7 @@ Start with the [README](../README.md) for what the port is and how to set it up.
 | Document | What it covers |
 |---|---|
 | [windows.md](windows.md) | Building and running on Windows: toolchain, scripts and their switches, profiling |
+| [../README.md](../README.md#recomplauncher) | Starting a release from RecompLauncher |
 | [input.md](input.md) | Gamepads, keyboard and mouse, the bindings file |
 | [overlay.md](overlay.md) | The F1 overlay: the per-hunter blacksmith wishlist, fullscreen, the software keyboard |
 | [native-menu.md](native-menu.md) | The opt-in native menus (`MH3U_NATIVE_TEXT`, `MH3U_NATIVE_MENU`) and how the game's menus work |

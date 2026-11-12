@@ -92,11 +92,39 @@ enum Tool {
         #[arg(long)]
         window: bool,
         /// With --window: borderless fullscreen on the window's monitor (also MH3U_FULLSCREEN=1; F11 or Alt+Enter toggles it).
-        #[arg(long)]
+        #[arg(long, conflicts_with = "windowed")]
         fullscreen: bool,
+        /// With --window: stay in a window. Wins over RECOMPLAUNCHER_MODE=bigpicture and over MH3U_FULLSCREEN.
+        #[arg(long, conflicts_with = "fullscreen")]
+        windowed: bool,
         /// How many system calls to allow before stopping.
         #[arg(long, default_value_t = 100_000)]
         max_imports: u64,
+        /// Keyboard and mouse game controls (MH3U_KEYBOARD_CONTROLS=1). Off unless this or the variable is set.
+        #[arg(long, conflicts_with = "no_keyboard_controls")]
+        keyboard_controls: bool,
+        /// Keyboard and mouse game controls off (MH3U_KEYBOARD_CONTROLS=0), even if the variable was already on.
+        #[arg(long, conflicts_with = "keyboard_controls")]
+        no_keyboard_controls: bool,
+        /// Gamepads keep working while the window is in the background (MH3U_BACKGROUND_GAMEPAD=1).
+        /// RecompLauncher defaults that to off; this is how a player turns it back on.
+        #[arg(long, conflicts_with = "no_background_gamepad")]
+        background_gamepad: bool,
+        /// Gamepads only work while the window has the focus (MH3U_BACKGROUND_GAMEPAD=0).
+        #[arg(long, conflicts_with = "background_gamepad")]
+        no_background_gamepad: bool,
+        /// Internal resolution 1, 2, 3 or 4 (MH3U_GFX_RESOLUTION_SCALE). Omit it for the game's own size, which is 1.
+        #[arg(long, value_parser = clap::value_parser!(u8).range(1..=4))]
+        scale: Option<u8>,
+        /// Which pad buttons are the game's A/B and X/Y (MH3U_PAD_LAYOUT): xbox (the default) or nintendo.
+        #[arg(long, value_parser = ["xbox", "nintendo"])]
+        pad_layout: Option<String>,
+        /// The wishlist's status in the item menu's last empty slot (MH3U_NATIVE_TEXT=1).
+        #[arg(long)]
+        native_text: bool,
+        /// Hold the mod key in the start menu: Gestures reads Mods (MH3U_NATIVE_MENU=1).
+        #[arg(long)]
+        native_menu: bool,
     },
     /// Translate the whole executable into C files in OUT (which must not be inside a git working tree).
     Translate {
@@ -284,10 +312,30 @@ fn main() -> Result<()> {
             save_dir,
             window,
             fullscreen,
+            windowed,
             max_imports,
+            keyboard_controls,
+            no_keyboard_controls,
+            background_gamepad,
+            no_background_gamepad,
+            scale,
+            pad_layout,
+            native_text,
+            native_menu,
         } => {
+            // Before any thread: the same variables the run scripts export, so a launcher can pass them as arguments.
+            apply_run_switches(RunSwitches {
+                keyboard_controls,
+                no_keyboard_controls,
+                background_gamepad,
+                no_background_gamepad,
+                scale,
+                pad_layout: pad_layout.as_deref(),
+                native_text,
+                native_menu,
+            });
             let save = save_dir.unwrap_or_else(|| c_dir.join("save"));
-            run_game(&dump(&game_dir)?, &c_dir, max_imports, save, window, fullscreen)
+            run_game(&dump(&game_dir)?, &c_dir, max_imports, save, window, fullscreen, windowed)
         }
         Tool::Disasm { game_dir, start, count } => {
             let data = read(&dump(&game_dir)?.executable()?)?;
@@ -894,7 +942,47 @@ fn patch_import_addresses(rpx_data: &[u8], words: &mut [u32], imports: &Imports)
     Ok(())
 }
 
-fn run_game(dump: &Dump, c_dir: &Path, max_imports: u64, save: PathBuf, window: bool, fullscreen: bool) -> Result<()> {
+struct RunSwitches<'a> {
+    keyboard_controls: bool,
+    no_keyboard_controls: bool,
+    background_gamepad: bool,
+    no_background_gamepad: bool,
+    scale: Option<u8>,
+    pad_layout: Option<&'a str>,
+    native_text: bool,
+    native_menu: bool,
+}
+
+/// The command-line switches, written as the `MH3U_` variables the game already reads. Called once, on the main thread,
+/// before [`run_game`] starts the gamepad thread.
+fn apply_run_switches(s: RunSwitches<'_>) {
+    if s.keyboard_controls {
+        mh3u_rt::set_startup_env("MH3U_KEYBOARD_CONTROLS", "1");
+    }
+    if s.no_keyboard_controls {
+        mh3u_rt::set_startup_env("MH3U_KEYBOARD_CONTROLS", "0");
+    }
+    if s.background_gamepad {
+        mh3u_rt::set_startup_env("MH3U_BACKGROUND_GAMEPAD", "1");
+    }
+    if s.no_background_gamepad {
+        mh3u_rt::set_startup_env("MH3U_BACKGROUND_GAMEPAD", "0");
+    }
+    if let Some(scale) = s.scale {
+        mh3u_rt::set_startup_env("MH3U_GFX_RESOLUTION_SCALE", &scale.to_string());
+    }
+    if let Some(layout) = s.pad_layout {
+        mh3u_rt::set_startup_env("MH3U_PAD_LAYOUT", layout);
+    }
+    if s.native_text {
+        mh3u_rt::set_startup_env("MH3U_NATIVE_TEXT", "1");
+    }
+    if s.native_menu {
+        mh3u_rt::set_startup_env("MH3U_NATIVE_MENU", "1");
+    }
+}
+
+fn run_game(dump: &Dump, c_dir: &Path, max_imports: u64, save: PathBuf, window: bool, fullscreen: bool, windowed: bool) -> Result<()> {
     let data = read(&dump.executable()?)?;
     let entry = u32::from_be_bytes(data.get(0x18..0x1c).context("short file")?.try_into()?);
     let mut pieces = Vec::new();
@@ -974,7 +1062,12 @@ fn run_game(dump: &Dump, c_dir: &Path, max_imports: u64, save: PathBuf, window: 
     let cache = c_dir.join("cache");
     // the overlay reads the game's data from the base game, and keeps its files (the wishlist) with the build
     let (dump_base, mods_dir, save_dir) = (dump.base.clone(), c_dir.join("mods"), save.clone());
-    let fullscreen = mh3u_gfx::fullscreen_wanted(fullscreen, std::env::var("MH3U_FULLSCREEN").ok().as_deref());
+    let fullscreen = mh3u_gfx::start_fullscreen(
+        windowed,
+        fullscreen,
+        std::env::var("MH3U_FULLSCREEN").ok().as_deref(),
+        std::env::var("RECOMPLAUNCHER_MODE").ok().as_deref(),
+    );
     // the keyboard and mouse bindings are kept with the build, like the wishlist
     let bindings = c_dir.join("input").join("bindings.json");
     // the window's icon is the game's own, read from the dump's meta folder (never copied anywhere)
